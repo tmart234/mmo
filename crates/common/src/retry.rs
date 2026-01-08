@@ -190,7 +190,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = retry_with_backoff(&config, "test_op", || async {
+        let result: Result<()> = retry_with_backoff(&config, "test_op", || async {
             Err(anyhow::anyhow!("invalid signature"))
         })
         .await;
