@@ -3,7 +3,6 @@
 // Cleans up children on Bevy exit or Ctrl-C.
 
 use anyhow::{Context, Result};
-use ctrlc;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use std::{
