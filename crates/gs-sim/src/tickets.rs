@@ -65,11 +65,16 @@ pub async fn ticket_listener(
     let mut last_hash: [u8; 32] = [0u8; 32];
 
     // Watchdog marks revoked if we stop getting fresh tickets.
+    // ROBUSTNESS: Increased timeout from 2.5s to 10s for high-latency networks.
     {
+        use common::config::GsConfig;
+
         let shared_for_watchdog = shared.clone();
         let revoke_tx = revoke_tx.clone();
+        let config = GsConfig::default();
+
         tokio::spawn(async move {
-            const LIVENESS_BUDGET_MS: u64 = 2_500;
+            let liveness_budget_ms = config.ticket_starvation_timeout_ms;
             loop {
                 sleep(Duration::from_millis(250)).await;
                 let (should_revoke, idle_ms) = {
@@ -77,7 +82,7 @@ pub async fn ticket_listener(
                     let last = guard.last_ticket_ms;
                     let now = now_ms();
                     let idle = now.saturating_sub(last);
-                    let dead = last != 0 && idle > LIVENESS_BUDGET_MS;
+                    let dead = last != 0 && idle > liveness_budget_ms;
                     (dead || guard.revoked, idle)
                 };
                 if should_revoke {
@@ -85,8 +90,8 @@ pub async fn ticket_listener(
                     if !guard.revoked {
                         guard.revoked = true;
                         eprintln!(
-                            "[GS] VS blessing lost (no fresh ticket in {} ms) → session revoked",
-                            idle_ms
+                            "[GS] VS blessing lost (no fresh ticket in {} ms, limit {} ms) → session revoked",
+                            idle_ms, liveness_budget_ms
                         );
                         let _ = revoke_tx.send(true);
                     }

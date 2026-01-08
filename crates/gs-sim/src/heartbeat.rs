@@ -1,8 +1,8 @@
 //! GS heartbeat & transcript attestation loop.
 //!
 //! - Heartbeats use a **unidirectional** stream (open_uni).
-//! - TranscriptDigest/ProtectedReceipt round-trip still uses a bi-stream.
-//! - We do **not** call `finish()`; we just drop the halves (best-effort).
+//! - TranscriptDigest/ProtectedReceipt round-trip uses a bi-stream with timeout.
+//! - Implements retry logic with exponential backoff for network resilience.
 
 pub async fn heartbeat_loop(
     conn: quinn::Connection,
@@ -12,17 +12,22 @@ pub async fn heartbeat_loop(
     shared: crate::state::Shared,
 ) -> anyhow::Result<()> {
     use common::{
+        config::GsConfig,
         crypto::{heartbeat_sign_bytes, now_ms, sign},
         framing::{recv_msg, send_msg},
         proto::{Heartbeat, ProtectedReceipt, TranscriptDigest},
+        retry::retry_with_backoff,
     };
     use std::sync::atomic::Ordering;
     use std::time::Duration;
-    use tokio::time::sleep;
+    use tokio::time::{sleep, timeout};
+
+    // Load configuration (could be passed as parameter in production)
+    let config = GsConfig::default();
 
     loop {
-        // ~2s cadence
-        sleep(Duration::from_secs(2)).await;
+        // Configurable heartbeat interval
+        sleep(Duration::from_millis(config.heartbeat_interval_ms)).await;
 
         let c = counter.fetch_add(1, Ordering::SeqCst) + 1;
         let now = now_ms();
@@ -46,63 +51,77 @@ pub async fn heartbeat_loop(
         let to_sign = heartbeat_sign_bytes(&session_id, c, now, &receipt_tip_now, &sw_hash_now);
         let sig_gs_bytes = sign(&eph_sk, &to_sign);
 
-        // (1) HEARTBEAT — unidirectional stream
-        match conn.open_uni().await {
-            Ok(mut send) => {
-                let hb = Heartbeat {
-                    session_id,
-                    gs_counter: c,
-                    gs_time_ms: now,
-                    receipt_tip: receipt_tip_now,
-                    sw_hash: sw_hash_now,
-                    sig_gs: sig_gs_bytes.to_vec(),
-                };
-                if let Err(e) = send_msg(&mut send, &hb).await {
-                    eprintln!("[GS] heartbeat send failed: {e:?}");
-                } else {
-                    println!("[GS] \u{2665} heartbeat {c}");
-                }
-                // Drop send half (no finish)
+        // (1) HEARTBEAT — unidirectional stream with retry
+        // TODO: Add periodic TPM re-attestation quotes
+        let hb = Heartbeat {
+            session_id,
+            gs_counter: c,
+            gs_time_ms: now,
+            receipt_tip: receipt_tip_now,
+            sw_hash: sw_hash_now,
+            sig_gs: sig_gs_bytes.to_vec(),
+            tpm_quote: None, // TPM re-attestation not yet implemented for heartbeats
+        };
+
+        let send_heartbeat = || {
+            let conn = conn.clone();
+            let hb = hb.clone();
+            async move {
+                let mut send = conn.open_uni().await?;
+                send_msg(&mut send, &hb).await?;
+                Ok::<_, anyhow::Error>(())
+            }
+        };
+
+        match retry_with_backoff(&config.retry, "heartbeat_send", send_heartbeat).await {
+            Ok(_) => {
+                println!("[GS] ♥ heartbeat {c}");
             }
             Err(e) => {
-                eprintln!("[GS] heartbeat open_uni failed: {e:?}");
-                // keep looping; VS may be busy
+                eprintln!("[GS] heartbeat send failed after retries: {e:?}");
+                // Continue trying; VS may recover
             }
         }
 
-        // (2) TRANSCRIPT DIGEST — bi-stream round trip
-        match conn.open_bi().await {
-            Ok((mut send2, mut recv2)) => {
-                let td = TranscriptDigest {
-                    session_id,
-                    gs_counter: c,
-                    receipt_tip: receipt_tip_now,
-                    positions: positions_vec,
-                };
-                if let Err(e) = send_msg(&mut send2, &td).await {
-                    eprintln!("[GS] transcript digest send failed: {e:?}");
+        // (2) TRANSCRIPT DIGEST — bi-stream round trip with timeout and retry
+        let td = TranscriptDigest {
+            session_id,
+            gs_counter: c,
+            receipt_tip: receipt_tip_now,
+            positions: positions_vec,
+        };
+
+        let send_transcript = || {
+            let conn = conn.clone();
+            let td = td.clone();
+            let timeout_duration = Duration::from_millis(config.transcript_response_timeout_ms);
+            async move {
+                let (mut send2, mut recv2) = conn.open_bi().await?;
+                send_msg(&mut send2, &td).await?;
+
+                // CRITICAL: Add timeout for VS response to prevent indefinite blocking
+                let pr = timeout(timeout_duration, recv_msg::<ProtectedReceipt>(&mut recv2))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("timeout waiting for ProtectedReceipt"))??;
+
+                if pr.session_id == session_id
+                    && pr.gs_counter == c
+                    && pr.receipt_tip == receipt_tip_now
+                {
+                    Ok(pr)
                 } else {
-                    match recv_msg::<ProtectedReceipt>(&mut recv2).await {
-                        Ok(pr) => {
-                            if pr.session_id == session_id
-                                && pr.gs_counter == c
-                                && pr.receipt_tip == receipt_tip_now
-                            {
-                                println!("[GS] VS ProtectedReceipt ok for counter {c}");
-                            } else {
-                                eprintln!("[GS] VS ProtectedReceipt mismatch at counter {c}");
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("[GS] transcript digest recv failed: {e:?}");
-                        }
-                    }
+                    Err(anyhow::anyhow!("ProtectedReceipt mismatch"))
                 }
-                // Drop both halves
+            }
+        };
+
+        match retry_with_backoff(&config.retry, "transcript_digest", send_transcript).await {
+            Ok(_) => {
+                println!("[GS] VS ProtectedReceipt ok for counter {c}");
             }
             Err(e) => {
-                eprintln!("[GS] transcript digest open_bi failed: {e:?}");
-                // continue; heartbeats still flow
+                eprintln!("[GS] transcript digest failed after retries: {e:?}");
+                // Continue; heartbeats still establish liveness
             }
         }
     }
