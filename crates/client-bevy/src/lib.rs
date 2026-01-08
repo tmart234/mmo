@@ -28,15 +28,26 @@ pub fn gather_input_impl(keys: &ButtonInput<KeyCode>) -> Option<ClientCmd> {
     let mut dy = 0.0f32;
 
     // Bevy 0.17 key names
-    if keys.pressed(KeyCode::KeyW) || keys.pressed(KeyCode::ArrowUp)    { dy += 1.0; }
-    if keys.pressed(KeyCode::KeyS) || keys.pressed(KeyCode::ArrowDown)  { dy -= 1.0; }
-    if keys.pressed(KeyCode::KeyA) || keys.pressed(KeyCode::ArrowLeft)  { dx -= 1.0; }
-    if keys.pressed(KeyCode::KeyD) || keys.pressed(KeyCode::ArrowRight) { dx += 1.0; }
+    if keys.pressed(KeyCode::KeyW) || keys.pressed(KeyCode::ArrowUp) {
+        dy += 1.0;
+    }
+    if keys.pressed(KeyCode::KeyS) || keys.pressed(KeyCode::ArrowDown) {
+        dy -= 1.0;
+    }
+    if keys.pressed(KeyCode::KeyA) || keys.pressed(KeyCode::ArrowLeft) {
+        dx -= 1.0;
+    }
+    if keys.pressed(KeyCode::KeyD) || keys.pressed(KeyCode::ArrowRight) {
+        dx += 1.0;
+    }
 
     if dx != 0.0 || dy != 0.0 {
         // normalize so diagonals aren't faster
-        let len = (dx*dx + dy*dy).sqrt();
-        Some(ClientCmd::Move { dx: (dx/len) as f32, dy: (dy/len) as f32 })
+        let len = (dx * dx + dy * dy).sqrt();
+        Some(ClientCmd::Move {
+            dx: (dx / len) as f32,
+            dy: (dy / len) as f32,
+        })
     } else {
         None
     }

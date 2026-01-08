@@ -75,7 +75,13 @@ fn main() {
         .add_message::<WorldSnapshotEvent>()
         .add_systems(
             Startup,
-            (setup_dbg, spawn_camera_3d, spawn_world, spawn_debug_ui, draw_axes_gizmos),
+            (
+                setup_dbg,
+                spawn_camera_3d,
+                spawn_world,
+                spawn_debug_ui,
+                draw_axes_gizmos,
+            ),
         );
 
     if !sanity {

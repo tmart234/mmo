@@ -25,8 +25,8 @@ pub struct VsConfig {
 impl Default for VsConfig {
     fn default() -> Self {
         Self {
-            join_max_skew_ms: 30_000,        // 30s (was 10s)
-            heartbeat_timeout_ms: 30_000,    // 30s (was 10s)
+            join_max_skew_ms: 30_000,     // 30s (was 10s)
+            heartbeat_timeout_ms: 30_000, // 30s (was 10s)
             physics_check_timeout_ms: 10_000,
             heartbeat_grace_period_ms: 5_000,
         }
@@ -62,7 +62,7 @@ impl Default for GsConfig {
             heartbeat_interval_ms: 2_000,
             first_ticket_timeout_ms: 30_000,
             transcript_response_timeout_ms: 15_000,
-            ticket_starvation_timeout_ms: 10_000,  // Much more lenient than 2.5s
+            ticket_starvation_timeout_ms: 10_000, // Much more lenient than 2.5s
             retry: RetryConfig::default(),
             max_concurrent_streams: 100,
         }
@@ -194,7 +194,10 @@ mod tests {
 
     #[test]
     fn test_should_retry() {
-        let cfg = RetryConfig { max_attempts: 3, ..Default::default() };
+        let cfg = RetryConfig {
+            max_attempts: 3,
+            ..Default::default()
+        };
         assert!(cfg.should_retry(0));
         assert!(cfg.should_retry(1));
         assert!(cfg.should_retry(2));

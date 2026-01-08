@@ -45,7 +45,9 @@ where
                 if !is_transient {
                     eprintln!(
                         "[RETRY] {} failed with non-transient error (attempt {}): {:?}",
-                        operation_name, attempt + 1, e
+                        operation_name,
+                        attempt + 1,
+                        e
                     );
                     return Err(e);
                 }
@@ -53,9 +55,7 @@ where
                 if !can_retry {
                     eprintln!(
                         "[RETRY] {} exhausted all {} attempts, giving up: {:?}",
-                        operation_name,
-                        config.max_attempts,
-                        e
+                        operation_name, config.max_attempts, e
                     );
                     return Err(e);
                 }
@@ -115,7 +115,9 @@ where
                 if !should_retry {
                     eprintln!(
                         "[RETRY] {} failed with non-retryable error (attempt {}): {:?}",
-                        operation_name, attempt + 1, e
+                        operation_name,
+                        attempt + 1,
+                        e
                     );
                     return Err(e);
                 }
@@ -123,9 +125,7 @@ where
                 if !can_retry {
                     eprintln!(
                         "[RETRY] {} exhausted all {} attempts: {:?}",
-                        operation_name,
-                        config.max_attempts,
-                        e
+                        operation_name, config.max_attempts, e
                     );
                     return Err(e);
                 }
