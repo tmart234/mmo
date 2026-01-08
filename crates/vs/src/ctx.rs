@@ -1,15 +1,19 @@
 // crates/vs/src/ctx.rs
+use common::config::VsConfig;
 use dashmap::DashMap;
 use ed25519_dalek::SigningKey;
 use std::sync::Arc;
 
-pub const JOIN_MAX_SKEW_MS: u64 = 10_000; // ~10s in dev
-pub const HEARTBEAT_TIMEOUT_MS: u64 = 10_000; // ~10s in dev
+// Legacy constants for backwards compatibility - prefer using VsConfig
+pub const JOIN_MAX_SKEW_MS: u64 = 30_000; // 30s (increased from 10s for cross-region)
+#[allow(dead_code)]
+pub const HEARTBEAT_TIMEOUT_MS: u64 = 30_000; // 30s (increased from 10s)
 
 #[derive(Clone)]
 pub struct VsCtx {
     pub vs_sk: Arc<SigningKey>,
     pub sessions: Arc<DashMap<[u8; 16], Session>>,
+    pub config: VsConfig,
 }
 
 #[derive(Clone)]
@@ -26,9 +30,14 @@ pub struct Session {
 
 impl VsCtx {
     pub fn new(vs_sk: Arc<SigningKey>) -> Self {
+        Self::new_with_config(vs_sk, VsConfig::default())
+    }
+
+    pub fn new_with_config(vs_sk: Arc<SigningKey>, config: VsConfig) -> Self {
         Self {
             vs_sk,
             sessions: Arc::new(DashMap::new()),
+            config,
         }
     }
 }

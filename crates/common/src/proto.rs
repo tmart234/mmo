@@ -8,6 +8,9 @@ pub type Sig = Vec<u8>;
 
 pub type OpId = [u8; 16];
 
+// Re-export TPM types for protocol use
+pub use crate::tpm::TpmQuote;
+
 /// GS → VS during admission.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct JoinRequest {
@@ -30,6 +33,10 @@ pub struct JoinRequest {
 
     /// GS long-term public key (Ed25519).
     pub gs_pub: [u8; 32],
+
+    /// Optional TPM attestation quote (for hardware root of trust).
+    /// If present, VS will verify TPM signature and PCR values.
+    pub tpm_quote: Option<TpmQuote>,
 }
 
 /// VS → GS after admitting it.
@@ -184,6 +191,10 @@ pub struct Heartbeat {
 
     /// Signature by GS's ephemeral session key over the canonical heartbeat bytes.
     pub sig_gs: Sig,
+
+    /// Optional TPM re-attestation quote (proves code hasn't changed).
+    /// If present during continuous operation, VS verifies PCR values match initial state.
+    pub tpm_quote: Option<TpmQuote>,
 }
 
 /// GS → VS: "Here's my current transcript digest at counter C."

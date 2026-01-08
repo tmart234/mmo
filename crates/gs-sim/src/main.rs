@@ -5,6 +5,7 @@ use common::{
     crypto::{file_sha256, join_request_sign_bytes, now_ms, sign, verify},
     framing::{recv_msg, send_msg},
     proto::{JoinAccept, JoinRequest, PlayTicket, Sig},
+    tpm::{SimulatedTpm, TpmProvider},
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use quinn::{Connection, Endpoint};
@@ -48,6 +49,10 @@ struct Opts {
     gs_sk: String,
     #[arg(long, default_value = "keys/gs_ed25519.pub")]
     gs_pk: String,
+
+    /// Enable TPM attestation (uses simulated TPM for testing)
+    #[arg(long)]
+    enable_tpm: bool,
 }
 
 #[tokio::main]
@@ -79,6 +84,26 @@ async fn main() -> Result<()> {
     let sw_hash = file_sha256(&exe)?;
 
     //
+    // 3b. Initialize TPM (simulated for testing, hardware for production).
+    //
+    let tpm: Option<Box<dyn TpmProvider>> = if opts.enable_tpm {
+        println!("[GS] initializing simulated TPM for attestation");
+        let mut tpm = SimulatedTpm::new();
+
+        // Extend PCR 0 with binary hash (code measurement)
+        tpm.extend_pcr(0, &sw_hash)
+            .context("extend PCR 0 with sw_hash")?;
+
+        // Extend PCR 1 with GS ID (configuration measurement)
+        tpm.extend_pcr(1, opts.gs_id.as_bytes())
+            .context("extend PCR 1 with gs_id")?;
+
+        Some(Box::new(tpm))
+    } else {
+        None
+    };
+
+    //
     // 4. QUIC connect to Validation Server (VS).
     //
     let (endpoint, server_addr) = make_endpoint_and_addr(&opts.vs)?;
@@ -97,6 +122,21 @@ async fn main() -> Result<()> {
     let to_sign = join_request_sign_bytes(&opts.gs_id, &sw_hash, now, &nonce, &eph_pub_bytes);
     let sig_gs: Sig = sign(&gs_sk_long, &to_sign).to_vec(); // [u8;64] -> Vec<u8>
 
+    // Generate TPM quote if TPM is enabled
+    let tpm_quote = if let Some(ref tpm) = tpm {
+        println!("[GS] generating TPM attestation quote (PCRs 0,1)");
+        let quote_nonce = nonce; // Reuse join request nonce
+        let mut nonce_32 = [0u8; 32];
+        nonce_32[..16].copy_from_slice(&quote_nonce);
+
+        Some(
+            tpm.quote(&[0, 1], &nonce_32)
+                .context("generate TPM quote")?,
+        )
+    } else {
+        None
+    };
+
     let jr = JoinRequest {
         gs_id: opts.gs_id.clone(),
         sw_hash,
@@ -105,6 +145,7 @@ async fn main() -> Result<()> {
         ephemeral_pub: eph_pub_bytes,
         sig_gs,
         gs_pub: gs_pk_long.to_bytes(),
+        tpm_quote,
     };
 
     let (mut jsend, mut jrecv) = conn.open_bi().await?;
@@ -179,15 +220,38 @@ async fn main() -> Result<()> {
         ticket_tx.clone(),
     ));
 
-    // === NEW: gate client port until we have the first ticket ===
+    // === CRITICAL FIX: gate client port with timeout to prevent deadlock ===
     {
+        use common::config::GsConfig;
+        use tokio::time::timeout;
+
+        let config = GsConfig::default();
+        let first_ticket_timeout = Duration::from_millis(config.first_ticket_timeout_ms);
+
         let mut first_ticket_rx = ticket_tx.subscribe();
-        while first_ticket_rx.borrow().is_none() {
-            if first_ticket_rx.changed().await.is_err() {
-                bail!("ticket channel closed before first ticket");
+        let wait_for_ticket = async {
+            while first_ticket_rx.borrow().is_none() {
+                if first_ticket_rx.changed().await.is_err() {
+                    bail!("ticket channel closed before first ticket");
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+
+        match timeout(first_ticket_timeout, wait_for_ticket).await {
+            Ok(Ok(_)) => {
+                println!("[GS] first PlayTicket received — opening client port");
+            }
+            Ok(Err(e)) => {
+                bail!("ticket channel error: {}", e);
+            }
+            Err(_) => {
+                bail!(
+                    "timeout waiting for first ticket from VS after {}ms - check VS connectivity",
+                    config.first_ticket_timeout_ms
+                );
             }
         }
-        println!("[GS] first PlayTicket received — opening client port");
     }
 
     // c) client_port_task:

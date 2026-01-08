@@ -5,7 +5,6 @@
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use ctrlc;
 use std::{
     fs,
     net::TcpStream,
@@ -128,10 +127,7 @@ fn main() -> Result<()> {
         bin_path("client-bevy", &profile),
         bin_path("sanity3d", &profile),
     ];
-    let bevy_path = bevy_bin_candidates
-        .iter()
-        .find(|p| p.exists())
-        .cloned();
+    let bevy_path = bevy_bin_candidates.iter().find(|p| p.exists()).cloned();
 
     let mut bevy_child = if let Some(path) = bevy_path {
         println!("[PLAY] launching Bevy client: {}", path.display());

@@ -2,10 +2,11 @@
 use quinn::Connection;
 use tokio::time::{sleep, Duration};
 
-use crate::ctx::{VsCtx, HEARTBEAT_TIMEOUT_MS};
+use crate::ctx::VsCtx;
 use common::crypto::now_ms;
 
 /// Close the connection if heartbeats stop or the session is revoked.
+/// Now uses configurable timeout from VsConfig.
 pub fn spawn_watchdog(conn: &Connection, ctx: VsCtx, session_id: [u8; 16]) {
     let conn = conn.clone();
     let ctx = ctx.clone();
@@ -31,11 +32,14 @@ pub fn spawn_watchdog(conn: &Connection, ctx: VsCtx, session_id: [u8; 16]) {
             }
 
             let idle_ms = now_ms().saturating_sub(last_seen_ms);
-            if idle_ms > HEARTBEAT_TIMEOUT_MS {
+            let timeout_ms = ctx.config.heartbeat_timeout_ms;
+
+            if idle_ms > timeout_ms {
                 eprintln!(
-                    "[VS] heartbeat timeout for session {}.. ({} ms idle) -> closing",
+                    "[VS] heartbeat timeout for session {}.. ({} ms idle, limit {} ms) -> closing",
                     hex::encode(&session_id[..4]),
-                    idle_ms
+                    idle_ms,
+                    timeout_ms
                 );
                 conn.close(0u32.into(), b"heartbeat timeout");
                 break;
