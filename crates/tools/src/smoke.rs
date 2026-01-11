@@ -15,7 +15,7 @@
 //      - stream heartbeats
 //      - receive PlayTickets
 //      - accept a client connection
-//      - exit after ~5s
+//      - exit after ~15s
 // 4. Run client-sim --smoke-test in the foreground. That will:
 //      - connect to gs-sim (QUIC 127.0.0.1:50000)
 //      - verify the VS-signed PlayTicket
@@ -185,8 +185,8 @@ fn main() -> Result<()> {
     //                                - connect/join
     //                                - heartbeat
     //                                - run the QUIC "client port"
-    //                                - accept one client handshake loop
-    //                                - shut down after ~5s
+    //                                - accept client connections
+    //                                - shut down after ~15s
     //
     let gs_bin = bin_path("gs-sim");
     let mut gs_child = Command::new(&gs_bin)
