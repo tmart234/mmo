@@ -4,7 +4,7 @@ use ed25519_dalek::VerifyingKey;
 use quinn::Connection;
 use rand::{rngs::OsRng, RngCore};
 
-use crate::ctx::{Session, VsCtx, JOIN_MAX_SKEW_MS};
+use crate::ctx::{Session, VsCtx};
 use crate::enforcer::enforcer;
 use crate::streams::{spawn_bistream_dispatch, spawn_ticket_loop, spawn_uni_heartbeat_listener};
 use crate::watchdog::spawn_watchdog;
@@ -13,6 +13,7 @@ use common::{
     crypto::{join_request_sign_bytes, now_ms, sign, verify},
     framing::{recv_msg, send_msg},
     proto::{JoinAccept, JoinRequest, Sig},
+    tpm::verify_quote,
 };
 
 /// Admit one GS (authenticate JoinRequest) then spawn loops for that session.
@@ -57,11 +58,32 @@ pub async fn admit_and_run(connecting: quinn::Incoming, ctx: VsCtx) -> Result<()
     // 2) Anti-replay time skew.
     let now = now_ms();
     let skew = now.abs_diff(jr.t_unix_ms);
-    if skew > JOIN_MAX_SKEW_MS {
+    if skew > ctx.config.join_max_skew_ms {
         bail!("JoinRequest timestamp skew too large: {skew} ms");
     }
 
     // 3) TODO: sw_hash allowlist here (enforce approved GS builds)
+
+    // 4) Verify TPM attestation quote if present.
+    if let Some(quote) = &jr.tpm_quote {
+        println!("[VS] verifying TPM quote for GS (nonce: {:02x?}...)", &quote.nonce[..4]);
+
+        // The TPM quote nonce should match the JoinRequest nonce
+        // TPM uses 32-byte nonces, so we check if the JoinRequest nonce matches the first 16 bytes
+        if &quote.nonce[..16] != jr.nonce.as_slice() {
+            bail!("TPM quote nonce doesn't match JoinRequest nonce");
+        }
+
+        // Verify the quote signature and nonce
+        // We don't check expected PCR values here since we're establishing the baseline
+        verify_quote(quote, &quote.nonce, None)
+            .context("TPM quote verification failed")?;
+
+        println!("[VS] TPM quote verified successfully");
+
+        // TODO: Store the TPM AK public key and PCR baseline for continuous attestation
+        // TODO: Verify EK certificate chain if ek_cert is present
+    }
 
     // Mint session id.
     let mut session_id = [0u8; 16];

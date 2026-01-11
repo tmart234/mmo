@@ -391,16 +391,12 @@ pub async fn client_port_task(
                     let new_tip = receipt_tip_update(&prev_tip, &ci_bytes, &ev_bytes);
                     guard.receipt_tip = new_tip;
 
-                    // Prepare copies BEFORE borrowing ledger mutably (avoid mixed borrows).
-                    let session_id_copy = guard.session_id; // [u8; 16] Copy
-                    let client_pub_copy = ci.client_pub; // [u8; 32] Copy
-                    let receipt_tip_copy = new_tip; // use updated tip
-
-                    // ---- 5b) ledger append (optional if ledger present) ----
-                    let mut op_id16 = [0u8; 16];
-                    op_id16.copy_from_slice(&ci.client_sig[..16]);
-
+                    // Append to ledger if enabled (copy values first to avoid borrow conflicts)
+                    let session_id_copy = guard.session_id;
+                    let client_pub_copy = ci.client_pub;
                     if let Some(ledger) = guard.ledger.as_mut() {
+                        let mut op_id16 = [0u8; 16];
+                        op_id16.copy_from_slice(&ci.client_sig[..16]);
                         let log_ev = LedgerEvent {
                             t_unix_ms: now_ms_val,
                             session_id: &session_id_copy,
@@ -410,7 +406,7 @@ pub async fn client_port_task(
                             delta: 0,
                             balance_before: 0,
                             balance_after: 0,
-                            receipt_tip: &receipt_tip_copy,
+                            receipt_tip: &new_tip,
                         };
                         if let Err(e) = ledger.append(&log_ev) {
                             eprintln!("[GS] ledger append failed: {e:?}");

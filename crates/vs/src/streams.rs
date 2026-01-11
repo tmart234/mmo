@@ -103,7 +103,7 @@ pub fn spawn_bistream_dispatch(conn: &Connection, ctx: VsCtx, session_id: [u8; 1
                 }
             };
 
-            // manual framing: 4-byte len + body
+            // Read length-prefixed frame (polymorphic message type).
             let mut len_buf = [0u8; 4];
             if let Err(e) = recv.read_exact(&mut len_buf).await {
                 eprintln!("[VS] stream read len failed: {e:?}");

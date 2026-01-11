@@ -4,11 +4,6 @@ use dashmap::DashMap;
 use ed25519_dalek::SigningKey;
 use std::sync::Arc;
 
-// Legacy constants for backwards compatibility - prefer using VsConfig
-pub const JOIN_MAX_SKEW_MS: u64 = 30_000; // 30s (increased from 10s for cross-region)
-#[allow(dead_code)]
-pub const HEARTBEAT_TIMEOUT_MS: u64 = 30_000; // 30s (increased from 10s)
-
 #[derive(Clone)]
 pub struct VsCtx {
     pub vs_sk: Arc<SigningKey>,

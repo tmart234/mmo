@@ -19,7 +19,6 @@ pub struct PlayerState {
     pub last_nonce: u64,
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct PlayerRuntime {
     pub buckets: HashMap<([u8; 32], CmdKey), TokenBucket>,
@@ -49,12 +48,10 @@ pub struct GsShared {
     // Trust state
     pub revoked: bool,
 
-    // Economy/audit
-    #[allow(dead_code)]
+    // Economy/audit (initialized on first use)
     pub ledger: Option<Ledger>,
 
-    // Runtime buckets / guards (optional until used everywhere)
-    #[allow(dead_code)]
+    // Runtime buckets / guards (initialized on first use)
     pub runtime: Option<PlayerRuntime>,
 }
 
