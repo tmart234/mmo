@@ -7,7 +7,7 @@ use common::{
 };
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use quinn::{ClientConfig, Endpoint, SendStream, RecvStream};
+use quinn::{ClientConfig, Endpoint, RecvStream, SendStream};
 use rand::rngs::OsRng;
 use std::{fs, path::Path, sync::Arc};
 use tokio::time::{sleep, timeout, Duration};
@@ -30,7 +30,9 @@ fn configure_quic_client() -> Result<ClientConfig> {
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
         .with_no_client_auth();
 
-    let mut client_config = ClientConfig::new(Arc::new(quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?));
+    let mut client_config = ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
+    ));
 
     // Performance tuning
     let mut transport_config = quinn::TransportConfig::default();

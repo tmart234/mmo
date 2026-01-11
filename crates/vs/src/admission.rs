@@ -66,7 +66,10 @@ pub async fn admit_and_run(connecting: quinn::Incoming, ctx: VsCtx) -> Result<()
 
     // 4) Verify TPM attestation quote if present.
     if let Some(quote) = &jr.tpm_quote {
-        println!("[VS] verifying TPM quote for GS (nonce: {:02x?}...)", &quote.nonce[..4]);
+        println!(
+            "[VS] verifying TPM quote for GS (nonce: {:02x?}...)",
+            &quote.nonce[..4]
+        );
 
         // The TPM quote nonce should match the JoinRequest nonce
         // TPM uses 32-byte nonces, so we check if the JoinRequest nonce matches the first 16 bytes
@@ -76,8 +79,7 @@ pub async fn admit_and_run(connecting: quinn::Incoming, ctx: VsCtx) -> Result<()
 
         // Verify the quote signature and nonce
         // We don't check expected PCR values here since we're establishing the baseline
-        verify_quote(quote, &quote.nonce, None)
-            .context("TPM quote verification failed")?;
+        verify_quote(quote, &quote.nonce, None).context("TPM quote verification failed")?;
 
         println!("[VS] TPM quote verified successfully");
 

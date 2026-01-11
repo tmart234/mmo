@@ -129,7 +129,8 @@ pub fn verify_quote(
         // Ed25519 public key
         use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
-        let ak_pub_bytes: [u8; 32] = quote.ak_pub
+        let ak_pub_bytes: [u8; 32] = quote
+            .ak_pub
             .as_slice()
             .try_into()
             .map_err(|_| anyhow!("invalid ak_pub length"))?;
@@ -385,14 +386,7 @@ impl HardwareTpm {
             .build()?;
 
         let ek = context.execute_with_nullauth_session(|ctx| {
-            ctx.create_primary(
-                Hierarchy::Endorsement,
-                key_pub,
-                None,
-                None,
-                None,
-                None,
-            )
+            ctx.create_primary(Hierarchy::Endorsement, key_pub, None, None, None, None)
         })?;
 
         Ok(ek.key_handle)

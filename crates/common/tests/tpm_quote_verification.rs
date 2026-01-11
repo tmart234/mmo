@@ -1,6 +1,6 @@
 // Test TPM quote verification logic
 
-use common::tpm::{SimulatedTpm, TpmProvider, verify_quote};
+use common::tpm::{verify_quote, SimulatedTpm, TpmProvider};
 use std::collections::HashMap;
 
 #[test]
@@ -71,7 +71,10 @@ fn test_tpm_quote_verification_invalid_signature() {
 
     let result = verify_quote(&quote, &nonce, None);
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("verification failed"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("verification failed"));
 }
 
 #[tokio::test]
@@ -84,16 +87,24 @@ async fn test_tpm_quote_with_timeout() {
     // Generate quote with timeout
     let quote_result = timeout(Duration::from_secs(1), async {
         tpm.quote(&[0, 1, 2], &nonce)
-    }).await;
+    })
+    .await;
 
-    assert!(quote_result.is_ok(), "TPM quote generation should complete within timeout");
+    assert!(
+        quote_result.is_ok(),
+        "TPM quote generation should complete within timeout"
+    );
     let quote = quote_result.unwrap().unwrap();
 
     // Verify quote with timeout
     let verify_result = timeout(Duration::from_secs(1), async {
         verify_quote(&quote, &nonce, None)
-    }).await;
+    })
+    .await;
 
-    assert!(verify_result.is_ok(), "TPM quote verification should complete within timeout");
+    assert!(
+        verify_result.is_ok(),
+        "TPM quote verification should complete within timeout"
+    );
     assert!(verify_result.unwrap().is_ok());
 }

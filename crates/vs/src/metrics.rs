@@ -61,15 +61,33 @@ lazy_static! {
 
 /// Initialize and register all metrics.
 pub fn register_metrics() {
-    REGISTRY.register(Box::new(HEARTBEATS_TOTAL.clone())).unwrap();
-    REGISTRY.register(Box::new(PROTECTED_RECEIPTS_TOTAL.clone())).unwrap();
-    REGISTRY.register(Box::new(JOIN_REQUESTS_TOTAL.clone())).unwrap();
-    REGISTRY.register(Box::new(TPM_VERIFICATIONS_TOTAL.clone())).unwrap();
-    REGISTRY.register(Box::new(REVOCATIONS_TOTAL.clone())).unwrap();
-    REGISTRY.register(Box::new(ACTIVE_SESSIONS.clone())).unwrap();
-    REGISTRY.register(Box::new(ACTIVE_CONNECTIONS.clone())).unwrap();
-    REGISTRY.register(Box::new(HEARTBEAT_LATENCY.clone())).unwrap();
-    REGISTRY.register(Box::new(TPM_VERIFICATION_LATENCY.clone())).unwrap();
+    REGISTRY
+        .register(Box::new(HEARTBEATS_TOTAL.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(PROTECTED_RECEIPTS_TOTAL.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(JOIN_REQUESTS_TOTAL.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(TPM_VERIFICATIONS_TOTAL.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(REVOCATIONS_TOTAL.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(ACTIVE_SESSIONS.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(ACTIVE_CONNECTIONS.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(HEARTBEAT_LATENCY.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(TPM_VERIFICATION_LATENCY.clone()))
+        .unwrap();
 }
 
 /// Get metrics in Prometheus text format.
