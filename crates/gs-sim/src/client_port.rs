@@ -87,27 +87,25 @@ pub async fn client_port_task(
         let peer_addr = conn.remote_address();
         println!("[GS] QUIC client connected from {}", peer_addr);
 
-        // Accept bi-stream IMMEDIATELY in the main loop to avoid client timeout.
-        // The client opens a bi-stream right after connecting and expects ServerHello within 3s.
-        let (send_stream, recv_stream) = match conn.accept_bi().await {
-            Ok(streams) => streams,
-            Err(e) => {
-                eprintln!("[GS] failed to accept bi-stream from {peer_addr}: {e:?}");
-                continue 'accept_loop;
-            }
-        };
+        // Snapshot the current ticket BEFORE spawning the task so it's immediately available.
+        // This prevents the spawned task from blocking while waiting for a ticket.
+        let current_ticket = ticket_rx.borrow().clone();
+        if current_ticket.is_none() {
+            eprintln!(
+                "[GS] no ticket available for client {}, rejecting",
+                peer_addr
+            );
+            continue 'accept_loop;
+        }
 
-        // Now spawn a task to handle this client connection with the accepted streams.
-        // This allows the main loop to go back to accepting new connections.
+        // Spawn task immediately to handle this client without blocking the main loop.
         let shared_for_task = shared.clone();
         let revoke_rx_for_task = revoke_rx.clone();
         let ticket_rx_for_task = ticket_rx.clone();
 
         tokio::spawn(async move {
-            // Handle the client connection in this task
             if let Err(e) = handle_client_connection(
-                send_stream,
-                recv_stream,
+                conn,
                 peer_addr,
                 shared_for_task,
                 revoke_rx_for_task,
@@ -121,16 +119,21 @@ pub async fn client_port_task(
     }
 }
 
-/// Handle a single client connection: send ServerHello, then process client inputs.
+/// Handle a single client connection: accept bi-stream, send ServerHello, then process inputs.
 async fn handle_client_connection(
-    mut send_stream: quinn::SendStream,
-    mut recv_stream: quinn::RecvStream,
+    conn: quinn::Connection,
     peer_addr: std::net::SocketAddr,
     shared: Shared,
     revoke_rx: watch::Receiver<bool>,
     ticket_rx: watch::Receiver<Option<PlayTicket>>,
 ) -> anyhow::Result<()> {
     use anyhow::{bail, Context};
+
+    // Accept bi-directional stream from client (must happen quickly)
+    let (mut send_stream, mut recv_stream) = conn
+        .accept_bi()
+        .await
+        .context("accept bi-stream from client")?;
 
     // If we've already been revoked, refuse this client.
     if *revoke_rx.borrow() {
@@ -143,16 +146,11 @@ async fn handle_client_connection(
         (guard.session_id, guard.vs_pub.to_bytes())
     };
 
-    // Clone a local watch receiver for tickets so this client follows updates.
-    // Wait until we have the first ticket, then seed a background "ticket ring" updater.
-    let mut local_ticket_rx = ticket_rx.clone();
-    let first_ticket: PlayTicket = loop {
-        if let Some(t) = local_ticket_rx.borrow().clone() {
-            break t;
-        }
-        if local_ticket_rx.changed().await.is_err() {
-            bail!("ticket channel closed");
-        }
+    // Get the current ticket (should already be available since we checked in main loop).
+    let local_ticket_rx = ticket_rx.clone();
+    let first_ticket: PlayTicket = match local_ticket_rx.borrow().clone() {
+        Some(t) => t,
+        None => bail!("no ticket available"),
     };
 
     // === Ticket ring so we accept recently rolled tickets even when client idles ===
