@@ -1,65 +1,53 @@
 // crates/gs-sim/src/client_port.rs
-use anyhow::anyhow;
-use anyhow::Context;
 use common::{
     crypto::{client_input_sign_bytes, now_ms, receipt_tip_update},
+    framing::{recv_msg, send_msg},
     proto::{AuthoritativeEvent, ClientCmd, ClientToGs, PlayTicket, ServerHello, WorldSnapshot},
 };
 use ed25519_dalek::{Signature, VerifyingKey};
+use quinn::{Endpoint, ServerConfig};
 use std::{
     collections::VecDeque,
     convert::TryFrom,
-    net::SocketAddr,
     sync::{Arc, Mutex},
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
     sync::watch,
     time::{sleep, Duration},
 };
 
 use crate::ledger::LedgerEvent;
 use crate::state::{PlayerState, Shared};
-use std::io::ErrorKind;
 
-const MAX_CLIENT_MSG: usize = 1024; // small and safe; raise if needed
 const NONCE_WINDOW: u64 = 4; // allow nonce jumps up to +4
 const TICKET_RING_MAX: usize = 32;
 
-/// Send a length-prefixed bincode message over a TCP stream.
-async fn send_bin_tcp<T: serde::Serialize>(sock: &mut TcpStream, msg: &T) -> anyhow::Result<()> {
-    let bytes = bincode::serialize(msg).context("serialize send_bin_tcp")?;
-    let len_le = (bytes.len() as u32).to_le_bytes();
+/// Configure QUIC server for GS client port.
+fn configure_quic_server() -> anyhow::Result<ServerConfig> {
+    // Generate self-signed certificate for local dev/testing
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
+    let cert_der = cert.serialize_der()?;
+    let priv_key = cert.serialize_private_key_der();
 
-    sock.write_all(&len_le).await.context("write len")?;
-    sock.write_all(&bytes).await.context("write body")?;
+    let cert_chain = vec![rustls::pki_types::CertificateDer::from(cert_der)];
+    let key_der = rustls::pki_types::PrivateKeyDer::try_from(priv_key)
+        .map_err(|e| anyhow::anyhow!("Failed to parse private key: {}", e))?;
 
-    Ok(())
+    let mut server_config = ServerConfig::with_single_cert(cert_chain, key_der)?;
+
+    // Performance tuning for MMO
+    let mut transport_config = quinn::TransportConfig::default();
+    transport_config.max_concurrent_bidi_streams(100_u32.into());
+    transport_config.max_concurrent_uni_streams(100_u32.into());
+    transport_config.keep_alive_interval(Some(Duration::from_secs(5)));
+
+    server_config.transport = Arc::new(transport_config);
+    Ok(server_config)
 }
 
-/// Receive a length-prefixed bincode message from a TCP stream.
-async fn recv_bin_tcp<T: serde::de::DeserializeOwned>(sock: &mut TcpStream) -> anyhow::Result<T> {
-    let mut len_buf = [0u8; 4];
-    sock.read_exact(&mut len_buf).await.context("read len")?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-
-    // Reject-before-parse: length sanity
-    if len == 0 || len > MAX_CLIENT_MSG {
-        // Act like a DDoS guard: drop without parsing
-        return Err(anyhow!("frame too large or zero (len={})", len));
-    }
-
-    let mut buf = vec![0u8; len];
-    sock.read_exact(&mut buf).await.context("read body")?;
-
-    let msg = bincode::deserialize(&buf).context("bincode::deserialize")?;
-    Ok(msg)
-}
-
-/// Local TCP listener that talks to a client instance (client-sim / client-bevy).
+/// QUIC listener that talks to client instances (client-sim / client-bevy).
 ///
-/// Security properties per client socket:
+/// Security properties per client connection:
 ///  - client must staple a fresh VS-signed PlayTicket
 ///  - ticket must match our session / be within time window
 ///  - ticket.client_binding must match client_pub (if bound)
@@ -76,16 +64,28 @@ pub async fn client_port_task(
     revoke_rx: watch::Receiver<bool>,
     ticket_rx: watch::Receiver<Option<PlayTicket>>,
 ) -> anyhow::Result<()> {
-    // Bind a local port for clients to connect (client-sim / client-bevy).
-    let listener = TcpListener::bind("127.0.0.1:50000")
-        .await
-        .context("bind 127.0.0.1:50000")?;
+    // Configure and start QUIC server
+    let server_config = configure_quic_server()?;
+    let endpoint = Endpoint::server(server_config, "127.0.0.1:50000".parse()?)?;
+    println!("[GS] QUIC client port listening on 127.0.0.1:50000");
 
     // Outer accept loop: one spawned task per client connection.
     'accept_loop: loop {
-        let (mut socket, peer_addr): (TcpStream, SocketAddr) =
-            listener.accept().await.context("accept client")?;
-        println!("[GS] client connected from {}", peer_addr);
+        let Some(connecting) = endpoint.accept().await else {
+            eprintln!("[GS] QUIC endpoint closed");
+            return Ok(());
+        };
+
+        let conn = match connecting.await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[GS] QUIC connection failed: {e:?}");
+                continue 'accept_loop;
+            }
+        };
+
+        let peer_addr = conn.remote_address();
+        println!("[GS] QUIC client connected from {}", peer_addr);
 
         // If we've already been revoked, just refuse immediately.
         if *revoke_rx.borrow() {
@@ -140,6 +140,15 @@ pub async fn client_port_task(
             });
         }
 
+        // Accept bi-directional stream from client
+        let (mut send_stream, mut recv_stream) = match conn.accept_bi().await {
+            Ok(streams) => streams,
+            Err(e) => {
+                eprintln!("[GS] failed to accept bi-stream from {peer_addr}: {e:?}");
+                continue 'accept_loop;
+            }
+        };
+
         // Send initial ServerHello with the first ticket.
         let hello = ServerHello {
             session_id,
@@ -147,20 +156,8 @@ pub async fn client_port_task(
             vs_pub: vs_pub_bytes,
         };
 
-        if let Err(e) = send_bin_tcp(&mut socket, &hello).await {
-            // Early client drop during startup is normal with retrying clients.
-            if let Some(ioe) = e.downcast_ref::<std::io::Error>() {
-                match ioe.kind() {
-                    ErrorKind::ConnectionAborted
-                    | ErrorKind::ConnectionReset
-                    | ErrorKind::BrokenPipe => {
-                        eprintln!("[GS] client {peer_addr} dropped before Hello; will retry");
-                    }
-                    _ => eprintln!("[GS] send ServerHello to {peer_addr} failed: {e:?}"),
-                }
-            } else {
-                eprintln!("[GS] send ServerHello to {peer_addr} failed: {e:?}");
-            }
+        if let Err(e) = send_msg(&mut send_stream, &hello).await {
+            eprintln!("[GS] send ServerHello to {peer_addr} failed: {e:?}");
             continue 'accept_loop;
         }
 
@@ -173,7 +170,6 @@ pub async fn client_port_task(
         tokio::spawn(async move {
             // per-connection tick counter for snapshots
             let mut tick: u64 = 0;
-            let mut socket = socket;
 
             loop {
                 // Hard revoke? Kill client immediately.
@@ -183,7 +179,7 @@ pub async fn client_port_task(
                 }
 
                 // Receive exactly one client message.
-                let msg_res = recv_bin_tcp::<ClientToGs>(&mut socket).await;
+                let msg_res = recv_msg::<ClientToGs>(&mut recv_stream).await;
                 let ci = match msg_res {
                     Ok(ClientToGs::Input(ci)) => Some(*ci), // enum carries Box<ClientInput>
                     Ok(ClientToGs::Bye) => {
@@ -444,7 +440,7 @@ pub async fn client_port_task(
                 };
 
                 // Respond with an updated WorldSnapshot back to this client
-                if let Err(e) = send_bin_tcp(&mut socket, &snapshot).await {
+                if let Err(e) = send_msg(&mut send_stream, &snapshot).await {
                     eprintln!("[GS] send WorldSnapshot to {peer_addr} failed: {e:?}");
                     break;
                 }

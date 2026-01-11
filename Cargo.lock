@@ -1916,7 +1916,9 @@ dependencies = [
  "common",
  "ed25519-dalek",
  "hex",
+ "quinn",
  "rand 0.8.5",
+ "rustls",
  "tokio",
 ]
 
@@ -3056,6 +3058,7 @@ dependencies = [
  "hex",
  "quinn",
  "rand 0.8.5",
+ "rcgen",
  "rustls",
  "serde",
  "serde_json",

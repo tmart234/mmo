@@ -2,25 +2,86 @@ pub use anyhow::{anyhow, bail, Context, Result};
 
 use common::{
     crypto::{client_input_sign_bytes, now_ms},
+    framing::{recv_msg, send_msg},
     proto::{ClientCmd, ClientInput, ClientToGs, PlayTicket, ServerHello, WorldSnapshot},
-    tcp_framing::{tcp_recv_msg, tcp_send_msg},
 };
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use quinn::{ClientConfig, Endpoint, SendStream, RecvStream};
 use rand::rngs::OsRng;
-use std::{fs, path::Path};
-use tokio::{
-    net::TcpStream,
-    time::{sleep, timeout, Duration},
-};
+use std::{fs, path::Path, sync::Arc};
+use tokio::time::{sleep, timeout, Duration};
 
 pub struct Session {
-    pub sock: TcpStream,
-    pub session_id: [u8; 16], // <-- 16 bytes (matches common)
+    pub send_stream: SendStream,
+    pub recv_stream: RecvStream,
+    pub session_id: [u8; 16],
     pub vs_pub: [u8; 32],
     pub ticket: PlayTicket,
     pub client_pub: [u8; 32],
     pub client_sk: SigningKey,
+}
+
+/// Configure QUIC client with insecure cert verification for localhost dev.
+fn configure_quic_client() -> Result<ClientConfig> {
+    // For localhost dev, we skip cert verification
+    let crypto = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+        .with_no_client_auth();
+
+    let mut client_config = ClientConfig::new(Arc::new(quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?));
+
+    // Performance tuning
+    let mut transport_config = quinn::TransportConfig::default();
+    transport_config.max_concurrent_bidi_streams(10_u32.into());
+    transport_config.keep_alive_interval(Some(Duration::from_secs(5)));
+
+    client_config.transport_config(Arc::new(transport_config));
+    Ok(client_config)
+}
+
+/// Skip server certificate verification for localhost development.
+#[derive(Debug)]
+struct SkipServerVerification;
+
+impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ED25519,
+        ]
+    }
 }
 
 // ---------- key / trust roots ----------
@@ -149,13 +210,22 @@ async fn attempt_connect_and_handshake(gs_addr: &str, hello_timeout: Duration) -
     let pinned_vs_pub = load_pinned_vs_pub()?;
     let (client_sk, client_pub) = load_or_create_client_keys()?;
 
-    // 1) connect
-    let mut sock = TcpStream::connect(gs_addr)
-        .await
-        .with_context(|| format!("connect to {}", gs_addr))?;
+    // 1) configure QUIC client
+    let client_config = configure_quic_client()?;
+    let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
+    endpoint.set_default_client_config(client_config);
 
-    // 2) recv ServerHello { session_id, ticket, vs_pub } with timeout
-    let sh: ServerHello = timeout(hello_timeout, tcp_recv_msg(&mut sock))
+    // 2) connect to GS
+    let conn = endpoint
+        .connect(gs_addr.parse()?, "localhost")?
+        .await
+        .with_context(|| format!("QUIC connect to {}", gs_addr))?;
+
+    // 3) open bi-directional stream
+    let (send_stream, mut recv_stream) = conn.open_bi().await.context("open bi-stream")?;
+
+    // 4) recv ServerHello { session_id, ticket, vs_pub } with timeout
+    let sh: ServerHello = timeout(hello_timeout, recv_msg(&mut recv_stream))
         .await
         .map_err(|_| anyhow!("timeout waiting for ServerHello"))?
         .context("recv ServerHello")?;
@@ -207,8 +277,9 @@ async fn attempt_connect_and_handshake(gs_addr: &str, hello_timeout: Duration) -
     };
 
     Ok(Session {
-        sock,
-        session_id: sh.session_id, // <-- [u8;16]
+        send_stream,
+        recv_stream,
+        session_id: sh.session_id,
         vs_pub: sh.vs_pub,
         ticket,
         client_pub,
@@ -241,14 +312,14 @@ pub async fn send_input(sess: &mut Session, nonce: u64, cmd: ClientCmd) -> Resul
     };
 
     let msg = ClientToGs::Input(Box::new(ci));
-    tcp_send_msg(&mut sess.sock, &msg)
+    send_msg(&mut sess.send_stream, &msg)
         .await
         .context("send ClientInput")
 }
 
 /// Read the authoritative world snapshot from GS.
 pub async fn recv_world(sess: &mut Session) -> Result<WorldSnapshot> {
-    tcp_recv_msg::<WorldSnapshot>(&mut sess.sock)
+    recv_msg::<WorldSnapshot>(&mut sess.recv_stream)
         .await
         .context("recv WorldSnapshot")
 }
