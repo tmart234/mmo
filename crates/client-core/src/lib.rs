@@ -157,7 +157,7 @@ pub fn load_or_create_client_keys() -> Result<(SigningKey, [u8; 32])> {
 
 /// One-shot connect + handshake. Kept for callers that don't want retry logic.
 pub async fn connect_and_handshake(gs_addr: &str) -> Result<Session> {
-    attempt_connect_and_handshake(gs_addr, Duration::from_secs(3)).await
+    attempt_connect_and_handshake(gs_addr, Duration::from_secs(10)).await
 }
 
 /// Connect + handshake with retry/backoff. Retries only *transient* failures
@@ -171,7 +171,7 @@ pub async fn connect_and_handshake_with_retry(
     let mut attempt = 1usize;
 
     loop {
-        match attempt_connect_and_handshake(gs_addr, Duration::from_secs(3)).await {
+        match attempt_connect_and_handshake(gs_addr, Duration::from_secs(10)).await {
             Ok(sess) => return Ok(sess),
             Err(e) => {
                 // Fatal classes (do not retry): VS pinning mismatch or bad ticket signature/body.
