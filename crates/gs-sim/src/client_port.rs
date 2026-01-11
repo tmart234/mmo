@@ -87,10 +87,21 @@ pub async fn client_port_task(
         let peer_addr = conn.remote_address();
         println!("[GS] QUIC client connected from {}", peer_addr);
 
-        // Snapshot the current ticket BEFORE spawning the task so it's immediately available.
-        // This prevents the spawned task from blocking while waiting for a ticket.
-        let current_ticket = ticket_rx.borrow().clone();
-        if current_ticket.is_none() {
+        // CRITICAL: Accept bi-stream HERE in the main loop, not in the spawned task.
+        // The client opens a bi-stream immediately after connecting and starts a 3-second
+        // timeout for ServerHello. If we spawn a task first, the task might not get scheduled
+        // fast enough, causing the client to timeout before we even call accept_bi().
+        // Accepting here ensures instant response to the client's stream open request.
+        let (send_stream, recv_stream) = match conn.accept_bi().await {
+            Ok(streams) => streams,
+            Err(e) => {
+                eprintln!("[GS] failed to accept bi-stream from {}: {e:?}", peer_addr);
+                continue 'accept_loop;
+            }
+        };
+
+        // Verify ticket exists before spawning task
+        if ticket_rx.borrow().is_none() {
             eprintln!(
                 "[GS] no ticket available for client {}, rejecting",
                 peer_addr
@@ -98,14 +109,15 @@ pub async fn client_port_task(
             continue 'accept_loop;
         }
 
-        // Spawn task immediately to handle this client without blocking the main loop.
+        // Now spawn task with already-accepted streams - this doesn't block the main loop
         let shared_for_task = shared.clone();
         let revoke_rx_for_task = revoke_rx.clone();
         let ticket_rx_for_task = ticket_rx.clone();
 
         tokio::spawn(async move {
             if let Err(e) = handle_client_connection(
-                conn,
+                send_stream,
+                recv_stream,
                 peer_addr,
                 shared_for_task,
                 revoke_rx_for_task,
@@ -119,21 +131,16 @@ pub async fn client_port_task(
     }
 }
 
-/// Handle a single client connection: accept bi-stream, send ServerHello, then process inputs.
+/// Handle a single client connection: send ServerHello with pre-accepted streams, then process inputs.
 async fn handle_client_connection(
-    conn: quinn::Connection,
+    mut send_stream: quinn::SendStream,
+    mut recv_stream: quinn::RecvStream,
     peer_addr: std::net::SocketAddr,
     shared: Shared,
     revoke_rx: watch::Receiver<bool>,
     ticket_rx: watch::Receiver<Option<PlayTicket>>,
 ) -> anyhow::Result<()> {
     use anyhow::{bail, Context};
-
-    // Accept bi-directional stream from client (must happen quickly)
-    let (mut send_stream, mut recv_stream) = conn
-        .accept_bi()
-        .await
-        .context("accept bi-stream from client")?;
 
     // If we've already been revoked, refuse this client.
     if *revoke_rx.borrow() {
