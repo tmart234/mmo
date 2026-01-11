@@ -91,6 +91,7 @@ pub fn register_metrics() {
 }
 
 /// Get metrics in Prometheus text format.
+#[allow(dead_code)]
 pub fn gather_metrics() -> String {
     use prometheus::Encoder;
     let encoder = prometheus::TextEncoder::new();
