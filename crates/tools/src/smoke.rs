@@ -15,9 +15,9 @@
 //      - stream heartbeats
 //      - receive PlayTickets
 //      - accept a client connection
-//      - exit after ~5s
+//      - exit after ~15s
 // 4. Run client-sim --smoke-test in the foreground. That will:
-//      - connect to gs-sim (TCP 127.0.0.1:50000)
+//      - connect to gs-sim (QUIC 127.0.0.1:50000)
 //      - verify the VS-signed PlayTicket
 //      - send nonce-monotonic ClientInput stapled to that ticket
 // 5. Wait for gs-sim to exit.
@@ -28,7 +28,7 @@
 // Differences from older version:
 //  - Resolve explicit paths to ./target/debug/{vs,gs-sim,client-sim} for Linux CI.
 //  - Inherit stdout/stderr so CI prints all logs inline.
-//  - WAIT for the GS client TCP port before starting client-sim to avoid races.
+//  - Sleep to allow GS QUIC endpoint initialization before starting client-sim.
 
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
@@ -36,7 +36,6 @@ use rand::rngs::OsRng;
 use std::time::SystemTime;
 use std::{
     fs,
-    net::TcpStream,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
@@ -100,18 +99,6 @@ fn ensure_vs_keys() -> Result<()> {
     );
 
     Ok(())
-}
-
-// Poll a TCP address until it accepts connections or we hit timeout_ms.
-fn wait_for_tcp(addr: &str, timeout_ms: u64) -> bool {
-    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
-    while std::time::Instant::now() < deadline {
-        if TcpStream::connect(addr).is_ok() {
-            return true;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    false
 }
 
 // ---------- Ledger E2E sanity checks (post-run) ----------
@@ -197,9 +184,9 @@ fn main() -> Result<()> {
     //    --test-once               tells it to:
     //                                - connect/join
     //                                - heartbeat
-    //                                - run the local TCP "client port"
-    //                                - accept one client handshake loop
-    //                                - shut down after ~5s
+    //                                - run the QUIC "client port"
+    //                                - accept client connections
+    //                                - shut down after ~15s
     //
     let gs_bin = bin_path("gs-sim");
     let mut gs_child = Command::new(&gs_bin)
@@ -211,18 +198,20 @@ fn main() -> Result<()> {
         .spawn()
         .with_context(|| format!("spawn {:?}", gs_bin))?;
 
-    // Wait for gs-sim to open its TCP port on 127.0.0.1:50000 (up to 5s).
-    if !wait_for_tcp("127.0.0.1:50000", 5000) {
-        eprintln!("[SMOKE] timeout waiting for gs-sim client port at 127.0.0.1:50000");
-    }
+    // Wait for gs-sim to initialize its QUIC endpoint on 127.0.0.1:50000.
+    // QUIC uses UDP, so we can't use TCP connection probing. Give it time to:
+    // - Complete VS handshake
+    // - Receive first ticket
+    // - Start QUIC server
+    thread::sleep(Duration::from_millis(2000));
 
     // 4. Run client-sim in the foreground.
     //
-    //    --smoke-test: send a handful of ClientInput frames and exit
+    //    --smoke-test: connect via QUIC, send a handful of ClientInput frames and exit
     //
     // We inherit stdout/stderr so we see:
-    //   [CLIENT] got ticket #1 ...
-    //   [CLIENT] sent input with nonce=1, ctr=1
+    //   [CLIENT] tick=1 you=(1.00,0.00)
+    //   [CLIENT] tick=2 you=(2.00,0.00)
     //
     let client_bin = bin_path("client-sim");
     let mut client_child = Command::new(&client_bin)

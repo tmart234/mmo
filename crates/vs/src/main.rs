@@ -10,6 +10,7 @@
 mod admission;
 mod ctx;
 mod enforcer;
+mod metrics;
 mod streams;
 mod watchdog;
 
@@ -51,6 +52,10 @@ async fn main() -> Result<()> {
             .expect("install ring CryptoProvider");
     }
 
+    // Initialize Prometheus metrics
+    metrics::register_metrics();
+    println!("[VS] Prometheus metrics initialized");
+
     // Load (or create) VS signing key
     let (vs_sk_raw, _vs_pk_raw) = load_or_make_keys(&opts.vs_sk, &opts.vs_pk)?;
     let ctx = VsCtx::new(Arc::new(vs_sk_raw));
@@ -58,6 +63,7 @@ async fn main() -> Result<()> {
     // Start QUIC listener
     let (endpoint, _local_addr) = make_endpoint(&opts.bind)?;
     println!("[VS] listening on {}", opts.bind);
+    println!("[VS] Metrics available via metrics::gather_metrics()");
 
     loop {
         let incoming_opt = endpoint.accept().await; // Option<Incoming>

@@ -264,10 +264,11 @@ async fn main() -> Result<()> {
     ));
 
     //
-    // 10. --test_once mode: let smoke test run a bit, then exit.
+    // 10. --test_once mode: let smoke test run, then exit.
+    //     Give client enough time to connect, handshake, and complete its test.
     //
     if opts.test_once {
-        sleep(Duration::from_secs(5)).await;
+        sleep(Duration::from_secs(15)).await;
 
         heartbeat_task.abort();
         tickets_task.abort();

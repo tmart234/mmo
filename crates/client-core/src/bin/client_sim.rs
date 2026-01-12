@@ -1,8 +1,8 @@
 use anyhow::Result;
 use clap::Parser;
 use client_core::*;
+use common::framing::send_msg;
 use common::proto::{ClientCmd, ClientToGs};
-use common::tcp_framing::tcp_send_msg;
 use tokio::time::{sleep, Duration};
 
 #[derive(Parser, Debug)]
@@ -17,9 +17,14 @@ struct Opts {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install rustls crypto provider (required for QUIC)
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("Failed to install crypto provider"))?;
+
     let opts = Opts::parse();
 
-    // Be resilient if GS hasn’t opened its client port yet:
+    // Be resilient if GS hasn't opened its client port yet:
     //  - up to 10 attempts
     //  - start with 150ms backoff, exponential to ~2s cap
     let mut sess =
@@ -44,8 +49,8 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Graceful shutdown: tell GS we're done before closing the socket
-    let _ = tcp_send_msg(&mut sess.sock, &ClientToGs::Bye).await;
+    // Graceful shutdown: tell GS we're done before closing the stream
+    let _ = send_msg(&mut sess.send_stream, &ClientToGs::Bye).await;
 
     Ok(())
 }
