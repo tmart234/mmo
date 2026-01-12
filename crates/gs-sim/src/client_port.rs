@@ -70,26 +70,51 @@ pub async fn client_port_task(
     println!("[GS] QUIC client port listening on 127.0.0.1:50000");
 
     // Outer accept loop: one spawned task per client connection.
+    let loop_start = std::time::Instant::now();
+    let mut conn_counter = 0u32;
+
     'accept_loop: loop {
+        println!(
+            "[GS] {:?} [ACCEPT LOOP] waiting for connection #{}",
+            loop_start.elapsed(),
+            conn_counter + 1
+        );
+
         let Some(connecting) = endpoint.accept().await else {
             eprintln!("[GS] QUIC endpoint closed");
             return Ok(());
         };
 
+        println!(
+            "[GS] {:?} [ACCEPT LOOP] incoming connection detected, starting handshake...",
+            loop_start.elapsed()
+        );
+
         let conn = match connecting.await {
-            Ok(c) => c,
+            Ok(c) => {
+                conn_counter += 1;
+                println!(
+                    "[GS] {:?} [ACCEPT LOOP] ✓ Connection #{} handshake complete",
+                    loop_start.elapsed(),
+                    conn_counter
+                );
+                c
+            }
             Err(e) => {
-                eprintln!("[GS] QUIC connection failed: {e:?}");
+                eprintln!(
+                    "[GS] {:?} [ACCEPT LOOP] ✗ handshake failed: {e:?}",
+                    loop_start.elapsed()
+                );
                 continue 'accept_loop;
             }
         };
 
         let peer_addr = conn.remote_address();
-        let t0 = std::time::Instant::now();
         let conn_id = conn.stable_id();
         println!(
-            "[GS] {:?} QUIC client connected from {} (conn_id={})",
-            t0.elapsed(),
+            "[GS] {:?} [CONN #{}] peer={} conn_id={} ACCEPTED",
+            loop_start.elapsed(),
+            conn_counter,
             peer_addr,
             conn_id
         );
@@ -98,7 +123,7 @@ pub async fn client_port_task(
         if ticket_rx.borrow().is_none() {
             eprintln!(
                 "[GS] {:?} no ticket available for client {}, rejecting",
-                t0.elapsed(),
+                loop_start.elapsed(),
                 peer_addr
             );
             continue 'accept_loop;
@@ -106,7 +131,7 @@ pub async fn client_port_task(
 
         println!(
             "[GS] {:?} spawning handler task for {}",
-            t0.elapsed(),
+            loop_start.elapsed(),
             peer_addr
         );
 
@@ -148,11 +173,28 @@ async fn handle_client_connection(
 ) -> anyhow::Result<()> {
     use anyhow::{bail, Context};
 
+    let task_start = std::time::Instant::now();
+    let conn_id = conn.stable_id();
+
+    println!(
+        "[GS] {:?} [TASK {}] calling accept_bi() on conn_id={}...",
+        task_start.elapsed(),
+        peer_addr,
+        conn_id
+    );
+
     // Accept bi-stream from client
     let (mut send_stream, mut recv_stream) = conn
         .accept_bi()
         .await
         .context("accept bi-stream from client")?;
+
+    println!(
+        "[GS] {:?} [TASK {}] ✓ accept_bi() succeeded on conn_id={}",
+        task_start.elapsed(),
+        peer_addr,
+        conn_id
+    );
 
     // If we've already been revoked, refuse this client.
     if *revoke_rx.borrow() {
