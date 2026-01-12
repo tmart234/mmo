@@ -223,13 +223,25 @@ async fn attempt_connect_and_handshake(gs_addr: &str, hello_timeout: Duration) -
         .connect(gs_addr.parse()?, "localhost")?
         .await
         .with_context(|| format!("QUIC connect to {}", gs_addr))?;
-    println!("[CLIENT] {:?} QUIC connected to {}", t0.elapsed(), gs_addr);
+    let conn_id = conn.stable_id();
+    println!(
+        "[CLIENT] {:?} QUIC connected to {} (conn_id={})",
+        t0.elapsed(),
+        gs_addr,
+        conn_id
+    );
 
     // 3) open bi-directional stream
+    println!(
+        "[CLIENT] {:?} opening bi-stream on conn_id={}...",
+        t0.elapsed(),
+        conn_id
+    );
     let (send_stream, mut recv_stream) = conn.open_bi().await.context("open bi-stream")?;
     println!(
-        "[CLIENT] {:?} bi-stream opened, waiting for ServerHello (timeout={}s)...",
+        "[CLIENT] {:?} bi-stream opened on conn_id={}, waiting for ServerHello (timeout={}s)...",
         t0.elapsed(),
+        conn_id,
         hello_timeout.as_secs()
     );
 

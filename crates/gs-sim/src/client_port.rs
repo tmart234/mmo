@@ -94,10 +94,7 @@ pub async fn client_port_task(
             conn_id
         );
 
-        // Give the QUIC connection a moment to fully stabilize before accepting streams
-        sleep(Duration::from_millis(10)).await;
-
-        // CRITICAL: Accept bi-stream HERE in the main loop, not in the spawned task.
+        // Accept bi-directional stream from client
         println!(
             "[GS] {:?} calling accept_bi() for {} (conn_id={})...",
             t0.elapsed(),
