@@ -86,17 +86,23 @@ pub async fn client_port_task(
 
         let peer_addr = conn.remote_address();
         let t0 = std::time::Instant::now();
+        let conn_id = conn.stable_id();
         println!(
-            "[GS] {:?} QUIC client connected from {}",
+            "[GS] {:?} QUIC client connected from {} (conn_id={})",
             t0.elapsed(),
-            peer_addr
+            peer_addr,
+            conn_id
         );
+
+        // Give the QUIC connection a moment to fully stabilize before accepting streams
+        sleep(Duration::from_millis(10)).await;
 
         // CRITICAL: Accept bi-stream HERE in the main loop, not in the spawned task.
         println!(
-            "[GS] {:?} calling accept_bi() for {}...",
+            "[GS] {:?} calling accept_bi() for {} (conn_id={})...",
             t0.elapsed(),
-            peer_addr
+            peer_addr,
+            conn_id
         );
         let (send_stream, recv_stream) = match conn.accept_bi().await {
             Ok(streams) => {
