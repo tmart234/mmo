@@ -218,19 +218,34 @@ async fn attempt_connect_and_handshake(gs_addr: &str, hello_timeout: Duration) -
     endpoint.set_default_client_config(client_config);
 
     // 2) connect to GS
+    let t0 = std::time::Instant::now();
     let conn = endpoint
         .connect(gs_addr.parse()?, "localhost")?
         .await
         .with_context(|| format!("QUIC connect to {}", gs_addr))?;
+    println!("[CLIENT] {:?} QUIC connected to {}", t0.elapsed(), gs_addr);
 
     // 3) open bi-directional stream
     let (send_stream, mut recv_stream) = conn.open_bi().await.context("open bi-stream")?;
+    println!(
+        "[CLIENT] {:?} bi-stream opened, waiting for ServerHello (timeout={}s)...",
+        t0.elapsed(),
+        hello_timeout.as_secs()
+    );
 
     // 4) recv ServerHello { session_id, ticket, vs_pub } with timeout
     let sh: ServerHello = timeout(hello_timeout, recv_msg(&mut recv_stream))
         .await
-        .map_err(|_| anyhow!("timeout waiting for ServerHello"))?
+        .map_err(|_| {
+            eprintln!(
+                "[CLIENT] {:?} TIMEOUT waiting for ServerHello after {}s",
+                t0.elapsed(),
+                hello_timeout.as_secs()
+            );
+            anyhow!("timeout waiting for ServerHello")
+        })?
         .context("recv ServerHello")?;
+    println!("[CLIENT] {:?} ServerHello received!", t0.elapsed());
 
     let ticket: PlayTicket = sh.ticket.clone();
 

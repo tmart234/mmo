@@ -85,17 +85,34 @@ pub async fn client_port_task(
         };
 
         let peer_addr = conn.remote_address();
-        println!("[GS] QUIC client connected from {}", peer_addr);
+        let t0 = std::time::Instant::now();
+        println!(
+            "[GS] {:?} QUIC client connected from {}",
+            t0.elapsed(),
+            peer_addr
+        );
 
         // CRITICAL: Accept bi-stream HERE in the main loop, not in the spawned task.
-        // The client opens a bi-stream immediately after connecting and starts a 3-second
-        // timeout for ServerHello. If we spawn a task first, the task might not get scheduled
-        // fast enough, causing the client to timeout before we even call accept_bi().
-        // Accepting here ensures instant response to the client's stream open request.
+        println!(
+            "[GS] {:?} calling accept_bi() for {}...",
+            t0.elapsed(),
+            peer_addr
+        );
         let (send_stream, recv_stream) = match conn.accept_bi().await {
-            Ok(streams) => streams,
+            Ok(streams) => {
+                println!(
+                    "[GS] {:?} accept_bi() succeeded for {}",
+                    t0.elapsed(),
+                    peer_addr
+                );
+                streams
+            }
             Err(e) => {
-                eprintln!("[GS] failed to accept bi-stream from {}: {e:?}", peer_addr);
+                eprintln!(
+                    "[GS] {:?} failed to accept bi-stream from {}: {e:?}",
+                    t0.elapsed(),
+                    peer_addr
+                );
                 continue 'accept_loop;
             }
         };
@@ -103,18 +120,30 @@ pub async fn client_port_task(
         // Verify ticket exists before spawning task
         if ticket_rx.borrow().is_none() {
             eprintln!(
-                "[GS] no ticket available for client {}, rejecting",
+                "[GS] {:?} no ticket available for client {}, rejecting",
+                t0.elapsed(),
                 peer_addr
             );
             continue 'accept_loop;
         }
 
+        println!(
+            "[GS] {:?} spawning handler task for {}",
+            t0.elapsed(),
+            peer_addr
+        );
         // Now spawn task with already-accepted streams - this doesn't block the main loop
         let shared_for_task = shared.clone();
         let revoke_rx_for_task = revoke_rx.clone();
         let ticket_rx_for_task = ticket_rx.clone();
 
         tokio::spawn(async move {
+            let task_start = std::time::Instant::now();
+            println!(
+                "[GS] {:?} handler task started for {}",
+                task_start.elapsed(),
+                peer_addr
+            );
             if let Err(e) = handle_client_connection(
                 send_stream,
                 recv_stream,
@@ -192,9 +221,16 @@ async fn handle_client_connection(
         vs_pub: vs_pub_bytes,
     };
 
+    println!("[GS] {} sending ServerHello...", peer_addr);
+    let send_start = std::time::Instant::now();
     send_msg(&mut send_stream, &hello)
         .await
         .context("send ServerHello")?;
+    println!(
+        "[GS] {} ServerHello sent in {:?}",
+        peer_addr,
+        send_start.elapsed()
+    );
 
     // Now handle client input loop
     let mut tick: u64 = 0;
