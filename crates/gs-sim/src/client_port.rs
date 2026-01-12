@@ -94,32 +94,6 @@ pub async fn client_port_task(
             conn_id
         );
 
-        // Accept bi-directional stream from client
-        println!(
-            "[GS] {:?} calling accept_bi() for {} (conn_id={})...",
-            t0.elapsed(),
-            peer_addr,
-            conn_id
-        );
-        let (send_stream, recv_stream) = match conn.accept_bi().await {
-            Ok(streams) => {
-                println!(
-                    "[GS] {:?} accept_bi() succeeded for {}",
-                    t0.elapsed(),
-                    peer_addr
-                );
-                streams
-            }
-            Err(e) => {
-                eprintln!(
-                    "[GS] {:?} failed to accept bi-stream from {}: {e:?}",
-                    t0.elapsed(),
-                    peer_addr
-                );
-                continue 'accept_loop;
-            }
-        };
-
         // Verify ticket exists before spawning task
         if ticket_rx.borrow().is_none() {
             eprintln!(
@@ -135,7 +109,9 @@ pub async fn client_port_task(
             t0.elapsed(),
             peer_addr
         );
-        // Now spawn task with already-accepted streams - this doesn't block the main loop
+
+        // Spawn task IMMEDIATELY without blocking the main loop.
+        // The task will accept the bi-stream, not the main loop.
         let shared_for_task = shared.clone();
         let revoke_rx_for_task = revoke_rx.clone();
         let ticket_rx_for_task = ticket_rx.clone();
@@ -148,8 +124,7 @@ pub async fn client_port_task(
                 peer_addr
             );
             if let Err(e) = handle_client_connection(
-                send_stream,
-                recv_stream,
+                conn,
                 peer_addr,
                 shared_for_task,
                 revoke_rx_for_task,
@@ -163,16 +138,21 @@ pub async fn client_port_task(
     }
 }
 
-/// Handle a single client connection: send ServerHello with pre-accepted streams, then process inputs.
+/// Handle a single client connection: accept bi-stream, send ServerHello, then process inputs.
 async fn handle_client_connection(
-    mut send_stream: quinn::SendStream,
-    mut recv_stream: quinn::RecvStream,
+    conn: quinn::Connection,
     peer_addr: std::net::SocketAddr,
     shared: Shared,
     revoke_rx: watch::Receiver<bool>,
     ticket_rx: watch::Receiver<Option<PlayTicket>>,
 ) -> anyhow::Result<()> {
     use anyhow::{bail, Context};
+
+    // Accept bi-stream from client
+    let (mut send_stream, mut recv_stream) = conn
+        .accept_bi()
+        .await
+        .context("accept bi-stream from client")?;
 
     // If we've already been revoked, refuse this client.
     if *revoke_rx.borrow() {
