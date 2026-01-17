@@ -37,7 +37,7 @@
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// PCR (Platform Configuration Register) index.
 /// TPM 2.0 typically has 24 PCRs (0-23).
@@ -52,10 +52,15 @@ pub type PcrValue = [u8; 32];
 /// 1. The current state of specified PCRs
 /// 2. Freshness via nonce
 /// 3. Authenticity via signature
+///
+/// NOTE: Uses BTreeMap instead of HashMap for deterministic serialization.
+/// This is critical because the signature is computed over serialized bytes,
+/// and HashMap iteration order is non-deterministic across processes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TpmQuote {
     /// PCR values included in this quote (index -> value).
-    pub pcr_values: HashMap<PcrIndex, PcrValue>,
+    /// BTreeMap ensures deterministic serialization order for signature verification.
+    pub pcr_values: BTreeMap<PcrIndex, PcrValue>,
 
     /// Nonce provided by verifier (prevents replay attacks).
     pub nonce: [u8; 32],
@@ -112,7 +117,7 @@ pub trait TpmProvider: Send + Sync {
 pub fn verify_quote(
     quote: &TpmQuote,
     expected_nonce: &[u8; 32],
-    expected_pcrs: Option<&HashMap<PcrIndex, PcrValue>>,
+    expected_pcrs: Option<&BTreeMap<PcrIndex, PcrValue>>,
 ) -> Result<()> {
     // 1. Check nonce (prevents replay)
     if &quote.nonce != expected_nonce {
@@ -258,13 +263,14 @@ impl TpmProvider for SimulatedTpm {
     fn quote(&self, pcr_indices: &[PcrIndex], nonce: &[u8; 32]) -> Result<TpmQuote> {
         use ed25519_dalek::Signer;
 
-        // Collect requested PCR values
-        let mut pcr_values = HashMap::new();
+        // Collect requested PCR values into BTreeMap for deterministic serialization
+        let mut pcr_values = BTreeMap::new();
         for &idx in pcr_indices {
             pcr_values.insert(idx, self.pcr_bank.read(idx));
         }
 
         // Create message to sign: (pcr_values || nonce)
+        // BTreeMap ensures this serializes identically on signer and verifier
         let message = bincode::serialize(&(&pcr_values, nonce))?;
 
         // Sign with attestation key (in real TPM, this is a restricted key)
@@ -465,7 +471,7 @@ impl TpmProvider for HardwareTpm {
         let pcr_values = match attest.attested() {
             AttestInfo::Quote { pcr_digest, .. } => {
                 // Read actual PCR values
-                let mut values = HashMap::new();
+                let mut values = BTreeMap::new();
                 for &idx in pcr_indices {
                     let pcr_data = self
                         .context
@@ -596,5 +602,22 @@ mod tests {
         let quote2 = tpm2.quote(&[0], &nonce).unwrap();
 
         assert_eq!(quote1.ak_pub, quote2.ak_pub);
+    }
+
+    #[test]
+    fn test_quote_signature_verifies_across_serialization() {
+        // This test verifies that the BTreeMap fix works:
+        // serialize -> sign -> deserialize -> re-serialize -> verify should succeed
+        let tpm = SimulatedTpm::new();
+
+        let nonce = [42u8; 32];
+        let quote = tpm.quote(&[0, 1], &nonce).unwrap();
+
+        // Simulate network transport: serialize and deserialize the quote
+        let serialized = bincode::serialize(&quote).unwrap();
+        let deserialized: TpmQuote = bincode::deserialize(&serialized).unwrap();
+
+        // Verification should succeed because BTreeMap serializes deterministically
+        assert!(verify_quote(&deserialized, &nonce, None).is_ok());
     }
 }

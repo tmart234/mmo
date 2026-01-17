@@ -1,7 +1,7 @@
 // Test TPM quote verification logic
 
 use common::tpm::{verify_quote, SimulatedTpm, TpmProvider};
-use std::collections::HashMap;
+use std::collections::BTreeMap; // Changed from HashMap
 
 #[test]
 fn test_tpm_quote_verification_success() {
@@ -47,12 +47,12 @@ fn test_tpm_quote_verification_pcr_check() {
     let quote = tpm.quote(&[0], &nonce).unwrap();
 
     // Verify with correct expected PCR values
-    let mut expected_pcrs = HashMap::new();
+    let mut expected_pcrs = BTreeMap::new(); // Changed from HashMap
     expected_pcrs.insert(0, expected_pcr0);
     assert!(verify_quote(&quote, &nonce, Some(&expected_pcrs)).is_ok());
 
     // Verify with wrong expected PCR values
-    let mut wrong_pcrs = HashMap::new();
+    let mut wrong_pcrs = BTreeMap::new(); // Changed from HashMap
     wrong_pcrs.insert(0, [0u8; 32]); // Wrong value
     let result = verify_quote(&quote, &nonce, Some(&wrong_pcrs));
     assert!(result.is_err());

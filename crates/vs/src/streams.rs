@@ -267,7 +267,7 @@ pub fn spawn_uni_heartbeat_listener(conn: &Connection, ctx: VsCtx, session_id: [
     tokio::spawn(async move {
         // Track expected PCR values from initial attestation
         // In production, these would be stored in ctx.sessions at JoinRequest time
-        let mut baseline_pcrs: Option<std::collections::HashMap<u8, [u8; 32]>> = None;
+        let mut baseline_pcrs: Option<std::collections::BTreeMap<u8, [u8; 32]>> = None;
 
         loop {
             let mut recv = match conn.accept_uni().await {
