@@ -14,6 +14,7 @@ use bevy::core_pipeline::tonemapping::Tonemapping;
 
 use client_bevy::{gather_input_impl, pump_snapshots_impl};
 use client_core::{connect_and_handshake_with_retry, recv_world, send_input};
+use common::framing::send_msg_continue;
 use common::proto::{ClientCmd, ClientToGs, WorldSnapshot};
 use std::{sync::Mutex, time::Duration};
 use tokio::sync::mpsc;
@@ -249,11 +250,16 @@ fn net_startup(mut commands: Commands) {
             .expect("tokio runtime");
 
         rt.block_on(async move {
+            println!("[NET] connecting to {}...", gs_addr);
+            
             let mut sess =
                 match connect_and_handshake_with_retry(&gs_addr, 10, Duration::from_millis(200))
                     .await
                 {
-                    Ok(s) => s,
+                    Ok(s) => {
+                        println!("[NET] connected! session={}", hex::encode(&s.session_id[..4]));
+                        s
+                    }
                     Err(e) => {
                         eprintln!("[NET] failed to connect/handshake: {e:#}");
                         return;
@@ -299,7 +305,10 @@ fn net_startup(mut commands: Commands) {
                 }
             }
 
-            let _ = common::tcp_framing::tcp_send_msg(&mut sess.sock, &ClientToGs::Bye).await;
+            // Graceful shutdown: send Bye over QUIC stream (not TCP!)
+            println!("[NET] sending Bye...");
+            let _ = send_msg_continue(&mut sess.send_stream, &ClientToGs::Bye).await;
+            println!("[NET] disconnected.");
         });
     });
 }

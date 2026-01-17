@@ -1,8 +1,8 @@
 // crates/gs-sim/src/client_port.rs
 use common::{
     crypto::{client_input_sign_bytes, now_ms, receipt_tip_update},
-    framing::{recv_msg, send_msg},
-    proto::{AuthoritativeEvent, ClientCmd, ClientToGs, PlayTicket, ServerHello, WorldSnapshot},
+    framing::{recv_msg, send_msg_continue},
+    proto::{AuthoritativeEvent, ClientCmd, ClientHello, ClientToGs, PlayTicket, ServerHello, WorldSnapshot},
 };
 use ed25519_dalek::{Signature, VerifyingKey};
 use quinn::{Endpoint, ServerConfig};
@@ -13,7 +13,7 @@ use std::{
 };
 use tokio::{
     sync::watch,
-    time::{sleep, Duration},
+    time::{sleep, timeout, Duration},
 };
 
 use crate::ledger::LedgerEvent;
@@ -21,6 +21,7 @@ use crate::state::{PlayerState, Shared};
 
 const NONCE_WINDOW: u64 = 4; // allow nonce jumps up to +4
 const TICKET_RING_MAX: usize = 32;
+const CLIENT_HELLO_TIMEOUT_SECS: u64 = 10;
 
 /// Configure QUIC server for GS client port.
 fn configure_quic_server() -> anyhow::Result<ServerConfig> {
@@ -48,6 +49,7 @@ fn configure_quic_server() -> anyhow::Result<ServerConfig> {
 /// QUIC listener that talks to client instances (client-sim / client-bevy).
 ///
 /// Security properties per client connection:
+///  - client must send ClientHello first (materializes QUIC stream)
 ///  - client must staple a fresh VS-signed PlayTicket
 ///  - ticket must match our session / be within time window
 ///  - ticket.client_binding must match client_pub (if bound)
@@ -163,7 +165,7 @@ pub async fn client_port_task(
     }
 }
 
-/// Handle a single client connection: accept bi-stream, send ServerHello, then process inputs.
+/// Handle a single client connection: accept bi-stream, receive ClientHello, send ServerHello, then process inputs.
 async fn handle_client_connection(
     conn: quinn::Connection,
     peer_addr: std::net::SocketAddr,
@@ -176,17 +178,33 @@ async fn handle_client_connection(
     let task_start = std::time::Instant::now();
     let conn_id = conn.stable_id();
 
+    // =========================================================================
+    // Step 1: Accept bi-stream from client
+    //
+    // NOTE: In QUIC, accept_bi() will block until the client sends data on
+    // the stream. The client must send ClientHello first to "materialize"
+    // the stream. See the comment in ClientHello for details.
+    // =========================================================================
     println!(
-        "[GS] {:?} [TASK {}] calling accept_bi() on conn_id={}...",
+        "[GS] {:?} [TASK {}] calling accept_bi() on conn_id={} (waiting for client to send data)...",
         task_start.elapsed(),
         peer_addr,
         conn_id
     );
 
-    // Accept bi-stream from client
-    let (mut send_stream, mut recv_stream) = conn
-        .accept_bi()
+    // Add a timeout to accept_bi to catch clients that open but don't send
+    let accept_timeout = Duration::from_secs(CLIENT_HELLO_TIMEOUT_SECS);
+    let (mut send_stream, mut recv_stream) = timeout(accept_timeout, conn.accept_bi())
         .await
+        .map_err(|_| {
+            eprintln!(
+                "[GS] {:?} [TASK {}] TIMEOUT waiting for client to open bi-stream after {}s",
+                task_start.elapsed(),
+                peer_addr,
+                CLIENT_HELLO_TIMEOUT_SECS
+            );
+            anyhow::anyhow!("timeout waiting for client bi-stream")
+        })?
         .context("accept bi-stream from client")?;
 
     println!(
@@ -195,6 +213,58 @@ async fn handle_client_connection(
         peer_addr,
         conn_id
     );
+
+    // =========================================================================
+    // Step 2: Receive ClientHello (this is what materializes the stream)
+    //
+    // The client MUST send ClientHello first. Without it, we'd be deadlocked
+    // because:
+    //   - We'd wait here for data
+    //   - Client would wait for ServerHello
+    //   - Neither would progress
+    // =========================================================================
+    println!(
+        "[GS] {:?} [TASK {}] waiting for ClientHello (timeout={}s)...",
+        task_start.elapsed(),
+        peer_addr,
+        CLIENT_HELLO_TIMEOUT_SECS
+    );
+
+    let client_hello: ClientHello = timeout(
+        Duration::from_secs(CLIENT_HELLO_TIMEOUT_SECS),
+        recv_msg(&mut recv_stream),
+    )
+    .await
+    .map_err(|_| {
+        eprintln!(
+            "[GS] {:?} [TASK {}] TIMEOUT waiting for ClientHello after {}s",
+            task_start.elapsed(),
+            peer_addr,
+            CLIENT_HELLO_TIMEOUT_SECS
+        );
+        anyhow::anyhow!("timeout waiting for ClientHello")
+    })?
+    .context("recv ClientHello")?;
+
+    println!(
+        "[GS] {:?} [TASK {}] ✓ ClientHello received (client_pub={}, proto_v={})",
+        task_start.elapsed(),
+        peer_addr,
+        hex::encode(&client_hello.client_pub[..4]),
+        client_hello.protocol_version
+    );
+
+    // Validate protocol version
+    if client_hello.protocol_version != ClientHello::CURRENT_PROTOCOL_VERSION {
+        eprintln!(
+            "[GS] {:?} [TASK {}] protocol version mismatch: client={}, server={}",
+            task_start.elapsed(),
+            peer_addr,
+            client_hello.protocol_version,
+            ClientHello::CURRENT_PROTOCOL_VERSION
+        );
+        // For now, just warn - could reject in future
+    }
 
     // If we've already been revoked, refuse this client.
     if *revoke_rx.borrow() {
@@ -239,26 +309,42 @@ async fn handle_client_connection(
         });
     }
 
-    // Send initial ServerHello with the first ticket.
+    // =========================================================================
+    // Step 3: Send ServerHello back to client
+    // =========================================================================
     let hello = ServerHello {
         session_id,
         ticket: first_ticket.clone(),
         vs_pub: vs_pub_bytes,
     };
 
-    println!("[GS] {} sending ServerHello...", peer_addr);
+    println!(
+        "[GS] {:?} [TASK {}] sending ServerHello (session={}, ticket_ctr={})...",
+        task_start.elapsed(),
+        peer_addr,
+        hex::encode(&session_id[..4]),
+        first_ticket.counter
+    );
+
     let send_start = std::time::Instant::now();
-    send_msg(&mut send_stream, &hello)
+    send_msg_continue(&mut send_stream, &hello)
         .await
         .context("send ServerHello")?;
+
     println!(
-        "[GS] {} ServerHello sent in {:?}",
+        "[GS] {:?} [TASK {}] ✓ ServerHello sent in {:?}",
+        task_start.elapsed(),
         peer_addr,
         send_start.elapsed()
     );
 
-    // Now handle client input loop
+    // =========================================================================
+    // Step 4: Main input loop - process ClientInput messages
+    // =========================================================================
     let mut tick: u64 = 0;
+
+    // Use the client_pub from ClientHello for this connection
+    let expected_client_pub = client_hello.client_pub;
 
     loop {
         // Hard revoke? Kill client immediately.
@@ -286,6 +372,17 @@ async fn handle_client_connection(
             Some(ci) => ci,
             None => break,
         };
+
+        // Verify client_pub matches what they declared in ClientHello
+        if ci.client_pub != expected_client_pub {
+            eprintln!(
+                "[GS] client_pub mismatch from {}: expected {}, got {}",
+                peer_addr,
+                hex::encode(&expected_client_pub[..4]),
+                hex::encode(&ci.client_pub[..4])
+            );
+            break;
+        }
 
         let now_ms_val = now_ms();
 
@@ -528,7 +625,7 @@ async fn handle_client_connection(
         };
 
         // Respond with an updated WorldSnapshot back to this client
-        if let Err(e) = send_msg(&mut send_stream, &snapshot).await {
+        if let Err(e) = send_msg_continue(&mut send_stream, &snapshot).await {
             eprintln!("[GS] send WorldSnapshot to {peer_addr} failed: {e:?}");
             break;
         }

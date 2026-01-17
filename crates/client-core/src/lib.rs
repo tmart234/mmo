@@ -2,8 +2,8 @@ pub use anyhow::{anyhow, bail, Context, Result};
 
 use common::{
     crypto::{client_input_sign_bytes, now_ms},
-    framing::{recv_msg, send_msg},
-    proto::{ClientCmd, ClientInput, ClientToGs, PlayTicket, ServerHello, WorldSnapshot},
+    framing::{recv_msg, send_msg_continue},
+    proto::{ClientCmd, ClientHello, ClientInput, ClientToGs, PlayTicket, ServerHello, WorldSnapshot},
 };
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -219,6 +219,11 @@ async fn attempt_connect_and_handshake(gs_addr: &str, hello_timeout: Duration) -
 
     // 2) connect to GS
     let t0 = std::time::Instant::now();
+    println!(
+        "[CLIENT] {:?} connecting to {}...",
+        t0.elapsed(),
+        gs_addr
+    );
     let conn = endpoint
         .connect(gs_addr.parse()?, "localhost")?
         .await
@@ -237,11 +242,36 @@ async fn attempt_connect_and_handshake(gs_addr: &str, hello_timeout: Duration) -
         t0.elapsed(),
         conn_id
     );
-    let (send_stream, mut recv_stream) = conn.open_bi().await.context("open bi-stream")?;
+    let (mut send_stream, mut recv_stream) = conn.open_bi().await.context("open bi-stream")?;
     println!(
-        "[CLIENT] {:?} bi-stream opened on conn_id={}, waiting for ServerHello (timeout={}s)...",
+        "[CLIENT] {:?} bi-stream opened on conn_id={}",
         t0.elapsed(),
-        conn_id,
+        conn_id
+    );
+
+    // =========================================================================
+    // CRITICAL FIX: Send ClientHello FIRST to materialize the QUIC stream!
+    //
+    // In QUIC (quinn), a bi-stream created via `open_bi()` is NOT visible to
+    // the peer's `accept_bi()` until data actually flows on it. Without this
+    // send, both sides deadlock:
+    //   - Client waits for ServerHello
+    //   - GS waits for accept_bi() to return (which never happens)
+    //
+    // The ClientHello also provides early client identification.
+    // =========================================================================
+    let client_hello = ClientHello::new(client_pub);
+    println!(
+        "[CLIENT] {:?} sending ClientHello (pub={}) to materialize stream...",
+        t0.elapsed(),
+        hex::encode(&client_pub[..4])
+    );
+    send_msg_continue(&mut send_stream, &client_hello)
+        .await
+        .context("send ClientHello")?;
+    println!(
+        "[CLIENT] {:?} ClientHello sent, waiting for ServerHello (timeout={}s)...",
+        t0.elapsed(),
         hello_timeout.as_secs()
     );
 
@@ -257,11 +287,15 @@ async fn attempt_connect_and_handshake(gs_addr: &str, hello_timeout: Duration) -
             anyhow!("timeout waiting for ServerHello")
         })?
         .context("recv ServerHello")?;
-    println!("[CLIENT] {:?} ServerHello received!", t0.elapsed());
+    println!(
+        "[CLIENT] {:?} ServerHello received! (session={})",
+        t0.elapsed(),
+        hex::encode(&sh.session_id[..4])
+    );
 
     let ticket: PlayTicket = sh.ticket.clone();
 
-    // 3) enforce VS key pinning
+    // 5) enforce VS key pinning
     if sh.vs_pub != pinned_vs_pub {
         bail!(
             "untrusted VS pubkey from GS.\n  got:  {:02x?}\n  want: {:02x?}",
@@ -270,17 +304,17 @@ async fn attempt_connect_and_handshake(gs_addr: &str, hello_timeout: Duration) -
         );
     }
 
-    // 4) enforce ticket client binding (if bound)
+    // 6) enforce ticket client binding (if bound)
     if ticket.client_binding != [0u8; 32] && ticket.client_binding != client_pub {
         bail!("ticket client_binding mismatch: this ticket isn't for our client_pub");
     }
 
-    // 5) session_id must match
+    // 7) session_id must match
     if ticket.session_id != sh.session_id {
         bail!("ServerHello session mismatch between GS and ticket");
     }
 
-    // 6) verify VS signature on ticket
+    // 8) verify VS signature on ticket
     // VS signed: (session_id, client_binding, counter, not_before_ms, not_after_ms, prev_ticket_hash)
     let body_tuple = (
         ticket.session_id,
@@ -304,6 +338,13 @@ async fn attempt_connect_and_handshake(gs_addr: &str, hello_timeout: Duration) -
         ticket.not_before_ms.saturating_sub(500) <= now
             && now <= ticket.not_after_ms.saturating_add(500)
     };
+
+    println!(
+        "[CLIENT] {:?} handshake complete, session={}, ticket_ctr={}",
+        t0.elapsed(),
+        hex::encode(&sh.session_id[..4]),
+        ticket.counter
+    );
 
     Ok(Session {
         send_stream,
@@ -332,7 +373,7 @@ pub async fn send_input(sess: &mut Session, nonce: u64, cmd: ClientCmd) -> Resul
 
     let ci = ClientInput {
         session_id: sess.session_id,         // <-- [u8;16]
-        ticket_counter: sess.ticket.counter, // u32
+        ticket_counter: sess.ticket.counter, // u64
         ticket_sig_vs: sess.ticket.sig_vs,   // [u8;64]
         client_nonce: nonce,
         cmd,
@@ -341,7 +382,7 @@ pub async fn send_input(sess: &mut Session, nonce: u64, cmd: ClientCmd) -> Resul
     };
 
     let msg = ClientToGs::Input(Box::new(ci));
-    send_msg(&mut sess.send_stream, &msg)
+    send_msg_continue(&mut sess.send_stream, &msg)
         .await
         .context("send ClientInput")
 }

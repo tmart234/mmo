@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use client_core::*;
-use common::framing::send_msg;
+use common::framing::send_msg_continue;
 use common::proto::{ClientCmd, ClientToGs};
 use tokio::time::{sleep, Duration};
 
@@ -24,11 +24,18 @@ async fn main() -> Result<()> {
 
     let opts = Opts::parse();
 
+    println!("[CLIENT] starting, connecting to {}...", opts.gs_addr);
+
     // Be resilient if GS hasn't opened its client port yet:
     //  - up to 10 attempts
     //  - start with 150ms backoff, exponential to ~2s cap
     let mut sess =
         connect_and_handshake_with_retry(&opts.gs_addr, 10, Duration::from_millis(150)).await?;
+
+    println!(
+        "[CLIENT] connected! session={}, starting game loop...",
+        hex::encode(&sess.session_id[..4])
+    );
 
     let mut nonce = 1_u64;
 
@@ -45,12 +52,14 @@ async fn main() -> Result<()> {
         sleep(Duration::from_millis(200)).await;
 
         if opts.smoke_test && nonce > 5 {
+            println!("[CLIENT] smoke test complete (nonce={}), sending Bye", nonce);
             break;
         }
     }
 
     // Graceful shutdown: tell GS we're done before closing the stream
-    let _ = send_msg(&mut sess.send_stream, &ClientToGs::Bye).await;
+    let _ = send_msg_continue(&mut sess.send_stream, &ClientToGs::Bye).await;
+    println!("[CLIENT] Bye sent, exiting.");
 
     Ok(())
 }

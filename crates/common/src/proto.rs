@@ -80,7 +80,38 @@ pub struct PlayTicket {
     pub sig_vs: [u8; 64],
 }
 
-/// GS → client as first message on the local TCP link.
+/// Client → GS as the very first message to materialize the QUIC bi-stream.
+///
+/// In QUIC (quinn), a bi-stream created via `open_bi()` is NOT visible to the
+/// peer's `accept_bi()` until data actually flows on it. This means:
+///   - Client calls `open_bi()` → gets (SendStream, RecvStream)
+///   - Client waits on RecvStream for ServerHello
+///   - GS calls `accept_bi()` → BLOCKS forever because no data has flowed
+///
+/// The fix: client MUST send something first. This `ClientHello` message
+/// serves that purpose and also provides early client identification.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ClientHello {
+    /// Client's public key (for early identification/binding check).
+    pub client_pub: [u8; 32],
+    /// Protocol version (for future compatibility).
+    pub protocol_version: u32,
+}
+
+impl ClientHello {
+    /// Current protocol version. Bump when making breaking changes.
+    pub const CURRENT_PROTOCOL_VERSION: u32 = 1;
+
+    /// Create a new ClientHello with the current protocol version.
+    pub fn new(client_pub: [u8; 32]) -> Self {
+        Self {
+            client_pub,
+            protocol_version: Self::CURRENT_PROTOCOL_VERSION,
+        }
+    }
+}
+
+/// GS → client as first response after receiving ClientHello.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ServerHello {
     pub session_id: [u8; 16],
