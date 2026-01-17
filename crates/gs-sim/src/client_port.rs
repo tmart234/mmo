@@ -20,7 +20,7 @@ use tokio::{
 };
 
 use crate::ledger::LedgerEvent;
-use crate::state::{PlayerState, Shared};
+use crate::state::{CmdKey, OpResult, PlayerState, Shared, TokenBucket};
 
 const NONCE_WINDOW: u64 = 4; // allow nonce jumps up to +4
 const TICKET_RING_MAX: usize = 32;
@@ -65,6 +65,7 @@ fn configure_quic_server() -> anyhow::Result<ServerConfig> {
 ///  - we update per-player world state in shared memory
 ///  - we fold BOTH the ClientInput and an AuthoritativeEvent into receipt_tip
 ///  - we respond with a WorldSnapshot including you + others
+///  - Stage 1.1: SpendCoins operations are idempotent via op_id LRU cache
 ///
 /// When VS revokes us (or we miss tickets), we disconnect everyone.
 pub async fn client_port_task(
@@ -187,10 +188,6 @@ async fn handle_client_connection(
 
     // =========================================================================
     // Step 1: Accept bi-stream from client
-    //
-    // NOTE: In QUIC, accept_bi() will block until the client sends data on
-    // the stream. The client must send ClientHello first to "materialize"
-    // the stream. See the comment in ClientHello for details.
     // =========================================================================
     println!(
         "[GS] {:?} [TASK {}] calling accept_bi() on conn_id={} \
@@ -200,7 +197,6 @@ async fn handle_client_connection(
         conn_id
     );
 
-    // Add a timeout to accept_bi to catch clients that open but don't send
     let accept_timeout = Duration::from_secs(CLIENT_HELLO_TIMEOUT_SECS);
     let (mut send_stream, mut recv_stream) = timeout(accept_timeout, conn.accept_bi())
         .await
@@ -223,13 +219,7 @@ async fn handle_client_connection(
     );
 
     // =========================================================================
-    // Step 2: Receive ClientHello (this is what materializes the stream)
-    //
-    // The client MUST send ClientHello first. Without it, we'd be deadlocked
-    // because:
-    //   - We'd wait here for data
-    //   - Client would wait for ServerHello
-    //   - Neither would progress
+    // Step 2: Receive ClientHello
     // =========================================================================
     println!(
         "[GS] {:?} [TASK {}] waiting for ClientHello (timeout={}s)...",
@@ -271,7 +261,6 @@ async fn handle_client_connection(
             client_hello.protocol_version,
             ClientHello::CURRENT_PROTOCOL_VERSION
         );
-        // For now, just warn - could reject in future
     }
 
     // If we've already been revoked, refuse this client.
@@ -285,7 +274,7 @@ async fn handle_client_connection(
         (guard.session_id, guard.vs_pub.to_bytes())
     };
 
-    // Get the current ticket (should already be available since we checked in main loop).
+    // Get the current ticket
     let local_ticket_rx = ticket_rx.clone();
     let first_ticket: PlayTicket = match local_ticket_rx.borrow().clone() {
         Some(t) => t,
@@ -294,14 +283,13 @@ async fn handle_client_connection(
 
     // === Ticket ring so we accept recently rolled tickets even when client idles ===
     let ring: Arc<Mutex<VecDeque<PlayTicket>>> = Arc::new(Mutex::new(VecDeque::new()));
-    // Track the latest ticket counter we've sent to this client
     let latest_sent_counter: Arc<std::sync::atomic::AtomicU64> =
         Arc::new(std::sync::atomic::AtomicU64::new(first_ticket.counter));
     {
         let mut r = ring.lock().unwrap();
         r.push_back(first_ticket.clone());
     }
-    // Watcher that pushes every new ticket into the ring (cap = TICKET_RING_MAX)
+    // Watcher that pushes every new ticket into the ring
     {
         let mut rx = local_ticket_rx.clone();
         let ring_for_watcher = ring.clone();
@@ -353,8 +341,6 @@ async fn handle_client_connection(
     // Step 4: Main input loop - process ClientInput messages
     // =========================================================================
     let mut tick: u64 = 0;
-
-    // Use the client_pub from ClientHello for this connection
     let expected_client_pub = client_hello.client_pub;
 
     loop {
@@ -367,7 +353,7 @@ async fn handle_client_connection(
         // Receive exactly one client message.
         let msg_res = recv_msg::<ClientToGs>(&mut recv_stream).await;
         let ci = match msg_res {
-            Ok(ClientToGs::Input(ci)) => Some(*ci), // enum carries Box<ClientInput>
+            Ok(ClientToGs::Input(ci)) => Some(*ci),
             Ok(ClientToGs::Bye) => {
                 println!("[GS] client {} said Bye; closing gracefully", peer_addr);
                 break;
@@ -378,7 +364,6 @@ async fn handle_client_connection(
             }
         };
 
-        // If we didn't get an Input (i.e., was Bye), end the loop.
         let ci = match ci {
             Some(ci) => ci,
             None => break,
@@ -398,9 +383,7 @@ async fn handle_client_connection(
         let now_ms_val = now_ms();
 
         // === Everything that touches shared state lives in this block ===
-        // We do NOT hold the mutex across an .await.
         let step_res: Result<WorldSnapshot, ()> = (|| {
-            // Snapshot GS-shared info we need BEFORE we await anything else.
             let mut guard = shared.lock().unwrap();
 
             // Phase 0: read current per-player state.
@@ -417,8 +400,6 @@ async fn handle_client_connection(
             };
 
             let ticket_matches = |pt: &PlayTicket| -> bool {
-                // Allow grace period for recently expired tickets (clock skew / race conditions)
-                // This prevents disconnects when a new ticket arrives but client hasn't received it yet
                 if now_ms_val < pt.not_before_ms
                     || now_ms_val > pt.not_after_ms.saturating_add(TICKET_EXPIRY_GRACE_MS)
                 {
@@ -471,14 +452,10 @@ async fn handle_client_connection(
                 return Err(());
             }
 
-            // ---- 2a) rate-limit per-cmd using TokenBucket (runtime buckets) ----
-            let rt = guard
-                .runtime
-                .get_or_insert_with(|| crate::state::PlayerRuntime {
-                    buckets: std::collections::HashMap::new(),
-                });
+            // ---- 2a) rate-limit per-cmd using TokenBucket ----
+            let rt = guard.runtime_mut();
 
-            let key = (ci.client_pub, crate::state::CmdKey::Move);
+            let key = (ci.client_pub, CmdKey::Move);
             match rt.buckets.entry(key) {
                 std::collections::hash_map::Entry::Occupied(mut o) => {
                     if !o.get_mut().take(1.0, now_ms_val) {
@@ -487,8 +464,8 @@ async fn handle_client_connection(
                     }
                 }
                 std::collections::hash_map::Entry::Vacant(v) => {
-                    let mut b = crate::state::TokenBucket::new(10.0, 10.0, now_ms_val); // cap=10, 10/sec
-                    let _ = b.take(1.0, now_ms_val); // spend the first token
+                    let mut b = TokenBucket::new(10.0, 10.0, now_ms_val);
+                    let _ = b.take(1.0, now_ms_val);
                     v.insert(b);
                 }
             }
@@ -524,7 +501,7 @@ async fn handle_client_connection(
             }
 
             // ---- 4) simulation / command handling ----
-            let (new_x, new_y) = match ci.cmd {
+            let (new_x, new_y) = match &ci.cmd {
                 ClientCmd::Move { mut dx, mut dy } => {
                     // per-tick displacement cap (anti-speedhack / anti-teleport)
                     const MAX_STEP: f32 = 1.0;
@@ -549,12 +526,65 @@ async fn handle_client_connection(
 
                     (nx, ny)
                 }
-                ClientCmd::SpendCoins(_) => {
-                    eprintln!(
-                        "[GS] SpendCoins not implemented; rejecting from {}",
-                        peer_addr
+                ClientCmd::SpendCoins(sc) => {
+                    // =========================================================
+                    // Stage 1.1: Economy Idempotency Check
+                    //
+                    // Before processing any economy operation, check if we've
+                    // already processed this (client_pub, op_id) pair.
+                    // If yes, this is a replay - ignore but don't error.
+                    // If no, process and cache the result.
+                    // =========================================================
+
+                    let rt = guard.runtime_mut();
+
+                    // Check idempotency: have we already processed this op?
+                    if let Some(cached_result) = rt.check_idempotency(&ci.client_pub, &sc.op_id) {
+                        println!(
+                            "[GS] SpendCoins replay detected from {peer_addr} \
+                             (op_id={}, processed_at={}ms ago, success={})",
+                            hex::encode(&sc.op_id[..4]),
+                            now_ms_val.saturating_sub(cached_result.processed_at_ms),
+                            cached_result.success
+                        );
+                        // Return current position - don't change state
+                        return Ok(WorldSnapshot {
+                            tick,
+                            you: (prev_x, prev_y),
+                            others: guard
+                                .players
+                                .iter()
+                                .filter(|(pk, _)| **pk != ci.client_pub)
+                                .map(|(pk, ps)| (*pk, ps.x, ps.y))
+                                .collect(),
+                        });
+                    }
+
+                    // Not a replay - process the operation
+                    // TODO: Implement actual economy logic here
+                    // For now, just log and record the operation
+
+                    println!(
+                        "[GS] SpendCoins NEW op from {peer_addr}: op_id={}, amount={}",
+                        hex::encode(&sc.op_id[..4]),
+                        sc.amount
                     );
-                    return Err(());
+
+                    // Record the operation in the idempotency cache
+                    // Re-borrow runtime since we dropped it in the check
+                    let rt = guard.runtime_mut();
+                    rt.record_op(
+                        ci.client_pub,
+                        sc.op_id,
+                        OpResult {
+                            processed_at_ms: now_ms_val,
+                            success: true, // Would be based on actual operation result
+                            balance_after: Some(0), // Would be actual balance
+                        },
+                    );
+
+                    // SpendCoins doesn't change position
+                    (prev_x, prev_y)
                 }
             };
 
@@ -588,7 +618,7 @@ async fn handle_client_connection(
             let new_tip = receipt_tip_update(&prev_tip, &ci_bytes, &ev_bytes);
             guard.receipt_tip = new_tip;
 
-            // Append to ledger if enabled (copy values first to avoid borrow conflicts)
+            // Append to ledger if enabled
             let session_id_copy = guard.session_id;
             let client_pub_copy = ci.client_pub;
             if let Some(ledger) = guard.ledger.as_mut() {
@@ -598,7 +628,10 @@ async fn handle_client_connection(
                     t_unix_ms: now_ms_val,
                     session_id: &session_id_copy,
                     client_pub: &client_pub_copy,
-                    op: "Move",
+                    op: match &ci.cmd {
+                        ClientCmd::Move { .. } => "Move",
+                        ClientCmd::SpendCoins(_) => "SpendCoins",
+                    },
                     op_id: &op_id16,
                     delta: 0,
                     balance_before: 0,
@@ -630,7 +663,7 @@ async fn handle_client_connection(
             };
 
             Ok(snapshot)
-        })(); // drop mutex guard here
+        })();
 
         // If validation or sim failed, kill client.
         let snapshot = match step_res {
@@ -647,7 +680,6 @@ async fn handle_client_connection(
             if let Some(newest) = ring_guard.back() {
                 let last_sent = latest_sent_counter.load(Ordering::SeqCst);
                 if newest.counter > last_sent {
-                    // Clone values while holding lock
                     let new_counter = newest.counter;
                     let update = GsToClient::TicketUpdate(TicketUpdate {
                         ticket: newest.clone(),
@@ -659,7 +691,7 @@ async fn handle_client_connection(
             } else {
                 None
             }
-        }; // ring_guard dropped here, before any await
+        };
 
         // Send ticket update if we have one
         if let Some((update, new_counter)) = maybe_ticket_update {
@@ -678,7 +710,7 @@ async fn handle_client_connection(
             break;
         }
 
-        // tiny breather so a spammy client doesn't 100% busy-loop us
+        // tiny breather
         sleep(Duration::from_millis(5)).await;
     }
 

@@ -16,7 +16,8 @@ use std::{
     sync::{atomic::AtomicU64, Arc, Mutex},
     time::Duration,
 };
-use tokio::{sync::watch, time::sleep};
+use tokio::sync::{watch, Mutex as TokioMutex};
+use tokio::time::sleep;
 
 mod client_port;
 mod heartbeat;
@@ -25,7 +26,7 @@ mod state;
 mod tickets;
 
 use crate::client_port::client_port_task;
-use crate::heartbeat::heartbeat_loop;
+use crate::heartbeat::heartbeat_loop_with_tpm;
 use crate::ledger::Ledger;
 use crate::state::{GsShared, Shared};
 use crate::tickets::ticket_listener;
@@ -51,6 +52,9 @@ struct Opts {
     gs_pk: String,
 
     /// Enable TPM attestation (uses simulated TPM for testing)
+    /// Stage 1.2: When enabled, GS will:
+    /// - Generate initial TPM quote at JoinRequest
+    /// - Periodically re-attest every ~60 seconds in heartbeats
     #[arg(long)]
     enable_tpm: bool,
 }
@@ -85,8 +89,9 @@ async fn main() -> Result<()> {
 
     //
     // 3b. Initialize TPM (simulated for testing, hardware for production).
+    //     Stage 1.2: TPM is now passed to heartbeat loop for continuous attestation.
     //
-    let tpm: Option<Box<dyn TpmProvider>> = if opts.enable_tpm {
+    let tpm: Option<Arc<TokioMutex<Box<dyn TpmProvider>>>> = if opts.enable_tpm {
         println!("[GS] initializing simulated TPM for attestation");
         let mut tpm = SimulatedTpm::new();
 
@@ -98,7 +103,15 @@ async fn main() -> Result<()> {
         tpm.extend_pcr(1, opts.gs_id.as_bytes())
             .context("extend PCR 1 with gs_id")?;
 
-        Some(Box::new(tpm))
+        println!(
+            "[GS] TPM PCRs extended: PCR0=sw_hash, PCR1=gs_id ({})",
+            opts.gs_id
+        );
+
+        // Wrap in Arc<TokioMutex> for async sharing with heartbeat loop
+        Some(Arc::new(TokioMutex::new(
+            Box::new(tpm) as Box<dyn TpmProvider>
+        )))
     } else {
         None
     };
@@ -120,18 +133,20 @@ async fn main() -> Result<()> {
 
     let now = now_ms();
     let to_sign = join_request_sign_bytes(&opts.gs_id, &sw_hash, now, &nonce, &eph_pub_bytes);
-    let sig_gs: Sig = sign(&gs_sk_long, &to_sign).to_vec(); // [u8;64] -> Vec<u8>
+    let sig_gs: Sig = sign(&gs_sk_long, &to_sign).to_vec();
 
     // Generate TPM quote if TPM is enabled
-    let tpm_quote = if let Some(ref tpm) = tpm {
-        println!("[GS] generating TPM attestation quote (PCRs 0,1)");
-        let quote_nonce = nonce; // Reuse join request nonce
+    let tpm_quote = if let Some(ref tpm_arc) = tpm {
+        println!("[GS] generating initial TPM attestation quote (PCRs 0,1)");
+        let quote_nonce = nonce;
         let mut nonce_32 = [0u8; 32];
         nonce_32[..16].copy_from_slice(&quote_nonce);
 
+        let tpm_guard = tpm_arc.lock().await;
         Some(
-            tpm.quote(&[0, 1], &nonce_32)
-                .context("generate TPM quote")?,
+            tpm_guard
+                .quote(&[0, 1], &nonce_32)
+                .context("generate initial TPM quote")?,
         )
     } else {
         None
@@ -157,7 +172,6 @@ async fn main() -> Result<()> {
     //
     let vs_vk = VerifyingKey::from_bytes(&ja.vs_pub).context("bad vs_pub from JoinAccept")?;
 
-    // ja.sig_vs is Vec<u8>, but verify() wants &[u8; 64]
     let sig_vs_arr: [u8; 64] = ja
         .sig_vs
         .clone()
@@ -201,13 +215,15 @@ async fn main() -> Result<()> {
     // 9. Spawn runtime tasks: heartbeat, ticket listener, (client port later).
     //
     // a) heartbeat_loop: GS → VS liveness + receipt_tip + sw_hash re-attestation
+    //    Stage 1.2: Now includes periodic TPM quotes when TPM is enabled
     let hb_counter = Arc::new(AtomicU64::new(0));
-    let heartbeat_task = tokio::spawn(heartbeat_loop(
+    let heartbeat_task = tokio::spawn(heartbeat_loop_with_tpm(
         conn.clone(),
         hb_counter.clone(),
-        eph_sk, // move ephemeral GS session signing key
+        eph_sk,
         ja.session_id,
         shared.clone(),
+        tpm, // Stage 1.2: Pass TPM for continuous attestation
     ));
 
     // b) ticket_listener:
@@ -256,7 +272,6 @@ async fn main() -> Result<()> {
 
     // c) client_port_task:
     //    TCP listener accepting local client-sim connections.
-    //    Each client waits for first ticket via ticket_rx before we send ServerHello.
     let client_port_task_handle = tokio::spawn(client_port_task(
         shared.clone(),
         revoke_rx.clone(),
@@ -265,7 +280,6 @@ async fn main() -> Result<()> {
 
     //
     // 10. --test_once mode: let smoke test run, then exit.
-    //     Give client enough time to connect, handshake, and complete its test.
     //
     if opts.test_once {
         sleep(Duration::from_secs(15)).await;
@@ -400,7 +414,6 @@ fn make_endpoint_and_addr(vs: &str) -> Result<(Endpoint, SocketAddr)> {
 
     let server_addr: SocketAddr = vs.parse().context("bad vs address")?;
 
-    // bind to wildcard IP in same family as VS address
     let bind_ip = match server_addr {
         SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
         SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
@@ -410,12 +423,7 @@ fn make_endpoint_and_addr(vs: &str) -> Result<(Endpoint, SocketAddr)> {
     let udp = UdpSocket::bind(local_addr)?;
     udp.set_nonblocking(true)?;
 
-    let endpoint = Endpoint::new(
-        EndpointConfig::default(),
-        None, // client-only endpoint
-        udp,
-        Arc::new(TokioRuntime),
-    )?;
+    let endpoint = Endpoint::new(EndpointConfig::default(), None, udp, Arc::new(TokioRuntime))?;
 
     Ok((endpoint, server_addr))
 }

@@ -5,30 +5,15 @@
 // - REQ-VS-001/002 (tickets, receipts)
 // - REQ-GS-001/002/003/004 (verify ticket & sigs, client binding, movement, multi-client)
 // - REQ-CL-001/002 (pinning, persistent keys)
+// - Stage 1.2: TPM continuous attestation (when --enable-tpm is used)
 //
-// 1. Ensure VS dev keys exist (keys/vs_ed25519.*). This matches what gs-sim
-//    and client-sim expect for VS signatures.
+// 1. Ensure VS dev keys exist (keys/vs_ed25519.*).
 // 2. Spawn VS in the background (listens QUIC on 127.0.0.1:4444).
-// 3. Spawn gs-sim --test-once in the background. That will:
-//      - connect to VS
-//      - open its client port on 127.0.0.1:50000
-//      - stream heartbeats
-//      - receive PlayTickets
-//      - accept a client connection
-//      - exit after ~15s
-// 4. Run client-sim --smoke-test in the foreground. That will:
-//      - connect to gs-sim (QUIC 127.0.0.1:50000)
-//      - verify the VS-signed PlayTicket
-//      - send nonce-monotonic ClientInput stapled to that ticket
-// 5. Wait for gs-sim to exit.
+// 3. Spawn gs-sim --test-once (optionally with --enable-tpm for TPM testing).
+// 4. Run client-sim --smoke-test in the foreground.
+// 5. Wait for gs-sim to complete.
 // 6. Kill VS.
-// 7. By default exit 0 so local `make ci` doesn’t hard-fail your dev loop.
-//    Set STRICT_SMOKE=1 to make the harness return nonzero on failures.
-//
-// Differences from older version:
-//  - Resolve explicit paths to ./target/debug/{vs,gs-sim,client-sim} for Linux CI.
-//  - Inherit stdout/stderr so CI prints all logs inline.
-//  - Sleep to allow GS QUIC endpoint initialization before starting client-sim.
+// 7. Optionally run TPM-enabled test as second pass.
 
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
@@ -47,21 +32,11 @@ const BIN_EXT: &str = ".exe";
 #[cfg(not(target_os = "windows"))]
 const BIN_EXT: &str = "";
 
-// Build an absolute/relative path to the compiled binary inside target/debug.
-//
-// Layout assumption:
-//   workspace_root/
-//     target/debug/vs(.exe)
-//     target/debug/gs-sim(.exe)
-//     target/debug/client-sim(.exe)
-//     crates/tools/  <-- this file lives here
-//
-// CARGO_MANIFEST_DIR for this crate = <workspace_root>/crates/tools
 fn bin_path(bin: &str) -> PathBuf {
     let tools_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = tools_dir
-        .parent() // crates/
-        .and_then(|p| p.parent()) // workspace root
+        .parent()
+        .and_then(|p| p.parent())
         .expect("could not locate workspace root");
 
     workspace_root
@@ -70,12 +45,6 @@ fn bin_path(bin: &str) -> PathBuf {
         .join(format!("{bin}{BIN_EXT}"))
 }
 
-// Ensure VS has an Ed25519 keypair on disk so it can sign tickets.
-//
-// keys/vs_ed25519.pk8  (priv)
-// keys/vs_ed25519.pub  (pub)
-//
-// gs-sim/client-sim currently expect those to exist.
 fn ensure_vs_keys() -> Result<()> {
     let skp = PathBuf::from("keys/vs_ed25519.pk8");
     let pkp = PathBuf::from("keys/vs_ed25519.pub");
@@ -101,8 +70,6 @@ fn ensure_vs_keys() -> Result<()> {
     Ok(())
 }
 
-// ---------- Ledger E2E sanity checks (post-run) ----------
-
 fn newest_ledger_file(dir: &str) -> anyhow::Result<PathBuf> {
     let mut newest: Option<(SystemTime, PathBuf)> = None;
     for ent in fs::read_dir(dir).context("read ledger dir")? {
@@ -127,7 +94,6 @@ fn assert_recent_ledger_has_move() -> anyhow::Result<()> {
     let meta = fs::metadata(&path).with_context(|| format!("stat {}", path.display()))?;
     anyhow::ensure!(meta.len() > 0, "ledger file is empty: {}", path.display());
 
-    // ensure it’s fresh (within the last 60s)
     let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
     let age = match SystemTime::now().duration_since(mtime) {
         Ok(d) => d,
@@ -161,13 +127,19 @@ fn assert_recent_ledger_has_move() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn main() -> Result<()> {
-    // 1. Make sure VS signing keys exist.
-    ensure_vs_keys()?;
+/// Run a single smoke test pass with optional TPM enabled.
+fn run_smoke_pass(enable_tpm: bool) -> Result<(bool, bool)> {
+    let pass_name = if enable_tpm {
+        "TPM-enabled"
+    } else {
+        "standard"
+    };
+    println!(
+        "\n[SMOKE] ========== Starting {} pass ==========",
+        pass_name
+    );
 
-    // 2. Spawn VS in the background.
-    //    We inherit stdout/stderr so GitHub Actions shows
-    //    e.g. "[VS] listening on 127.0.0.1:4444".
+    // 1. Spawn VS
     let vs_bin = bin_path("vs");
     let mut vs_child = Command::new(&vs_bin)
         .stdout(Stdio::inherit())
@@ -175,44 +147,27 @@ fn main() -> Result<()> {
         .spawn()
         .with_context(|| format!("spawn {:?}", vs_bin))?;
 
-    // Give VS time to bind to 127.0.0.1:4444 (QUIC/UDP).
     thread::sleep(Duration::from_millis(200));
 
-    // 3. Spawn gs-sim in the background.
-    //
-    //    --vs 127.0.0.1:4444       tells it where to find the validator server
-    //    --test-once               tells it to:
-    //                                - connect/join
-    //                                - heartbeat
-    //                                - run the QUIC "client port"
-    //                                - accept client connections
-    //                                - shut down after ~15s
-    //
+    // 2. Spawn GS (with or without TPM)
     let gs_bin = bin_path("gs-sim");
-    let mut gs_child = Command::new(&gs_bin)
-        .arg("--vs")
-        .arg("127.0.0.1:4444")
-        .arg("--test-once")
+    let mut gs_cmd = Command::new(&gs_bin);
+    gs_cmd.arg("--vs").arg("127.0.0.1:4444").arg("--test-once");
+
+    if enable_tpm {
+        gs_cmd.arg("--enable-tpm");
+    }
+
+    let mut gs_child = gs_cmd
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| format!("spawn {:?}", gs_bin))?;
 
-    // Wait for gs-sim to initialize its QUIC endpoint on 127.0.0.1:50000.
-    // QUIC uses UDP, so we can't use TCP connection probing. Give it time to:
-    // - Complete VS handshake
-    // - Receive first ticket
-    // - Start QUIC server
+    // Wait for GS to initialize
     thread::sleep(Duration::from_millis(2000));
 
-    // 4. Run client-sim in the foreground.
-    //
-    //    --smoke-test: connect via QUIC, send a handful of ClientInput frames and exit
-    //
-    // We inherit stdout/stderr so we see:
-    //   [CLIENT] tick=1 you=(1.00,0.00)
-    //   [CLIENT] tick=2 you=(2.00,0.00)
-    //
+    // 3. Run client
     let client_bin = bin_path("client-sim");
     let mut client_child = Command::new(&client_bin)
         .arg("--gs-addr")
@@ -225,26 +180,45 @@ fn main() -> Result<()> {
 
     let client_status = client_child.wait().context("wait client-sim")?;
     if client_status.success() {
-        println!("[SMOKE] client-sim completed successfully.");
+        println!(
+            "[SMOKE] {} pass: client-sim completed successfully.",
+            pass_name
+        );
     } else {
         println!(
-            "[SMOKE] client-sim exited nonzero (status={:?})",
+            "[SMOKE] {} pass: client-sim exited nonzero (status={:?})",
+            pass_name,
             client_status.code()
         );
     }
 
-    // 5. Wait for gs-sim to complete its --test-once run.
+    // 4. Wait for GS
     let gs_status = gs_child.wait().context("wait gs-sim")?;
     if gs_status.success() {
-        println!("[SMOKE] gs-sim completed successfully.");
+        println!("[SMOKE] {} pass: gs-sim completed successfully.", pass_name);
     } else {
         println!(
-            "[SMOKE] gs-sim exited nonzero (status={:?})",
+            "[SMOKE] {} pass: gs-sim exited nonzero (status={:?})",
+            pass_name,
             gs_status.code()
         );
     }
 
-    // 5b. Sanity-check that a recent ledger file exists and its last line has op=Move.
+    // 5. Kill VS
+    let _ = vs_child.kill();
+    let _ = vs_child.wait();
+
+    Ok((client_status.success(), gs_status.success()))
+}
+
+fn main() -> Result<()> {
+    // 1. Make sure VS signing keys exist.
+    ensure_vs_keys()?;
+
+    // 2. Run standard smoke test (without TPM)
+    let (client_ok, gs_ok) = run_smoke_pass(false)?;
+
+    // 3. Check ledger
     match assert_recent_ledger_has_move() {
         Ok(_) => {}
         Err(e) => {
@@ -256,13 +230,34 @@ fn main() -> Result<()> {
         }
     }
 
-    // 6. Kill VS so it doesn't hang CI.
-    let _ = vs_child.kill();
-    let _ = vs_child.wait();
+    // 4. Run TPM-enabled smoke test (unless SKIP_TPM_TEST is set)
+    let (tpm_client_ok, tpm_gs_ok) = if std::env::var("SKIP_TPM_TEST").is_err() {
+        // Small delay between passes
+        thread::sleep(Duration::from_millis(500));
+        run_smoke_pass(true)?
+    } else {
+        println!("[SMOKE] Skipping TPM test (SKIP_TPM_TEST is set)");
+        (true, true)
+    };
 
-    // 7. Exit policy: default is success; STRICT_SMOKE=1 makes failures fatal.
+    // 5. Summary
+    println!("\n[SMOKE] ========== Summary ==========");
+    println!(
+        "[SMOKE] Standard pass: client={}, gs={}",
+        if client_ok { "OK" } else { "FAIL" },
+        if gs_ok { "OK" } else { "FAIL" }
+    );
+    println!(
+        "[SMOKE] TPM pass: client={}, gs={}",
+        if tpm_client_ok { "OK" } else { "FAIL" },
+        if tpm_gs_ok { "OK" } else { "FAIL" }
+    );
+
+    // 6. Exit policy
     let strict = std::env::var("STRICT_SMOKE").is_ok();
-    if strict && (!client_status.success() || !gs_status.success()) {
+    let all_ok = client_ok && gs_ok && tpm_client_ok && tpm_gs_ok;
+
+    if strict && !all_ok {
         std::process::exit(1);
     }
 

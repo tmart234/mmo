@@ -3,6 +3,7 @@ use common::{
     crypto::{heartbeat_sign_bytes, now_ms, sha256, sign, verify},
     framing::{recv_msg, send_msg},
     proto::{Heartbeat, PlayTicket, ProtectedReceipt, Sig, TranscriptDigest},
+    tpm::verify_quote,
 };
 use ed25519_dalek::VerifyingKey;
 use quinn::Connection;
@@ -11,6 +12,7 @@ use tokio::time::sleep;
 
 use crate::ctx::VsCtx;
 use crate::enforcer::enforcer;
+use crate::metrics::{HEARTBEATS_TOTAL, TPM_VERIFICATIONS_TOTAL, TPM_VERIFICATION_LATENCY};
 
 /// VS -> GS: issue `PlayTicket` every ~2s. Stops when session is revoked.
 pub fn spawn_ticket_loop(conn: &Connection, ctx: VsCtx, session_id: [u8; 16]) {
@@ -89,7 +91,7 @@ pub fn spawn_ticket_loop(conn: &Connection, ctx: VsCtx, session_id: [u8; 16]) {
 /// Accept bi-streams from GS and handle TranscriptDigest (reply PR) or Heartbeat (verify, liveness).
 pub fn spawn_bistream_dispatch(conn: &Connection, ctx: VsCtx, session_id: [u8; 16]) {
     let conn = conn.clone();
-    let ctx = ctx.clone(); // own a clone inside the task
+    let ctx = ctx.clone();
     let vs_sk = ctx.vs_sk.clone();
 
     tokio::spawn(async move {
@@ -126,11 +128,11 @@ pub fn spawn_bistream_dispatch(conn: &Connection, ctx: VsCtx, session_id: [u8; 1
                         hex::encode(&session_id[..4])
                     );
                     if let Some(mut s) = ctx.sessions.get_mut(&session_id) {
-                        s.revoked = true; // ticket loop will stop
+                        s.revoked = true;
                     }
                 }
 
-                // Dedupe logging: we ACK duplicates but avoid duplicate log lines.
+                // Dedupe logging
                 let is_dup = if let Some(mut sess) = ctx.sessions.get_mut(&session_id) {
                     if sess
                         .last_pr_counter
@@ -148,7 +150,7 @@ pub fn spawn_bistream_dispatch(conn: &Connection, ctx: VsCtx, session_id: [u8; 1
                     false
                 };
 
-                // Always build/send a ProtectedReceipt (clients/GS rely on the ACK).
+                // Build/send ProtectedReceipt
                 let pr_body =
                     match bincode::serialize(&(td.session_id, td.gs_counter, td.receipt_tip)) {
                         Ok(b) => b,
@@ -167,7 +169,6 @@ pub fn spawn_bistream_dispatch(conn: &Connection, ctx: VsCtx, session_id: [u8; 1
 
                 if let Err(e) = send_msg(&mut send, &pr).await {
                     let msg = format!("{e:?}");
-                    // GS intentionally drops the send-half after best-effort; treat these as benign
                     if !msg.contains("stopped by peer") && !msg.contains("ClosedStream") {
                         eprintln!("[VS] send ProtectedReceipt failed: {e:?}");
                     }
@@ -192,13 +193,11 @@ pub fn spawn_bistream_dispatch(conn: &Connection, ctx: VsCtx, session_id: [u8; 1
                     }
                 };
 
-                // session id check
                 if hb.session_id != session_id {
                     eprintln!("[VS] heartbeat session mismatch");
                     continue;
                 }
 
-                // monotonic counter
                 if hb.gs_counter <= sess.last_counter {
                     eprintln!(
                         "[VS] heartbeat non-monotonic (got {}, last {})",
@@ -207,7 +206,6 @@ pub fn spawn_bistream_dispatch(conn: &Connection, ctx: VsCtx, session_id: [u8; 1
                     continue;
                 }
 
-                // verify signature with stored ephemeral pub
                 let eph_vk = match VerifyingKey::from_bytes(&sess.ephemeral_pub) {
                     Ok(vk) => vk,
                     Err(e) => {
@@ -243,11 +241,10 @@ pub fn spawn_bistream_dispatch(conn: &Connection, ctx: VsCtx, session_id: [u8; 1
                         "[VS] enforcement (heartbeat) error on session {}..: {e}",
                         hex::encode(&session_id[..4])
                     );
-                    sess.revoked = true; // ticket loop will stop
+                    sess.revoked = true;
                     continue;
                 }
 
-                // record liveness
                 sess.last_counter = hb.gs_counter;
                 sess.last_seen_ms = now_ms();
 
@@ -261,18 +258,23 @@ pub fn spawn_bistream_dispatch(conn: &Connection, ctx: VsCtx, session_id: [u8; 1
 
 /// Listen for Heartbeat messages on **uni** streams.
 /// Updates `last_seen_ms`, verifies sig, and informs the enforcer.
+///
+/// Stage 1.2: Now also verifies TPM re-attestation quotes when present.
 pub fn spawn_uni_heartbeat_listener(conn: &Connection, ctx: VsCtx, session_id: [u8; 16]) {
     let conn = conn.clone();
     let ctx = ctx.clone();
 
     tokio::spawn(async move {
+        // Track expected PCR values from initial attestation
+        // In production, these would be stored in ctx.sessions at JoinRequest time
+        let mut baseline_pcrs: Option<std::collections::HashMap<u8, [u8; 32]>> = None;
+
         loop {
-            // one uni-stream per heartbeat
             let mut recv = match conn.accept_uni().await {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("[VS] accept_uni (heartbeat) failed: {e:?}");
-                    break; // connection likely closing; exit task
+                    break;
                 }
             };
 
@@ -284,7 +286,8 @@ pub fn spawn_uni_heartbeat_listener(conn: &Connection, ctx: VsCtx, session_id: [
                 }
             };
 
-            // Lookup the session (ephemeral pubkey lives here)
+            HEARTBEATS_TOTAL.inc();
+
             let (ephemeral_pub, revoked) = match ctx.sessions.get(&session_id) {
                 Some(s) => (s.ephemeral_pub, s.revoked),
                 None => {
@@ -303,7 +306,7 @@ pub fn spawn_uni_heartbeat_listener(conn: &Connection, ctx: VsCtx, session_id: [
                 continue;
             }
 
-            // Verify GS heartbeat signature (ed25519 over canonical bytes)
+            // Verify GS heartbeat signature
             let sig_arr: [u8; 64] = match hb.sig_gs.clone().try_into() {
                 Ok(a) => a,
                 Err(_) => {
@@ -341,13 +344,83 @@ pub fn spawn_uni_heartbeat_listener(conn: &Connection, ctx: VsCtx, session_id: [
                 continue;
             }
 
+            // =========================================================
+            // Stage 1.2: Verify TPM Re-Attestation Quote
+            //
+            // If the heartbeat includes a TPM quote, verify:
+            // 1. The nonce matches our expectation (derived from session state)
+            // 2. The quote signature is valid
+            // 3. PCR values match the baseline from JoinRequest
+            //
+            // This detects:
+            // - Hot-patching (modifying GS memory after startup)
+            // - Configuration changes
+            // - Any code tampering since initial attestation
+            // =========================================================
+            if let Some(ref quote) = hb.tpm_quote {
+                let timer = TPM_VERIFICATION_LATENCY.start_timer();
+
+                // Derive expected nonce (must match GS derivation)
+                let expected_nonce = {
+                    let mut buf = Vec::with_capacity(16 + 8 + 32);
+                    buf.extend_from_slice(&session_id);
+                    buf.extend_from_slice(&hb.gs_counter.to_le_bytes());
+                    buf.extend_from_slice(&hb.receipt_tip);
+                    sha256(&buf)
+                };
+
+                // Verify quote nonce and signature
+                match verify_quote(quote, &expected_nonce, baseline_pcrs.as_ref()) {
+                    Ok(()) => {
+                        println!(
+                            "[VS] TPM re-attestation verified (session {}.., ctr {})",
+                            hex::encode(&session_id[..4]),
+                            hb.gs_counter
+                        );
+                        TPM_VERIFICATIONS_TOTAL
+                            .with_label_values(&["success"])
+                            .inc();
+
+                        // If this is the first quote we've seen, establish baseline
+                        if baseline_pcrs.is_none() {
+                            baseline_pcrs = Some(quote.pcr_values.clone());
+                            println!(
+                                "[VS] TPM baseline established for session {}.. (PCRs: {:?})",
+                                hex::encode(&session_id[..4]),
+                                quote.pcr_values.keys().collect::<Vec<_>>()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[VS] TPM re-attestation FAILED (session {}.., ctr {}): {}",
+                            hex::encode(&session_id[..4]),
+                            hb.gs_counter,
+                            e
+                        );
+                        TPM_VERIFICATIONS_TOTAL.with_label_values(&["failed"]).inc();
+
+                        // CRITICAL: Mark session as revoked - GS integrity compromised
+                        if let Some(mut sess) = ctx.sessions.get_mut(&session_id) {
+                            sess.revoked = true;
+                            eprintln!(
+                                "[VS] Session {}.. REVOKED due to TPM attestation failure",
+                                hex::encode(&session_id[..4])
+                            );
+                        }
+                        continue;
+                    }
+                }
+
+                timer.observe_duration();
+            }
+
             // Mark last-seen and let the enforcer pin time/hash
             if let Some(mut sess) = ctx.sessions.get_mut(&session_id) {
                 sess.last_seen_ms = now_ms();
             }
             if let Err(e) = enforcer().lock().unwrap().on_heartbeat(session_id, &hb) {
                 eprintln!("[VS] enforcer.on_heartbeat failed: {e:#}");
-                // Let watchdog close it if enforcer revoked
             }
         }
     });

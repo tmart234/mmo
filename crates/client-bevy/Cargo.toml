@@ -8,7 +8,7 @@ name = "sanity3d"
 path = "src/main.rs"
 
 [dependencies]
-bevy         = { version = "0.17.2", default-features = true }
+bevy        = { version = "0.17.2", default-features = true }
 client-core = { path = "../client-core" }
 tokio       = { workspace = true }
 common      = { path = "../common" }

@@ -33,3 +33,5 @@ hex           = { workspace = true }
 clap          = { workspace = true }
 
 common        = { path = "../common" }
+
+lru           = "0.12"

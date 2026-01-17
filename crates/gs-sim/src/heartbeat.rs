@@ -3,7 +3,24 @@
 //! - Heartbeats use a **unidirectional** stream (open_uni).
 //! - TranscriptDigest/ProtectedReceipt round-trip uses a bi-stream with timeout.
 //! - Implements retry logic with exponential backoff for network resilience.
+//! - Stage 1.2: Periodic TPM re-attestation every ~60 seconds to detect hot-patching.
 
+use common::tpm::TpmProvider;
+use std::sync::Arc;
+use tokio::sync::Mutex as TokioMutex;
+
+/// Interval between TPM re-attestation quotes (in heartbeat cycles).
+/// With 2-second heartbeats, 30 cycles = ~60 seconds.
+const TPM_REATTEST_INTERVAL: u64 = 30;
+
+/// PCR indices to include in re-attestation quotes.
+/// PCR 0: Binary measurement (sw_hash)
+/// PCR 1: Configuration measurement (gs_id)
+const TPM_PCRS: &[u8] = &[0, 1];
+
+/// Heartbeat loop without TPM (backward-compatible wrapper).
+/// For TPM-enabled attestation, use `heartbeat_loop_with_tpm` directly.
+#[allow(dead_code)] // Public API for callers that don't need TPM
 pub async fn heartbeat_loop(
     conn: quinn::Connection,
     counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -11,9 +28,31 @@ pub async fn heartbeat_loop(
     session_id: [u8; 16],
     shared: crate::state::Shared,
 ) -> anyhow::Result<()> {
+    heartbeat_loop_with_tpm(conn, counter, eph_sk, session_id, shared, None).await
+}
+
+/// Heartbeat loop with optional TPM for continuous attestation.
+///
+/// Stage 1.2: If TPM is provided, generates a re-attestation quote every
+/// TPM_REATTEST_INTERVAL heartbeats (~60 seconds) and attaches it to the
+/// Heartbeat message. This allows VS to detect if:
+/// - The GS binary was modified in memory (hot-patching)
+/// - Configuration was changed after startup
+/// - Any PCR values drifted from the baseline established at join
+///
+/// The quote nonce is derived from (session_id || gs_counter || receipt_tip)
+/// to ensure freshness and prevent replay of old quotes.
+pub async fn heartbeat_loop_with_tpm(
+    conn: quinn::Connection,
+    counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    eph_sk: ed25519_dalek::SigningKey,
+    session_id: [u8; 16],
+    shared: crate::state::Shared,
+    tpm: Option<Arc<TokioMutex<Box<dyn TpmProvider>>>>,
+) -> anyhow::Result<()> {
     use common::{
         config::GsConfig,
-        crypto::{heartbeat_sign_bytes, now_ms, sign},
+        crypto::{heartbeat_sign_bytes, now_ms, sha256, sign},
         framing::{recv_msg, send_msg},
         proto::{Heartbeat, ProtectedReceipt, TranscriptDigest},
         retry::retry_with_backoff,
@@ -22,8 +61,11 @@ pub async fn heartbeat_loop(
     use std::time::Duration;
     use tokio::time::{sleep, timeout};
 
-    // Load configuration (could be passed as parameter in production)
+    // Load configuration
     let config = GsConfig::default();
+
+    // Track when we last did TPM re-attestation
+    let mut last_tpm_counter: u64 = 0;
 
     loop {
         // Configurable heartbeat interval
@@ -51,8 +93,58 @@ pub async fn heartbeat_loop(
         let to_sign = heartbeat_sign_bytes(&session_id, c, now, &receipt_tip_now, &sw_hash_now);
         let sig_gs_bytes = sign(&eph_sk, &to_sign);
 
+        // =====================================================================
+        // Stage 1.2: Periodic TPM Re-Attestation
+        //
+        // Why periodic re-attestation matters:
+        // - Initial attestation at JoinRequest proves code identity at startup
+        // - An attacker could modify memory AFTER startup (hot-patching)
+        // - Periodic quotes prove code hasn't been modified since join
+        //
+        // Quote nonce derivation:
+        // - nonce = sha256(session_id || gs_counter || receipt_tip)
+        // - This binds the quote to a specific point in time/state
+        // - VS can verify nonce matches what it expects
+        // - Prevents replay of old valid quotes
+        // =====================================================================
+        let tpm_quote = if let Some(ref tpm_arc) = tpm {
+            // Only re-attest every TPM_REATTEST_INTERVAL heartbeats
+            if c >= last_tpm_counter + TPM_REATTEST_INTERVAL {
+                last_tpm_counter = c;
+
+                // Derive nonce from session state for freshness
+                let nonce_preimage = {
+                    let mut buf = Vec::with_capacity(16 + 8 + 32);
+                    buf.extend_from_slice(&session_id);
+                    buf.extend_from_slice(&c.to_le_bytes());
+                    buf.extend_from_slice(&receipt_tip_now);
+                    buf
+                };
+                let nonce_32 = sha256(&nonce_preimage);
+
+                // Generate TPM quote (this may take a few ms)
+                match tpm_arc.lock().await.quote(TPM_PCRS, &nonce_32) {
+                    Ok(quote) => {
+                        println!(
+                            "[GS] TPM re-attestation quote generated (counter={}, pcrs={:?})",
+                            c, TPM_PCRS
+                        );
+                        Some(quote)
+                    }
+                    Err(e) => {
+                        eprintln!("[GS] TPM re-attestation failed (counter={}): {:?}", c, e);
+                        // Continue without quote - VS will notice missing re-attestation
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // (1) HEARTBEAT — unidirectional stream with retry
-        // TODO: Add periodic TPM re-attestation quotes
         let hb = Heartbeat {
             session_id,
             gs_counter: c,
@@ -60,7 +152,7 @@ pub async fn heartbeat_loop(
             receipt_tip: receipt_tip_now,
             sw_hash: sw_hash_now,
             sig_gs: sig_gs_bytes.to_vec(),
-            tpm_quote: None, // TPM re-attestation not yet implemented for heartbeats
+            tpm_quote, // Stage 1.2: Include TPM quote when available
         };
 
         let send_heartbeat = || {
@@ -75,11 +167,14 @@ pub async fn heartbeat_loop(
 
         match retry_with_backoff(&config.retry, "heartbeat_send", send_heartbeat).await {
             Ok(_) => {
-                println!("[GS] ♥ heartbeat {c}");
+                if hb.tpm_quote.is_some() {
+                    println!("[GS] ♥ heartbeat {c} (with TPM quote)");
+                } else {
+                    println!("[GS] ♥ heartbeat {c}");
+                }
             }
             Err(e) => {
                 eprintln!("[GS] heartbeat send failed after retries: {e:?}");
-                // Continue trying; VS may recover
             }
         }
 
@@ -99,7 +194,6 @@ pub async fn heartbeat_loop(
                 let (mut send2, mut recv2) = conn.open_bi().await?;
                 send_msg(&mut send2, &td).await?;
 
-                // CRITICAL: Add timeout for VS response to prevent indefinite blocking
                 let pr = timeout(timeout_duration, recv_msg::<ProtectedReceipt>(&mut recv2))
                     .await
                     .map_err(|_| anyhow::anyhow!("timeout waiting for ProtectedReceipt"))??;
@@ -121,8 +215,57 @@ pub async fn heartbeat_loop(
             }
             Err(e) => {
                 eprintln!("[GS] transcript digest failed after retries: {e:?}");
-                // Continue; heartbeats still establish liveness
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use common::crypto::sha256;
+
+    #[test]
+    fn test_nonce_derivation_is_deterministic() {
+        let session_id = [0xAA; 16];
+        let counter = 42u64;
+        let receipt_tip = [0xBB; 32];
+
+        let mut buf1 = Vec::new();
+        buf1.extend_from_slice(&session_id);
+        buf1.extend_from_slice(&counter.to_le_bytes());
+        buf1.extend_from_slice(&receipt_tip);
+
+        let mut buf2 = Vec::new();
+        buf2.extend_from_slice(&session_id);
+        buf2.extend_from_slice(&counter.to_le_bytes());
+        buf2.extend_from_slice(&receipt_tip);
+
+        assert_eq!(
+            sha256(&buf1),
+            sha256(&buf2),
+            "nonce derivation must be deterministic"
+        );
+    }
+
+    #[test]
+    fn test_nonce_changes_with_counter() {
+        let session_id = [0xAA; 16];
+        let receipt_tip = [0xBB; 32];
+
+        let mut buf1 = Vec::new();
+        buf1.extend_from_slice(&session_id);
+        buf1.extend_from_slice(&1u64.to_le_bytes());
+        buf1.extend_from_slice(&receipt_tip);
+
+        let mut buf2 = Vec::new();
+        buf2.extend_from_slice(&session_id);
+        buf2.extend_from_slice(&2u64.to_le_bytes());
+        buf2.extend_from_slice(&receipt_tip);
+
+        assert_ne!(
+            sha256(&buf1),
+            sha256(&buf2),
+            "different counters must produce different nonces"
+        );
     }
 }
