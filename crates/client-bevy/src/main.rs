@@ -251,13 +251,16 @@ fn net_startup(mut commands: Commands) {
 
         rt.block_on(async move {
             println!("[NET] connecting to {}...", gs_addr);
-            
+
             let mut sess =
                 match connect_and_handshake_with_retry(&gs_addr, 10, Duration::from_millis(200))
                     .await
                 {
                     Ok(s) => {
-                        println!("[NET] connected! session={}", hex::encode(&s.session_id[..4]));
+                        println!(
+                            "[NET] connected! session={}",
+                            hex::encode(&s.session_id[..4])
+                        );
                         s
                     }
                     Err(e) => {

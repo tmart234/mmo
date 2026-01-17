@@ -3,7 +3,10 @@ pub use anyhow::{anyhow, bail, Context, Result};
 use common::{
     crypto::{client_input_sign_bytes, now_ms},
     framing::{recv_msg, send_msg_continue},
-    proto::{ClientCmd, ClientHello, ClientInput, ClientToGs, PlayTicket, ServerHello, WorldSnapshot},
+    proto::{
+        ClientCmd, ClientHello, ClientInput, ClientToGs, GsToClient, PlayTicket, ServerHello,
+        WorldSnapshot,
+    },
 };
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -219,11 +222,7 @@ async fn attempt_connect_and_handshake(gs_addr: &str, hello_timeout: Duration) -
 
     // 2) connect to GS
     let t0 = std::time::Instant::now();
-    println!(
-        "[CLIENT] {:?} connecting to {}...",
-        t0.elapsed(),
-        gs_addr
-    );
+    println!("[CLIENT] {:?} connecting to {}...", t0.elapsed(), gs_addr);
     let conn = endpoint
         .connect(gs_addr.parse()?, "localhost")?
         .await
@@ -388,8 +387,25 @@ pub async fn send_input(sess: &mut Session, nonce: u64, cmd: ClientCmd) -> Resul
 }
 
 /// Read the authoritative world snapshot from GS.
+/// Also handles TicketUpdate messages and updates the session's ticket.
 pub async fn recv_world(sess: &mut Session) -> Result<WorldSnapshot> {
-    recv_msg::<WorldSnapshot>(&mut sess.recv_stream)
-        .await
-        .context("recv WorldSnapshot")
+    loop {
+        let msg: GsToClient = recv_msg(&mut sess.recv_stream)
+            .await
+            .context("recv GsToClient")?;
+
+        match msg {
+            GsToClient::WorldSnapshot(ws) => {
+                return Ok(ws);
+            }
+            GsToClient::TicketUpdate(tu) => {
+                // Update our stapled ticket for future inputs
+                sess.ticket = tu.ticket;
+            }
+            GsToClient::ServerHello(_) => {
+                // Unexpected at this point, but just ignore
+                eprintln!("[CLIENT] unexpected ServerHello in game loop, ignoring");
+            }
+        }
+    }
 }

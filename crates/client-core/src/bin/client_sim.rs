@@ -52,7 +52,10 @@ async fn main() -> Result<()> {
         sleep(Duration::from_millis(200)).await;
 
         if opts.smoke_test && nonce > 5 {
-            println!("[CLIENT] smoke test complete (nonce={}), sending Bye", nonce);
+            println!(
+                "[CLIENT] smoke test complete (nonce={}), sending Bye",
+                nonce
+            );
             break;
         }
     }

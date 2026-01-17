@@ -12,6 +12,7 @@ bevy         = { version = "0.17.2", default-features = true }
 client-core = { path = "../client-core" }
 tokio       = { workspace = true }
 common      = { path = "../common" }
+hex         = { workspace = true }
 
 # Add dynamic_linking only for non-Windows builds
 [target.'cfg(not(windows))'.dependencies]

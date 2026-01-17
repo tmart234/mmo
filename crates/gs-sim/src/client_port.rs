@@ -2,7 +2,10 @@
 use common::{
     crypto::{client_input_sign_bytes, now_ms, receipt_tip_update},
     framing::{recv_msg, send_msg_continue},
-    proto::{AuthoritativeEvent, ClientCmd, ClientHello, ClientToGs, PlayTicket, ServerHello, WorldSnapshot},
+    proto::{
+        AuthoritativeEvent, ClientCmd, ClientHello, ClientToGs, GsToClient, PlayTicket,
+        ServerHello, TicketUpdate, WorldSnapshot,
+    },
 };
 use ed25519_dalek::{Signature, VerifyingKey};
 use quinn::{Endpoint, ServerConfig};
@@ -22,6 +25,9 @@ use crate::state::{PlayerState, Shared};
 const NONCE_WINDOW: u64 = 4; // allow nonce jumps up to +4
 const TICKET_RING_MAX: usize = 32;
 const CLIENT_HELLO_TIMEOUT_SECS: u64 = 10;
+/// Grace period (ms) for ticket expiration to handle clock skew and race conditions.
+/// A ticket that expired within this window is still accepted if it's in the ring.
+const TICKET_EXPIRY_GRACE_MS: u64 = 2000;
 
 /// Configure QUIC server for GS client port.
 fn configure_quic_server() -> anyhow::Result<ServerConfig> {
@@ -165,7 +171,8 @@ pub async fn client_port_task(
     }
 }
 
-/// Handle a single client connection: accept bi-stream, receive ClientHello, send ServerHello, then process inputs.
+/// Handle a single client connection: accept bi-stream, receive ClientHello,
+/// send ServerHello, then process inputs.
 async fn handle_client_connection(
     conn: quinn::Connection,
     peer_addr: std::net::SocketAddr,
@@ -186,7 +193,8 @@ async fn handle_client_connection(
     // the stream. See the comment in ClientHello for details.
     // =========================================================================
     println!(
-        "[GS] {:?} [TASK {}] calling accept_bi() on conn_id={} (waiting for client to send data)...",
+        "[GS] {:?} [TASK {}] calling accept_bi() on conn_id={} \
+         (waiting for client to send data)...",
         task_start.elapsed(),
         peer_addr,
         conn_id
@@ -286,6 +294,9 @@ async fn handle_client_connection(
 
     // === Ticket ring so we accept recently rolled tickets even when client idles ===
     let ring: Arc<Mutex<VecDeque<PlayTicket>>> = Arc::new(Mutex::new(VecDeque::new()));
+    // Track the latest ticket counter we've sent to this client
+    let latest_sent_counter: Arc<std::sync::atomic::AtomicU64> =
+        Arc::new(std::sync::atomic::AtomicU64::new(first_ticket.counter));
     {
         let mut r = ring.lock().unwrap();
         r.push_back(first_ticket.clone());
@@ -406,7 +417,11 @@ async fn handle_client_connection(
             };
 
             let ticket_matches = |pt: &PlayTicket| -> bool {
-                if now_ms_val < pt.not_before_ms || now_ms_val > pt.not_after_ms {
+                // Allow grace period for recently expired tickets (clock skew / race conditions)
+                // This prevents disconnects when a new ticket arrives but client hasn't received it yet
+                if now_ms_val < pt.not_before_ms
+                    || now_ms_val > pt.not_after_ms.saturating_add(TICKET_EXPIRY_GRACE_MS)
+                {
                     return false;
                 }
                 if pt.session_id != session_id {
@@ -449,7 +464,8 @@ async fn handle_client_connection(
             }
             if ci.client_nonce > prev_nonce.saturating_add(NONCE_WINDOW) {
                 eprintln!(
-                    "[GS] client_nonce jump too large from {peer_addr} (got {}, last {}, window {})",
+                    "[GS] client_nonce jump too large from {peer_addr} \
+                     (got {}, last {}, window {})",
                     ci.client_nonce, prev_nonce, NONCE_WINDOW
                 );
                 return Err(());
@@ -527,7 +543,7 @@ async fn handle_client_connection(
 
                     println!(
                         "[GS] accepted Move {{ dx: {:.3}, dy: {:.3} }} \
-                                 (nonce={}, ticket_ctr={}, used_recent={}) from {peer_addr}",
+                         (nonce={}, ticket_ctr={}, used_recent={}) from {peer_addr}",
                         dx, dy, ci.client_nonce, ci.ticket_counter, used_recent
                     );
 
@@ -624,8 +640,40 @@ async fn handle_client_connection(
             }
         };
 
+        // Check if there's a newer ticket to send to this client
+        let maybe_ticket_update: Option<(GsToClient, u64)> = {
+            use std::sync::atomic::Ordering;
+            let ring_guard = ring.lock().unwrap();
+            if let Some(newest) = ring_guard.back() {
+                let last_sent = latest_sent_counter.load(Ordering::SeqCst);
+                if newest.counter > last_sent {
+                    // Clone values while holding lock
+                    let new_counter = newest.counter;
+                    let update = GsToClient::TicketUpdate(TicketUpdate {
+                        ticket: newest.clone(),
+                    });
+                    Some((update, new_counter))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }; // ring_guard dropped here, before any await
+
+        // Send ticket update if we have one
+        if let Some((update, new_counter)) = maybe_ticket_update {
+            use std::sync::atomic::Ordering;
+            if let Err(e) = send_msg_continue(&mut send_stream, &update).await {
+                eprintln!("[GS] send TicketUpdate to {peer_addr} failed: {e:?}");
+                break;
+            }
+            latest_sent_counter.store(new_counter, Ordering::SeqCst);
+        }
+
         // Respond with an updated WorldSnapshot back to this client
-        if let Err(e) = send_msg_continue(&mut send_stream, &snapshot).await {
+        let ws_msg = GsToClient::WorldSnapshot(snapshot);
+        if let Err(e) = send_msg_continue(&mut send_stream, &ws_msg).await {
             eprintln!("[GS] send WorldSnapshot to {peer_addr} failed: {e:?}");
             break;
         }
