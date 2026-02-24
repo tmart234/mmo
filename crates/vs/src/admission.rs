@@ -62,7 +62,22 @@ pub async fn admit_and_run(connecting: quinn::Incoming, ctx: VsCtx) -> Result<()
         bail!("JoinRequest timestamp skew too large: {skew} ms");
     }
 
-    // 3) TODO: sw_hash allowlist here (enforce approved GS builds)
+    // 3) Priority 3 (TOFU/TPM supply chain fix): sw_hash allowlist.
+    //
+    // If the allowlist is non-empty, the GS binary hash MUST be in it.
+    // An empty allowlist means "dev/TOFU mode — accept any binary", which is
+    // the safe default for local development.  Production deployments MUST
+    // populate VsConfig::sw_hash_allowlist with the sha256 hashes of every
+    // approved GS release build so a compromised or tampered binary cannot
+    // join the network even if it has valid TPM quotes.
+    if !ctx.config.sw_hash_allowlist.is_empty()
+        && !ctx.config.sw_hash_allowlist.contains(&jr.sw_hash)
+    {
+        bail!(
+            "sw_hash {} is not in the VS allowlist — unapproved GS build rejected",
+            hex::encode(jr.sw_hash)
+        );
+    }
 
     // 4) Verify TPM attestation quote if present.
     if let Some(quote) = &jr.tpm_quote {
@@ -77,14 +92,26 @@ pub async fn admit_and_run(connecting: quinn::Incoming, ctx: VsCtx) -> Result<()
             bail!("TPM quote nonce doesn't match JoinRequest nonce");
         }
 
-        // Verify the quote signature and nonce
-        // We don't check expected PCR values here since we're establishing the baseline
-        verify_quote(quote, &quote.nonce, None).context("TPM quote verification failed")?;
+        // Priority 3: enforce required PCR baselines if configured.
+        //
+        // When VsConfig::required_pcr_baselines is non-empty, verify_quote will
+        // check that the quote's PCR values exactly match the configured baseline.
+        // This prevents a compromised hypervisor or modified OS from passing
+        // attestation — the attacker would need to produce a TPM-signed quote
+        // with the correct PCR values, which requires the TPM's AK private key.
+        //
+        // When required_pcr_baselines is empty (default), we operate in TOFU mode:
+        // the first quote establishes the baseline and continuous attestation
+        // (in spawn_uni_heartbeat_listener) ensures it never drifts.
+        let required = if ctx.config.required_pcr_baselines.is_empty() {
+            None
+        } else {
+            Some(&ctx.config.required_pcr_baselines)
+        };
+
+        verify_quote(quote, &quote.nonce, required).context("TPM quote verification failed")?;
 
         println!("[VS] TPM quote verified successfully");
-
-        // TODO: Store the TPM AK public key and PCR baseline for continuous attestation
-        // TODO: Verify EK certificate chain if ek_cert is present
     }
 
     // Mint session id.

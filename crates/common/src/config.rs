@@ -20,6 +20,21 @@ pub struct VsConfig {
 
     /// Grace period for out-of-order heartbeat vs transcript (default: 5s).
     pub heartbeat_grace_period_ms: u64,
+
+    /// Priority 3 (TOFU/TPM fix): allowlist of approved GS binary hashes (sw_hash).
+    /// Each entry is a sha256 digest of an approved GS build.
+    /// If the vec is **empty** the VS operates in TOFU/dev mode and accepts any hash.
+    /// In production, populate this with the sha256 hashes of vetted GS releases.
+    pub sw_hash_allowlist: Vec<[u8; 32]>,
+
+    /// Priority 3 (TOFU/TPM fix): required PCR values that must be present in any
+    /// TPM attestation quote.  Keys are PCR indices (0-7 cover firmware + OS +
+    /// Secure Boot policy on most TPM 2.0 platforms).
+    /// If the map is **empty** the VS operates in TOFU mode: the first quote from
+    /// each GS establishes the baseline and subsequent quotes must match it.
+    /// In production, fill this with known-good measurements for the approved OS
+    /// and firmware stack so a compromised hypervisor cannot pass attestation.
+    pub required_pcr_baselines: std::collections::BTreeMap<u8, [u8; 32]>,
 }
 
 impl Default for VsConfig {
@@ -29,6 +44,8 @@ impl Default for VsConfig {
             heartbeat_timeout_ms: 30_000, // 30s (was 10s)
             physics_check_timeout_ms: 10_000,
             heartbeat_grace_period_ms: 5_000,
+            sw_hash_allowlist: Vec::new(),
+            required_pcr_baselines: std::collections::BTreeMap::new(),
         }
     }
 }

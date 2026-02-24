@@ -239,6 +239,22 @@ pub struct TranscriptDigest {
     /// Player positions as GS claims them *right now*.
     /// Vec of (player_pubkey, x, y).
     pub positions: Vec<([u8; 32], f32, f32)>,
+
+    /// Priority 2 (Ghost Snapshot fix): sha256 of bincode-serialised `positions`.
+    /// The GS folds this root into `receipt_tip` before signing the heartbeat
+    /// (`receipt_tip = sha256(old_receipt_tip || snapshot_root)`), so the VS
+    /// speed-check is over positions that are cryptographically committed to
+    /// in the signed receipt chain, not a "trust me bro" array.
+    /// VS enforcer verifies: sha256(positions_bytes) == snapshot_root,
+    /// and that receipt_tip matches the one claimed in the matching heartbeat.
+    pub snapshot_root: [u8; 32],
+
+    /// Priority 1 (DA Black Hole fix): raw bytes of every ClientInput accepted
+    /// by the GS since the previous TranscriptDigest.  The VS writes these to
+    /// durable DA storage *before* signing the ProtectedReceipt, so an auditor
+    /// can always reconstruct the transcript even if the GS later goes rogue
+    /// and deletes its local ledger.
+    pub da_payload: Vec<Vec<u8>>,
 }
 
 /// VS → GS. VS signs what GS claimed, so GS can't deny it later.

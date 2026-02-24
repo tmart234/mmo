@@ -618,6 +618,11 @@ async fn handle_client_connection(
             let new_tip = receipt_tip_update(&prev_tip, &ci_bytes, &ev_bytes);
             guard.receipt_tip = new_tip;
 
+            // Priority 1 (DA Black Hole fix): buffer the raw signed ClientInput bytes
+            // so the heartbeat loop can ship them to VS as da_payload, guaranteeing
+            // the VS can durably store them before signing the ProtectedReceipt.
+            guard.da_buffer.push(ci_bytes);
+
             // Append to ledger if enabled
             let session_id_copy = guard.session_id;
             let client_pub_copy = ci.client_pub;
