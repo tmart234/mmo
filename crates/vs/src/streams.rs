@@ -150,6 +150,34 @@ pub fn spawn_bistream_dispatch(conn: &Connection, ctx: VsCtx, session_id: [u8; 1
                     false
                 };
 
+                // Priority 1 (DA Black Hole fix): write the raw ClientInput bytes
+                // to durable DA storage BEFORE signing the ProtectedReceipt.
+                // This guarantees auditors can reconstruct the full transcript even
+                // if the GS later deletes its local ledger or refuses to serve data.
+                // The VS is the last line of defence for data availability.
+                if !td.da_payload.is_empty() {
+                    if let Err(e) = write_da_log(&td.session_id, td.gs_counter, &td.da_payload) {
+                        // Log the error but do NOT issue the ProtectedReceipt — if
+                        // we can't persist the DA payload we cannot guarantee
+                        // availability, so we must refuse to notarise this tick.
+                        eprintln!(
+                            "[VS] DA log write FAILED for session {}.., ctr={}: {e:?} \
+                             — ProtectedReceipt withheld",
+                            hex::encode(&session_id[..4]),
+                            td.gs_counter,
+                        );
+                        continue;
+                    }
+                    if !is_dup {
+                        println!(
+                            "[VS] DA log written ({} inputs) for session {}.., ctr={}",
+                            td.da_payload.len(),
+                            hex::encode(&td.session_id[..4]),
+                            td.gs_counter,
+                        );
+                    }
+                }
+
                 // Build/send ProtectedReceipt
                 let pr_body =
                     match bincode::serialize(&(td.session_id, td.gs_counter, td.receipt_tip)) {
@@ -424,4 +452,47 @@ pub fn spawn_uni_heartbeat_listener(conn: &Connection, ctx: VsCtx, session_id: [
             }
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// Priority 1 (DA Black Hole fix): durable DA log writer
+//
+// Writes the raw ClientInput bytes from a TranscriptDigest to a local file
+// BEFORE the VS signs the ProtectedReceipt.  This ensures auditors always
+// have access to the data needed to reconstruct and verify the transcript,
+// even if the GS later goes rogue and deletes its own ledger.
+//
+// File layout: da_log/session_<hex8>_ctr_<counter_decimal>.da
+// Binary format: [u32 LE entry_count] ([u32 LE len] [bytes])...
+// ---------------------------------------------------------------------------
+fn write_da_log(
+    session_id: &[u8; 16],
+    gs_counter: u64,
+    da_payload: &[Vec<u8>],
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    std::fs::create_dir_all("da_log")?;
+
+    let path = format!(
+        "da_log/session_{}_ctr_{:010}.da",
+        hex::encode(&session_id[..8]),
+        gs_counter,
+    );
+
+    let mut f = std::fs::File::create(&path)?;
+
+    // Header: number of entries (u32 LE)
+    let count = da_payload.len() as u32;
+    f.write_all(&count.to_le_bytes())?;
+
+    // Each entry: length (u32 LE) then raw bytes
+    for entry in da_payload {
+        let len = entry.len() as u32;
+        f.write_all(&len.to_le_bytes())?;
+        f.write_all(entry)?;
+    }
+
+    f.flush()?;
+    Ok(())
 }

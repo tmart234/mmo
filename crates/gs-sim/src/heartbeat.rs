@@ -74,9 +74,15 @@ pub async fn heartbeat_loop_with_tpm(
         let c = counter.fetch_add(1, Ordering::SeqCst) + 1;
         let now = now_ms();
 
-        // Snapshot state without holding mutex across awaits
-        let (receipt_tip_now, sw_hash_now, positions_vec) = {
-            let guard = match shared.lock() {
+        // Snapshot state without holding mutex across awaits.
+        //
+        // Priority 1 (DA Black Hole): drain da_buffer so VS gets all ClientInput
+        //   bytes before signing the ProtectedReceipt.
+        // Priority 2 (Ghost Snapshot): compute snapshot_root = sha256(positions),
+        //   then fold it into receipt_tip so positions are cryptographically
+        //   committed to the signed transcript chain.
+        let (receipt_tip_now, sw_hash_now, positions_vec, snapshot_root, da_payload) = {
+            let mut guard = match shared.lock() {
                 Ok(g) => g,
                 Err(p) => {
                     eprintln!("[GS] shared mutex poisoned in heartbeat_loop; using inner");
@@ -87,7 +93,29 @@ pub async fn heartbeat_loop_with_tpm(
             for (pubkey, ps) in guard.players.iter() {
                 pos_out.push((*pubkey, ps.x, ps.y));
             }
-            (guard.receipt_tip, guard.sw_hash, pos_out)
+
+            // Priority 2: commit the current position snapshot into the receipt_tip.
+            // snapshot_root = sha256(bincode(positions))
+            // new_receipt_tip = sha256(prev_receipt_tip || snapshot_root)
+            // This means the VS speed-check is over positions that are part of the
+            // signed chain, not a "trust me bro" side-channel.
+            let positions_bytes =
+                bincode::serialize(&pos_out).expect("serialize positions for snapshot_root");
+            let snapshot_root = sha256(&positions_bytes);
+            let extended_tip =
+                sha256(&[guard.receipt_tip.as_ref(), snapshot_root.as_ref()].concat());
+            guard.receipt_tip = extended_tip;
+
+            // Priority 1: drain the DA buffer so VS can durably store the inputs.
+            let da_payload = std::mem::take(&mut guard.da_buffer);
+
+            (
+                extended_tip,
+                guard.sw_hash,
+                pos_out,
+                snapshot_root,
+                da_payload,
+            )
         };
 
         let to_sign = heartbeat_sign_bytes(&session_id, c, now, &receipt_tip_now, &sw_hash_now);
@@ -184,6 +212,10 @@ pub async fn heartbeat_loop_with_tpm(
             gs_counter: c,
             receipt_tip: receipt_tip_now,
             positions: positions_vec,
+            // Priority 2 (Ghost Snapshot fix): positions committed to receipt_tip.
+            snapshot_root,
+            // Priority 1 (DA Black Hole fix): raw ClientInput bytes for VS DA log.
+            da_payload,
         };
 
         let send_transcript = || {

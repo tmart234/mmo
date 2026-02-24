@@ -107,6 +107,13 @@ pub struct GsShared {
 
     // Runtime buckets / guards (initialized on first use)
     pub runtime: Option<PlayerRuntime>,
+
+    /// Priority 1 (DA Black Hole fix): accumulates raw bincode bytes of every
+    /// accepted ClientInput since the last TranscriptDigest was sent.
+    /// The heartbeat loop drains this buffer and ships it as
+    /// TranscriptDigest.da_payload so the VS can write it to durable DA
+    /// storage before signing the ProtectedReceipt.
+    pub da_buffer: Vec<Vec<u8>>,
 }
 
 impl GsShared {
@@ -126,6 +133,7 @@ impl GsShared {
 
             ledger: None,
             runtime: None,
+            da_buffer: Vec::new(),
         }
     }
 
