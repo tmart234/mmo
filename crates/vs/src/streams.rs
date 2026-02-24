@@ -12,7 +12,7 @@ use tokio::time::sleep;
 
 use crate::ctx::VsCtx;
 use crate::enforcer::enforcer;
-use crate::metrics::{HEARTBEATS_TOTAL, TPM_VERIFICATION_LATENCY, TPM_VERIFICATIONS_TOTAL};
+use crate::metrics::{HEARTBEATS_TOTAL, TPM_VERIFICATIONS_TOTAL, TPM_VERIFICATION_LATENCY};
 
 /// How long the bi-stream handler waits for the matching Heartbeat to be staged
 /// before giving up and refusing to issue the ProtectedReceipt.
@@ -218,14 +218,14 @@ pub fn spawn_bistream_dispatch(conn: &Connection, ctx: VsCtx, session_id: [u8; 1
                 }
             }
 
-            let pr_body =
-                match bincode::serialize(&(td.session_id, td.gs_counter, td.receipt_tip)) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        eprintln!("[VS] ProtectedReceipt serialize failed: {e:?}");
-                        continue;
-                    }
-                };
+            let pr_body = match bincode::serialize(&(td.session_id, td.gs_counter, td.receipt_tip))
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("[VS] ProtectedReceipt serialize failed: {e:?}");
+                    continue;
+                }
+            };
             let pr = ProtectedReceipt {
                 session_id: td.session_id,
                 gs_counter: td.gs_counter,
@@ -313,7 +313,10 @@ pub fn spawn_uni_heartbeat_listener(conn: &Connection, ctx: VsCtx, session_id: [
             let vk = match VerifyingKey::from_bytes(&ephemeral_pub) {
                 Ok(vk) => vk,
                 Err(e) => {
-                    eprintln!("[VS] bad ephemeral_pub session {}..: {e:?}", hex4(&session_id));
+                    eprintln!(
+                        "[VS] bad ephemeral_pub session {}..: {e:?}",
+                        hex4(&session_id)
+                    );
                     continue;
                 }
             };
@@ -353,10 +356,7 @@ pub fn spawn_uni_heartbeat_listener(conn: &Connection, ctx: VsCtx, session_id: [
                             .inc();
                         if baseline_pcrs.is_none() {
                             baseline_pcrs = Some(quote.pcr_values.clone());
-                            println!(
-                                "[VS] TPM baseline set for session {}..",
-                                hex4(&session_id)
-                            );
+                            println!("[VS] TPM baseline set for session {}..", hex4(&session_id));
                         }
                     }
                     Err(e) => {
