@@ -109,7 +109,13 @@ pub async fn heartbeat_loop_with_tpm(
             // Priority 1: drain the DA buffer so VS can durably store the inputs.
             let da_payload = std::mem::take(&mut guard.da_buffer);
 
-            (extended_tip, guard.sw_hash, pos_out, snapshot_root, da_payload)
+            (
+                extended_tip,
+                guard.sw_hash,
+                pos_out,
+                snapshot_root,
+                da_payload,
+            )
         };
 
         let to_sign = heartbeat_sign_bytes(&session_id, c, now, &receipt_tip_now, &sw_hash_now);

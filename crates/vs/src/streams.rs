@@ -156,9 +156,7 @@ pub fn spawn_bistream_dispatch(conn: &Connection, ctx: VsCtx, session_id: [u8; 1
                 // if the GS later deletes its local ledger or refuses to serve data.
                 // The VS is the last line of defence for data availability.
                 if !td.da_payload.is_empty() {
-                    if let Err(e) =
-                        write_da_log(&td.session_id, td.gs_counter, &td.da_payload)
-                    {
+                    if let Err(e) = write_da_log(&td.session_id, td.gs_counter, &td.da_payload) {
                         // Log the error but do NOT issue the ProtectedReceipt — if
                         // we can't persist the DA payload we cannot guarantee
                         // availability, so we must refuse to notarise this tick.
