@@ -2,7 +2,7 @@
 use common::{
     crypto::{heartbeat_sign_bytes, now_ms, sha256, sign, verify},
     framing::{recv_msg, send_msg},
-    proto::{Heartbeat, PlayTicket, ProtectedReceipt, Sig, TranscriptDigest},
+    proto::{Heartbeat, PlayTicket, ProtectedReceipt, TranscriptDigest},
     tpm::verify_quote,
 };
 use ed25519_dalek::VerifyingKey;
@@ -14,6 +14,10 @@ use crate::ctx::VsCtx;
 use crate::enforcer::enforcer;
 use crate::metrics::{HEARTBEATS_TOTAL, TPM_VERIFICATIONS_TOTAL, TPM_VERIFICATION_LATENCY};
 
+/// How long the bi-stream handler waits for the matching Heartbeat to be staged
+/// before giving up and refusing to issue the ProtectedReceipt.
+const HB_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// VS -> GS: issue `PlayTicket` every ~2s. Stops when session is revoked.
 pub fn spawn_ticket_loop(conn: &Connection, ctx: VsCtx, session_id: [u8; 16]) {
     let conn = conn.clone();
@@ -22,14 +26,13 @@ pub fn spawn_ticket_loop(conn: &Connection, ctx: VsCtx, session_id: [u8; 16]) {
 
     tokio::spawn(async move {
         let mut counter: u64 = 0;
-        let mut prev_hash: [u8; 32] = [0u8; 32];
+        let mut prev_hash = [0u8; 32];
 
         loop {
-            // Stop when revoked (authoritative) or missing (session removed).
             if enforcer().lock().unwrap().is_revoked(session_id) {
                 eprintln!(
                     "[VS] ticket loop ending for session {}.. (revoked)",
-                    hex::encode(&session_id[..4])
+                    hex4(&session_id)
                 );
                 break;
             }
@@ -41,14 +44,7 @@ pub fn spawn_ticket_loop(conn: &Connection, ctx: VsCtx, session_id: [u8; 16]) {
 
             counter += 1;
             let now = now_ms();
-            let not_before = now;
-            let not_after = now + 2_000;
-
-            // Body VS signs (GS/Client verify the same tuple).
-            let body_tuple = (
-                session_id, [0u8; 32], // client_binding placeholder
-                counter, not_before, not_after, prev_hash,
-            );
+            let body_tuple = (session_id, [0u8; 32], counter, now, now + 2_000, prev_hash);
             let body_bytes = match bincode::serialize(&body_tuple) {
                 Ok(b) => b,
                 Err(e) => {
@@ -57,19 +53,15 @@ pub fn spawn_ticket_loop(conn: &Connection, ctx: VsCtx, session_id: [u8; 16]) {
                 }
             };
 
-            let sig_vs_arr: [u8; 64] = sign(vs_sk.as_ref(), &body_bytes);
-
             let pt = PlayTicket {
                 session_id,
                 client_binding: [0u8; 32],
                 counter,
-                not_before_ms: not_before,
-                not_after_ms: not_after,
+                not_before_ms: now,
+                not_after_ms: now + 2_000,
                 prev_ticket_hash: prev_hash,
-                sig_vs: sig_vs_arr,
+                sig_vs: sign(vs_sk.as_ref(), &body_bytes),
             };
-
-            // update chain for next ticket
             prev_hash = sha256(&body_bytes);
 
             match conn.open_bi().await {
@@ -88,7 +80,13 @@ pub fn spawn_ticket_loop(conn: &Connection, ctx: VsCtx, session_id: [u8; 16]) {
     });
 }
 
-/// Accept bi-streams from GS and handle TranscriptDigest (reply PR) or Heartbeat (verify, liveness).
+/// Accept bi-streams from GS and handle TranscriptDigest (then reply ProtectedReceipt).
+///
+/// Fix 2 (Tick Synchronization): waits for the matching signed Heartbeat to be
+/// staged by `spawn_uni_heartbeat_listener` before calling the enforcer, so
+/// `on_heartbeat()` + `on_transcript()` always run as a verified pair.  This
+/// closes the Premature Notarization exploit where a rogue GS could obtain a
+/// receipt for an unverified TranscriptDigest by dropping or delaying its HB.
 pub fn spawn_bistream_dispatch(conn: &Connection, ctx: VsCtx, session_id: [u8; 16]) {
     let conn = conn.clone();
     let ctx = ctx.clone();
@@ -96,212 +94,181 @@ pub fn spawn_bistream_dispatch(conn: &Connection, ctx: VsCtx, session_id: [u8; 1
 
     tokio::spawn(async move {
         loop {
-            let pair = conn.accept_bi().await;
-            let (mut send, mut recv) = match pair {
+            let (mut send, mut recv) = match conn.accept_bi().await {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!("[VS] accept_bi stream error: {e:?}");
+                    eprintln!("[VS] accept_bi error: {e:?}");
                     break;
                 }
             };
 
-            // Read length-prefixed frame (polymorphic message type).
             let mut len_buf = [0u8; 4];
             if let Err(e) = recv.read_exact(&mut len_buf).await {
                 eprintln!("[VS] stream read len failed: {e:?}");
                 continue;
             }
-            let len = u32::from_le_bytes(len_buf) as usize;
-
-            let mut buf = vec![0u8; len];
+            let mut buf = vec![0u8; u32::from_le_bytes(len_buf) as usize];
             if let Err(e) = recv.read_exact(&mut buf).await {
                 eprintln!("[VS] stream read body failed: {e:?}");
                 continue;
             }
 
-            // Try TranscriptDigest first.
-            if let Ok(td) = bincode::deserialize::<TranscriptDigest>(&buf) {
-                // Enforce physics / invariants at this tick.
-                if let Err(e) = enforcer().lock().unwrap().on_transcript(session_id, &td) {
+            let td = match bincode::deserialize::<TranscriptDigest>(&buf) {
+                Ok(td) => td,
+                Err(_) => {
+                    eprintln!("[VS] unrecognised message on bi-stream (expected TranscriptDigest)");
+                    continue;
+                }
+            };
+
+            // Obtain staging handles (Arc clones; does not hold the DashMap entry).
+            let (staged_hbs, hb_notify) = match ctx.sessions.get(&session_id) {
+                Some(s) => (s.staged_hbs.clone(), s.hb_notify.clone()),
+                None => {
+                    eprintln!("[VS] TranscriptDigest for unknown session");
+                    continue;
+                }
+            };
+
+            // Wait for the matching Heartbeat (verified by the uni-stream handler).
+            // Creating `notified` BEFORE the map check guarantees we cannot miss a
+            // notification that races with the check.
+            let maybe_hb = tokio::time::timeout(HB_WAIT_TIMEOUT, async {
+                loop {
+                    let notified = hb_notify.notified();
+                    if let Some(hb) = staged_hbs.lock().unwrap().remove(&td.gs_counter) {
+                        return hb;
+                    }
+                    notified.await;
+                }
+            })
+            .await
+            .ok(); // Elapsed → None
+
+            let hb = match maybe_hb {
+                Some(hb) => hb,
+                None => {
                     eprintln!(
-                        "[VS] enforcement (transcript) error on session {}..: {e}",
-                        hex::encode(&session_id[..4])
-                    );
-                    if let Some(mut s) = ctx.sessions.get_mut(&session_id) {
-                        s.revoked = true;
-                    }
-                }
-
-                // Dedupe logging
-                let is_dup = if let Some(mut sess) = ctx.sessions.get_mut(&session_id) {
-                    if sess
-                        .last_pr_counter
-                        .map(|c| c == td.gs_counter)
-                        .unwrap_or(false)
-                        && sess.last_pr_tip == td.receipt_tip
-                    {
-                        true
-                    } else {
-                        sess.last_pr_counter = Some(td.gs_counter);
-                        sess.last_pr_tip = td.receipt_tip;
-                        false
-                    }
-                } else {
-                    false
-                };
-
-                // Priority 1 (DA Black Hole fix): write the raw ClientInput bytes
-                // to durable DA storage BEFORE signing the ProtectedReceipt.
-                // This guarantees auditors can reconstruct the full transcript even
-                // if the GS later deletes its local ledger or refuses to serve data.
-                // The VS is the last line of defence for data availability.
-                if !td.da_payload.is_empty() {
-                    if let Err(e) = write_da_log(&td.session_id, td.gs_counter, &td.da_payload) {
-                        // Log the error but do NOT issue the ProtectedReceipt — if
-                        // we can't persist the DA payload we cannot guarantee
-                        // availability, so we must refuse to notarise this tick.
-                        eprintln!(
-                            "[VS] DA log write FAILED for session {}.., ctr={}: {e:?} \
-                             — ProtectedReceipt withheld",
-                            hex::encode(&session_id[..4]),
-                            td.gs_counter,
-                        );
-                        continue;
-                    }
-                    if !is_dup {
-                        println!(
-                            "[VS] DA log written ({} inputs) for session {}.., ctr={}",
-                            td.da_payload.len(),
-                            hex::encode(&td.session_id[..4]),
-                            td.gs_counter,
-                        );
-                    }
-                }
-
-                // Build/send ProtectedReceipt
-                let pr_body =
-                    match bincode::serialize(&(td.session_id, td.gs_counter, td.receipt_tip)) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            eprintln!("[VS] ProtectedReceipt serialize body failed: {e:?}");
-                            continue;
-                        }
-                    };
-                let sig_vs: Sig = sign(vs_sk.as_ref(), &pr_body).to_vec();
-                let pr = ProtectedReceipt {
-                    session_id: td.session_id,
-                    gs_counter: td.gs_counter,
-                    receipt_tip: td.receipt_tip,
-                    sig_vs,
-                };
-
-                if let Err(e) = send_msg(&mut send, &pr).await {
-                    let msg = format!("{e:?}");
-                    if !msg.contains("stopped by peer") && !msg.contains("ClosedStream") {
-                        eprintln!("[VS] send ProtectedReceipt failed: {e:?}");
-                    }
-                } else if !is_dup {
-                    println!(
-                        "[VS] ProtectedReceipt issued for ctr {} (session {}..)",
+                        "[VS] timeout waiting for Heartbeat ctr={} (session {}..) \
+                         — ProtectedReceipt withheld",
                         td.gs_counter,
-                        hex::encode(&td.session_id[..4])
-                    );
-                }
-
-                continue;
-            }
-
-            // Then try Heartbeat.
-            if let Ok(hb) = bincode::deserialize::<Heartbeat>(&buf) {
-                let mut sess = match ctx.sessions.get_mut(&session_id) {
-                    Some(s) => s,
-                    None => {
-                        eprintln!("[VS] heartbeat for unknown session");
-                        continue;
-                    }
-                };
-
-                if hb.session_id != session_id {
-                    eprintln!("[VS] heartbeat session mismatch");
-                    continue;
-                }
-
-                if hb.gs_counter <= sess.last_counter {
-                    eprintln!(
-                        "[VS] heartbeat non-monotonic (got {}, last {})",
-                        hb.gs_counter, sess.last_counter
+                        hex4(&session_id)
                     );
                     continue;
                 }
+            };
 
-                let eph_vk = match VerifyingKey::from_bytes(&sess.ephemeral_pub) {
-                    Ok(vk) => vk,
-                    Err(e) => {
-                        eprintln!("[VS] stored ephemeral_pub invalid: {e:?}");
-                        continue;
-                    }
-                };
-
-                let hb_bytes = heartbeat_sign_bytes(
-                    &hb.session_id,
+            // on_heartbeat first (stages receipt_tip + snapshot_root), then on_transcript.
+            if let Err(e) = enforcer().lock().unwrap().on_heartbeat(session_id, &hb) {
+                eprintln!(
+                    "[VS] on_heartbeat error (session {}.., ctr {}): {e}",
+                    hex4(&session_id),
                     hb.gs_counter,
-                    hb.gs_time_ms,
-                    &hb.receipt_tip,
-                    &hb.sw_hash,
                 );
-
-                let hb_sig_arr: [u8; 64] = match hb.sig_gs.clone().try_into() {
-                    Ok(arr) => arr,
-                    Err(_) => {
-                        eprintln!("[VS] heartbeat sig_gs wrong length (expected 64)");
-                        continue;
-                    }
-                };
-
-                if !verify(&eph_vk, &hb_bytes, &hb_sig_arr) {
-                    eprintln!("[VS] heartbeat sig BAD]");
-                    continue;
+                if let Some(mut s) = ctx.sessions.get_mut(&session_id) {
+                    s.revoked = true;
                 }
-
-                // Enforcement: pin sw_hash and stage time for speed check
-                if let Err(e) = enforcer().lock().unwrap().on_heartbeat(session_id, &hb) {
-                    eprintln!(
-                        "[VS] enforcement (heartbeat) error on session {}..: {e}",
-                        hex::encode(&session_id[..4])
-                    );
-                    sess.revoked = true;
-                    continue;
-                }
-
-                sess.last_counter = hb.gs_counter;
-                sess.last_seen_ms = now_ms();
-
                 continue;
             }
 
-            eprintln!("[VS] unknown message type on bi-stream");
+            if let Err(e) = enforcer().lock().unwrap().on_transcript(session_id, &td) {
+                eprintln!(
+                    "[VS] on_transcript error (session {}.., ctr {}): {e}",
+                    hex4(&session_id),
+                    td.gs_counter,
+                );
+                if let Some(mut s) = ctx.sessions.get_mut(&session_id) {
+                    s.revoked = true;
+                }
+                continue;
+            }
+
+            // De-dup check (log suppression only — receipt is always issued on first).
+            let is_dup = if let Some(mut sess) = ctx.sessions.get_mut(&session_id) {
+                if sess.last_pr_counter == Some(td.gs_counter) && sess.last_pr_tip == td.receipt_tip
+                {
+                    true
+                } else {
+                    sess.last_pr_counter = Some(td.gs_counter);
+                    sess.last_pr_tip = td.receipt_tip;
+                    false
+                }
+            } else {
+                false
+            };
+
+            // Priority 1: persist DA payload before signing the receipt.
+            if !td.da_payload.is_empty() {
+                if let Err(e) = write_da_log(&td.session_id, td.gs_counter, &td.da_payload) {
+                    eprintln!(
+                        "[VS] DA log FAILED (session {}.., ctr={}): {e:?} \
+                         — ProtectedReceipt withheld",
+                        hex4(&session_id),
+                        td.gs_counter,
+                    );
+                    continue;
+                }
+                if !is_dup {
+                    println!(
+                        "[VS] DA log written ({} inputs) session {}.., ctr={}",
+                        td.da_payload.len(),
+                        hex4(&td.session_id),
+                        td.gs_counter,
+                    );
+                }
+            }
+
+            let pr_body = match bincode::serialize(&(td.session_id, td.gs_counter, td.receipt_tip))
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("[VS] ProtectedReceipt serialize failed: {e:?}");
+                    continue;
+                }
+            };
+            let pr = ProtectedReceipt {
+                session_id: td.session_id,
+                gs_counter: td.gs_counter,
+                receipt_tip: td.receipt_tip,
+                sig_vs: sign(vs_sk.as_ref(), &pr_body).to_vec(),
+            };
+
+            if let Err(e) = send_msg(&mut send, &pr).await {
+                let msg = format!("{e:?}");
+                if !msg.contains("stopped by peer") && !msg.contains("ClosedStream") {
+                    eprintln!("[VS] send ProtectedReceipt failed: {e:?}");
+                }
+            } else if !is_dup {
+                println!(
+                    "[VS] ProtectedReceipt issued ctr={} (session {}..)",
+                    td.gs_counter,
+                    hex4(&td.session_id)
+                );
+            }
         }
     });
 }
 
 /// Listen for Heartbeat messages on **uni** streams.
-/// Updates `last_seen_ms`, verifies sig, and informs the enforcer.
 ///
-/// Stage 1.2: Now also verifies TPM re-attestation quotes when present.
+/// After verifying the GS signature and optional TPM quote, this handler
+/// stages the Heartbeat in `session.staged_hbs` and fires `hb_notify`.
+/// `spawn_bistream_dispatch` waits on that notification before processing
+/// the matching TranscriptDigest, ensuring the two always run as a pair.
+///
+/// Stage 1.2: TPM re-attestation quotes are verified here before staging.
 pub fn spawn_uni_heartbeat_listener(conn: &Connection, ctx: VsCtx, session_id: [u8; 16]) {
     let conn = conn.clone();
     let ctx = ctx.clone();
 
     tokio::spawn(async move {
-        // Track expected PCR values from initial attestation
-        // In production, these would be stored in ctx.sessions at JoinRequest time
         let mut baseline_pcrs: Option<std::collections::BTreeMap<u8, [u8; 32]>> = None;
 
         loop {
             let mut recv = match conn.accept_uni().await {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("[VS] accept_uni (heartbeat) failed: {e:?}");
+                    eprintln!("[VS] accept_uni failed: {e:?}");
                     break;
                 }
             };
@@ -316,32 +283,30 @@ pub fn spawn_uni_heartbeat_listener(conn: &Connection, ctx: VsCtx, session_id: [
 
             HEARTBEATS_TOTAL.inc();
 
-            let (ephemeral_pub, revoked) = match ctx.sessions.get(&session_id) {
-                Some(s) => (s.ephemeral_pub, s.revoked),
-                None => {
-                    eprintln!(
-                        "[VS] heartbeat for unknown session {}..",
-                        hex::encode(&session_id[..4])
-                    );
-                    continue;
-                }
+            let (ephemeral_pub, revoked, last_counter) = match ctx.sessions.get(&session_id) {
+                Some(s) => (s.ephemeral_pub, s.revoked, s.last_counter),
+                None => continue,
             };
             if revoked {
+                continue;
+            }
+
+            // Counter must advance.
+            if hb.gs_counter <= last_counter {
                 eprintln!(
-                    "[VS] heartbeat ignored for revoked session {}..",
-                    hex::encode(&session_id[..4])
+                    "[VS] HB non-monotonic (got {}, last {}) session {}..",
+                    hb.gs_counter,
+                    last_counter,
+                    hex4(&session_id)
                 );
                 continue;
             }
 
-            // Verify GS heartbeat signature
+            // Verify signature — now covers snapshot_root (Fix 1).
             let sig_arr: [u8; 64] = match hb.sig_gs.clone().try_into() {
                 Ok(a) => a,
                 Err(_) => {
-                    eprintln!(
-                        "[VS] bad hb.sig_gs length for session {}..",
-                        hex::encode(&session_id[..4])
-                    );
+                    eprintln!("[VS] bad sig_gs length session {}..", hex4(&session_id));
                     continue;
                 }
             };
@@ -349,92 +314,60 @@ pub fn spawn_uni_heartbeat_listener(conn: &Connection, ctx: VsCtx, session_id: [
                 Ok(vk) => vk,
                 Err(e) => {
                     eprintln!(
-                        "[VS] bad ephemeral_pub in session {}..: {e:?}",
-                        hex::encode(&session_id[..4])
+                        "[VS] bad ephemeral_pub session {}..: {e:?}",
+                        hex4(&session_id)
                     );
                     continue;
                 }
             };
-
-            let bytes = heartbeat_sign_bytes(
+            let sign_bytes = heartbeat_sign_bytes(
                 &hb.session_id,
                 hb.gs_counter,
                 hb.gs_time_ms,
                 &hb.receipt_tip,
                 &hb.sw_hash,
+                &hb.snapshot_root,
             );
-            if !verify(&vk, &bytes, &sig_arr) {
+            if !verify(&vk, &sign_bytes, &sig_arr) {
                 eprintln!(
-                    "[VS] heartbeat signature invalid (sid {}.., ctr {})",
-                    hex::encode(&session_id[..4]),
+                    "[VS] HB sig invalid (session {}.., ctr {})",
+                    hex4(&session_id),
                     hb.gs_counter
                 );
                 continue;
             }
 
-            // =========================================================
-            // Stage 1.2: Verify TPM Re-Attestation Quote
-            //
-            // If the heartbeat includes a TPM quote, verify:
-            // 1. The nonce matches our expectation (derived from session state)
-            // 2. The quote signature is valid
-            // 3. PCR values match the baseline from JoinRequest
-            //
-            // This detects:
-            // - Hot-patching (modifying GS memory after startup)
-            // - Configuration changes
-            // - Any code tampering since initial attestation
-            // =========================================================
+            // Stage 1.2: verify TPM quote when present.
             if let Some(ref quote) = hb.tpm_quote {
                 let timer = TPM_VERIFICATION_LATENCY.start_timer();
 
-                // Derive expected nonce (must match GS derivation)
                 let expected_nonce = {
-                    let mut buf = Vec::with_capacity(16 + 8 + 32);
+                    let mut buf = Vec::with_capacity(56);
                     buf.extend_from_slice(&session_id);
                     buf.extend_from_slice(&hb.gs_counter.to_le_bytes());
                     buf.extend_from_slice(&hb.receipt_tip);
                     sha256(&buf)
                 };
 
-                // Verify quote nonce and signature
                 match verify_quote(quote, &expected_nonce, baseline_pcrs.as_ref()) {
                     Ok(()) => {
-                        println!(
-                            "[VS] TPM re-attestation verified (session {}.., ctr {})",
-                            hex::encode(&session_id[..4]),
-                            hb.gs_counter
-                        );
                         TPM_VERIFICATIONS_TOTAL
                             .with_label_values(&["success"])
                             .inc();
-
-                        // If this is the first quote we've seen, establish baseline
                         if baseline_pcrs.is_none() {
                             baseline_pcrs = Some(quote.pcr_values.clone());
-                            println!(
-                                "[VS] TPM baseline established for session {}.. (PCRs: {:?})",
-                                hex::encode(&session_id[..4]),
-                                quote.pcr_values.keys().collect::<Vec<_>>()
-                            );
+                            println!("[VS] TPM baseline set for session {}..", hex4(&session_id));
                         }
                     }
                     Err(e) => {
                         eprintln!(
-                            "[VS] TPM re-attestation FAILED (session {}.., ctr {}): {}",
-                            hex::encode(&session_id[..4]),
-                            hb.gs_counter,
-                            e
+                            "[VS] TPM FAILED (session {}.., ctr {}): {e}",
+                            hex4(&session_id),
+                            hb.gs_counter
                         );
                         TPM_VERIFICATIONS_TOTAL.with_label_values(&["failed"]).inc();
-
-                        // CRITICAL: Mark session as revoked - GS integrity compromised
                         if let Some(mut sess) = ctx.sessions.get_mut(&session_id) {
                             sess.revoked = true;
-                            eprintln!(
-                                "[VS] Session {}.. REVOKED due to TPM attestation failure",
-                                hex::encode(&session_id[..4])
-                            );
                         }
                         continue;
                     }
@@ -443,27 +376,27 @@ pub fn spawn_uni_heartbeat_listener(conn: &Connection, ctx: VsCtx, session_id: [
                 timer.observe_duration();
             }
 
-            // Mark last-seen and let the enforcer pin time/hash
+            // Signature verified — update liveness counter and stage for bi-stream.
             if let Some(mut sess) = ctx.sessions.get_mut(&session_id) {
                 sess.last_seen_ms = now_ms();
+                sess.last_counter = hb.gs_counter;
             }
-            if let Err(e) = enforcer().lock().unwrap().on_heartbeat(session_id, &hb) {
-                eprintln!("[VS] enforcer.on_heartbeat failed: {e:#}");
+
+            if let Some(s) = ctx.sessions.get(&session_id) {
+                s.staged_hbs.lock().unwrap().insert(hb.gs_counter, hb);
+                s.hb_notify.notify_waiters();
             }
         }
     });
 }
 
 // ---------------------------------------------------------------------------
-// Priority 1 (DA Black Hole fix): durable DA log writer
+// Priority 1 (DA Black Hole fix): durable DA log writer.
+// Writes before the ProtectedReceipt is signed so auditors can always
+// reconstruct the transcript even if the GS later deletes its ledger.
 //
-// Writes the raw ClientInput bytes from a TranscriptDigest to a local file
-// BEFORE the VS signs the ProtectedReceipt.  This ensures auditors always
-// have access to the data needed to reconstruct and verify the transcript,
-// even if the GS later goes rogue and deletes its own ledger.
-//
-// File layout: da_log/session_<hex8>_ctr_<counter_decimal>.da
-// Binary format: [u32 LE entry_count] ([u32 LE len] [bytes])...
+// Format: da_log/session_<hex8>_ctr_<decimal>.da
+//         [u32 LE count] ([u32 LE len] [bytes])...
 // ---------------------------------------------------------------------------
 fn write_da_log(
     session_id: &[u8; 16],
@@ -473,26 +406,20 @@ fn write_da_log(
     use std::io::Write as _;
 
     std::fs::create_dir_all("da_log")?;
-
     let path = format!(
         "da_log/session_{}_ctr_{:010}.da",
         hex::encode(&session_id[..8]),
         gs_counter,
     );
-
     let mut f = std::fs::File::create(&path)?;
-
-    // Header: number of entries (u32 LE)
-    let count = da_payload.len() as u32;
-    f.write_all(&count.to_le_bytes())?;
-
-    // Each entry: length (u32 LE) then raw bytes
+    f.write_all(&(da_payload.len() as u32).to_le_bytes())?;
     for entry in da_payload {
-        let len = entry.len() as u32;
-        f.write_all(&len.to_le_bytes())?;
+        f.write_all(&(entry.len() as u32).to_le_bytes())?;
         f.write_all(entry)?;
     }
+    f.flush()
+}
 
-    f.flush()?;
-    Ok(())
+fn hex4(id: &[u8; 16]) -> String {
+    hex::encode(&id[..4])
 }

@@ -118,7 +118,14 @@ pub async fn heartbeat_loop_with_tpm(
             )
         };
 
-        let to_sign = heartbeat_sign_bytes(&session_id, c, now, &receipt_tip_now, &sw_hash_now);
+        let to_sign = heartbeat_sign_bytes(
+            &session_id,
+            c,
+            now,
+            &receipt_tip_now,
+            &sw_hash_now,
+            &snapshot_root,
+        );
         let sig_gs_bytes = sign(&eph_sk, &to_sign);
 
         // =====================================================================
@@ -179,6 +186,11 @@ pub async fn heartbeat_loop_with_tpm(
             gs_time_ms: now,
             receipt_tip: receipt_tip_now,
             sw_hash: sw_hash_now,
+            // Priority 2 (Ghost Snapshot fix): snapshot_root is now part of the
+            // signed Heartbeat so the VS can cryptographically verify that the
+            // positions in the TranscriptDigest were committed before the HB was
+            // signed, closing the Ghost Snapshot exploit.
+            snapshot_root,
             sig_gs: sig_gs_bytes.to_vec(),
             tpm_quote, // Stage 1.2: Include TPM quote when available
         };
@@ -212,9 +224,8 @@ pub async fn heartbeat_loop_with_tpm(
             gs_counter: c,
             receipt_tip: receipt_tip_now,
             positions: positions_vec,
-            // Priority 2 (Ghost Snapshot fix): positions committed to receipt_tip.
-            snapshot_root,
             // Priority 1 (DA Black Hole fix): raw ClientInput bytes for VS DA log.
+            // Note: snapshot_root has been moved to the signed Heartbeat (Fix 2).
             da_payload,
         };
 

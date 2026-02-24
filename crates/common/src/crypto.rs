@@ -72,8 +72,17 @@ pub fn heartbeat_sign_bytes(
     gs_time_ms: u64,
     receipt_tip: &[u8; 32],
     sw_hash: &[u8; 32],
+    snapshot_root: &[u8; 32],
 ) -> Vec<u8> {
-    bincode::serialize(&(session_id, gs_counter, gs_time_ms, receipt_tip, sw_hash)).unwrap()
+    bincode::serialize(&(
+        session_id,
+        gs_counter,
+        gs_time_ms,
+        receipt_tip,
+        sw_hash,
+        snapshot_root,
+    ))
+    .unwrap()
 }
 
 pub fn rolling_hash_update(prev: [u8; 32], event_bytes: &[u8]) -> [u8; 32] {
