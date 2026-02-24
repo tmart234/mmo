@@ -1,8 +1,11 @@
 // crates/vs/src/ctx.rs
 use common::config::VsConfig;
+use common::proto::Heartbeat;
 use dashmap::DashMap;
 use ed25519_dalek::SigningKey;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 
 #[derive(Clone)]
 pub struct VsCtx {
@@ -21,6 +24,21 @@ pub struct Session {
     // For ProtectedReceipt de-dup / tidy logs
     pub last_pr_counter: Option<u64>,
     pub last_pr_tip: [u8; 32],
+
+    /// Fix 2 (Tick Synchronization): staging area for Heartbeats that have
+    /// arrived on the uni-stream but whose matching TranscriptDigest bi-stream
+    /// has not yet been processed.  Keyed by gs_counter.
+    ///
+    /// The bi-stream handler waits here (with a timeout) before calling the
+    /// enforcer, guaranteeing that receipt_tip and snapshot_root from the
+    /// *signed* Heartbeat are always available when on_transcript() runs.
+    /// This closes the Premature Notarization exploit where a TranscriptDigest
+    /// could arrive and be receipted before the Heartbeat signature was verified.
+    pub staged_hbs: Arc<Mutex<HashMap<u64, Heartbeat>>>,
+
+    /// Notified whenever a new Heartbeat is staged into `staged_hbs`, waking
+    /// any bi-stream handlers that are waiting for their matching HB.
+    pub hb_notify: Arc<Notify>,
 }
 
 impl VsCtx {

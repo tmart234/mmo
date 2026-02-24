@@ -45,6 +45,14 @@ struct SessionPhysics {
     /// physics checks on a positions array that is disconnected from the
     /// committed transcript hash.
     pending_hb_receipt_tip: Option<[u8; 32]>,
+
+    /// Priority 2 (Ghost Snapshot fix): the snapshot_root the GS signed in
+    /// the most recent heartbeat.  Because it is part of the signed heartbeat
+    /// bytes, the VS can cryptographically verify that
+    /// sha256(td.positions) == this value, permanently linking the positions
+    /// array to the GS's own signature.  A rogue GS cannot swap in a fake
+    /// positions array after the heartbeat is signed.
+    pending_snapshot_root: Option<[u8; 32]>,
 }
 
 impl Enforcer {
@@ -63,6 +71,7 @@ impl Enforcer {
                 last_positions: HashMap::new(),
                 pending_hb_time_ms: None,
                 pending_hb_receipt_tip: None,
+                pending_snapshot_root: None,
             },
         );
     }
@@ -123,10 +132,11 @@ impl Enforcer {
             return Err(anyhow!("sw_hash mismatch"));
         }
 
-        // Stage time and receipt_tip of this heartbeat; speed check + cross-
-        // validation will be done when TranscriptDigest arrives.
+        // Stage time, receipt_tip, and snapshot_root of this heartbeat; speed
+        // check + cross-validation will be done when TranscriptDigest arrives.
         sess.pending_hb_time_ms = Some(hb.gs_time_ms);
         sess.pending_hb_receipt_tip = Some(hb.receipt_tip);
+        sess.pending_snapshot_root = Some(hb.snapshot_root);
         Ok(())
     }
 
@@ -153,50 +163,71 @@ impl Enforcer {
         }
 
         // -----------------------------------------------------------------------
-        // Priority 2, check 1: receipt_tip cross-validation.
+        // Priority 2, check 1: receipt_tip cross-validation (mandatory).
         // The TranscriptDigest must carry the same receipt_tip the GS signed in
         // its Heartbeat for this counter.  If they differ the GS is operating a
         // split-brain: an honest state committed in the heartbeat vs. a fabricated
         // positions array fed to the speed checker.
+        //
+        // With tick synchronization (Fix 2), the Heartbeat is always processed
+        // before on_transcript() is called, so pending_hb_receipt_tip is always
+        // Some here.  Failing if it is None is the correct safe default.
         // -----------------------------------------------------------------------
-        if let Some(expected_tip) = sess.pending_hb_receipt_tip {
-            if td.receipt_tip != expected_tip {
+        let expected_tip = match sess.pending_hb_receipt_tip.take() {
+            Some(t) => t,
+            None => {
                 sess.revoked = true;
-                eprintln!(
-                    "[VS] REVOKE session {}.. reason=receipt_tip_mismatch \
-                     (heartbeat={}, transcript={})",
-                    hex4(&session_id),
-                    hex32(&expected_tip),
-                    hex32(&td.receipt_tip),
-                );
                 return Err(anyhow!(
-                    "receipt_tip in TranscriptDigest does not match Heartbeat"
+                    "no staged receipt_tip: Heartbeat must be verified before TranscriptDigest"
                 ));
             }
+        };
+        if td.receipt_tip != expected_tip {
+            sess.revoked = true;
+            eprintln!(
+                "[VS] REVOKE session {}.. reason=receipt_tip_mismatch \
+                 (heartbeat={}, transcript={})",
+                hex4(&session_id),
+                hex32(&expected_tip),
+                hex32(&td.receipt_tip),
+            );
+            return Err(anyhow!(
+                "receipt_tip in TranscriptDigest does not match Heartbeat"
+            ));
         }
-        // Clear the staged tip regardless (consumed by this digest).
-        sess.pending_hb_receipt_tip = None;
 
         // -----------------------------------------------------------------------
-        // Priority 2, check 2: snapshot_root integrity.
-        // Recompute sha256(positions) and compare against the claimed root.
-        // Because the GS folded snapshot_root into receipt_tip (which was signed),
-        // a rogue GS cannot swap in a different positions array post-signature.
+        // Priority 2, check 2: snapshot_root integrity against the signed HB.
+        // Recompute sha256(positions) and compare against the snapshot_root that
+        // the GS included in the *signed* Heartbeat (stored as pending_snapshot_root
+        // by on_heartbeat).  Because the GS signed snapshot_root in the Heartbeat,
+        // a rogue GS cannot substitute a different positions array in the
+        // TranscriptDigest — the sha256 would no longer match the signed value.
         // -----------------------------------------------------------------------
+        let expected_root = match sess.pending_snapshot_root.take() {
+            Some(r) => r,
+            None => {
+                sess.revoked = true;
+                return Err(anyhow!(
+                    "no staged snapshot_root: Heartbeat must be verified before TranscriptDigest"
+                ));
+            }
+        };
         let positions_bytes =
             bincode::serialize(&td.positions).expect("serialize positions for snapshot_root check");
         let computed_root = sha256(&positions_bytes);
-        if computed_root != td.snapshot_root {
+        if computed_root != expected_root {
             sess.revoked = true;
             eprintln!(
                 "[VS] REVOKE session {}.. reason=snapshot_root_mismatch \
-                 (computed={}, claimed={})",
+                 (computed={}, heartbeat_signed={})",
                 hex4(&session_id),
                 hex32(&computed_root),
-                hex32(&td.snapshot_root),
+                hex32(&expected_root),
             );
             return Err(anyhow!(
-                "snapshot_root does not match sha256(positions): positions array was tampered"
+                "sha256(positions) does not match snapshot_root signed in Heartbeat: \
+                 positions array was tampered after heartbeat was signed"
             ));
         }
 

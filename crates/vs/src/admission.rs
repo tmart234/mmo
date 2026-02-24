@@ -3,6 +3,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::VerifyingKey;
 use quinn::Connection;
 use rand::{rngs::OsRng, RngCore};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 
 use crate::ctx::{Session, VsCtx};
 use crate::enforcer::enforcer;
@@ -128,6 +131,8 @@ pub async fn admit_and_run(connecting: quinn::Incoming, ctx: VsCtx) -> Result<()
             revoked: false,
             last_pr_counter: None,
             last_pr_tip: [0u8; 32],
+            staged_hbs: Arc::new(Mutex::new(HashMap::new())),
+            hb_notify: Arc::new(Notify::new()),
         },
     );
 
