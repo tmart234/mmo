@@ -21,6 +21,11 @@ Flow:
 
 Goal: anti-cheat + anti-rogue-host + audit trail, built into the protocol.
 
+> **Production design:** see [`docs/anticheat/`](docs/anticheat/README.md) for the
+> threat model, requirements, architecture, protocol spec (FPP v1), ontology
+> review, language decision (ADR-001) and roadmap that supersede the prototype
+> design below.
+
 ---
 
 ## Crypto (so far)
