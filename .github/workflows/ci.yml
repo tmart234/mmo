@@ -40,6 +40,14 @@ jobs:
         env:
           STRICT_SMOKE: "1"
 
+      # The Halo: CE port (first reference title) is 32-bit x86: keep the C SDK
+      # building and conforming for that ABI.
+      - name: C SDK conformance on i686 (Halo ABI)
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q gcc-multilib
+          rustup target add i686-unknown-linux-gnu
+          make ffi-c-test-i686
+
   # Advisories (RustSec, same database as cargo-audit), licenses, bans and
   # sources, per deny.toml. Blocking.
   dependency-policy:

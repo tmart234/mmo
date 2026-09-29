@@ -175,3 +175,51 @@ LD_LIBRARY_PATH=/usr/lib/i386-linux-gnu build/linux/halo
 
 On a desktop, the port's own route is simpler: Arch Linux's `lib32-sdl3`
 package (what its CI uses), or the prebuilt releases linked from its README.
+
+## 7. The security multiplayer mod
+
+Goal: a Halo: CE mod, and later equivalents for other classic C/C++ games,
+that makes player-hosted and dedicated multiplayer speak FPP. The mod is C
+code in a fork of the port. All protocol logic stays in `mmo` and reaches the
+game only through the C SDK `crates/fpp-ffi` (`include/fpp.h` +
+`libfpp.a`). The same SDK serves every classic, since their game code is
+C/C++ (ADR-001 E1).
+
+```text
+halo-ce-universal fork                         mmo
+┌──────────────────────────────────────┐       ┌──────────────────────────────┐
+│ game code (decomp, unchanged logic)  │       │ fpp-ffi   C ABI, i686/x86_64 │
+│  network_distributed.c  ─┐           │       │  ├ keys, digests             │
+│  network_damage.c       ─┼─ hooks ──►│ glue  │  ├ InputCommit builder/verify│
+│  p2p.c / p2p_signal.c   ─┘           │ (C)  ─┼─►├ Checkpoint builder/verify │
+│ host validators (H01/H02 fixes, C)   │       │  └ (M2) secure P2P session   │
+│ evidence bundle on disk              │       │ fpp-wire / fpp-crypto / merkle│
+└──────────────────────────────────────┘       └──────────────────────────────┘
+```
+
+What the glue does with the SDK (distributed netcode, player-hosted):
+
+| Where | When | SDK calls |
+|-------|------|-----------|
+| Client join | Once per match | `fpp_signer_generate` (session key); send the public key to the host with the join |
+| Client, `network_distributed_tick()` | Every tick | `fpp_input_commit_add_frame(tick, bytes)` with the tick's action update, own-position report and hit reports |
+| Client, epoch end | Every `ticks_per_epoch` | `fpp_input_commit_sign`; send reliably; keep `fpp_object_digest` as the next `prev` |
+| Host, per slot | Every tick | Its own builder over the frames it *received*; at epoch end `fpp_verify_input_commit` (player's key) and compare `frames_root` with `fpp_input_commit_frames_root`; a mismatch is a Signal |
+| Host, epoch end | Every epoch | `fpp_checkpoint_begin`; `add_input` per slot (commit digest, applied bitset); `add_event` for damage, deaths, pickups and scores it decided; `add_roster`; `fpp_checkpoint_sign` with the host instance key; send the digest to every client |
+| Everyone | Match end | Write the evidence bundle (frames, commits, checkpoints) to disk; clients `fpp_verify_checkpoint` the host's objects. Any player can later prove what the host did (H09). |
+
+Milestones (each builds on the previous; M1 is done):
+
+| # | Milestone | Status / exit |
+|---|-----------|---------------|
+| **M1** | C SDK for evidence primitives (`fpp-ffi`), 32- and 64-bit | ✅ The C conformance program (`make ffi-c-test`, `ffi-c-test-i686`) signs objects byte-identical to the golden vectors, verified by the independent Python implementation. Linked statically into a local build of the 32-bit port, it runs at start-up: `fpp-probe: SDK ABI 1, signed a 312-byte InputCommit for 30 ticks, verify: ok`. |
+| **M2** | Secure P2P session in the SDK: authenticated key exchange with the host's static key fingerprint in the invite, per-packet counters with a replay window, path validation before endpoint changes | Replaces the port's tunnel keying (fixes H03–H05). Proposed construction: Noise IK/XX over the port's existing UDP tunnel. It fits its datagram design better than embedding a QUIC stack in the game loop. Decide when M2 starts. |
+| **M3** | Fork + glue: evidence recording as in the table above; host validators fixing H01/H02 emit structured Signals | Red-team clients from H1 are rejected or flagged; each match leaves a verifiable evidence bundle |
+| **M4** | Headless replay auditor built from the port | Re-simulates host decisions from a bundle; flags a cheating host; identical results on Linux, Windows and Android |
+| **M5** | Verified playlists: dedicated host mode, Verifier/Broker/SAR from `mmo`, device tiers (Windows, Android) | Needs roadmap P2 and P3 |
+| **M6** | Anti-ESP relevance filtering in the distributed netcode | Radar client loses occluded players |
+
+Linking notes, learned from the probe: link the static archive explicitly
+(`-l:libfpp.a` or its full path), because with `-lfpp` the linker prefers
+`libfpp.so` when both are present. Add `-ldl -lgcc_s` to the game's link line.
+The SDK uses no libm symbols, so it coexists with the port's `musl-math`.

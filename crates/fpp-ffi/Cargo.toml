@@ -1,0 +1,23 @@
+[package]
+name = "fpp-ffi"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Fair-Play Protocol v1 SDK for C/C++ games: stable C ABI over fpp-wire, fpp-crypto and fpp-merkle"
+
+[lib]
+name = "fpp"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+fpp-types = { path = "../fpp-types" }
+fpp-wire = { path = "../fpp-wire" }
+fpp-crypto = { path = "../fpp-crypto" }
+fpp-merkle = { path = "../fpp-merkle" }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+cbindgen = "0.29"

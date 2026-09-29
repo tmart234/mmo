@@ -28,3 +28,6 @@ crates/*/keys/
 
 # Runtime output of vs/gs-sim (evidence and ledger logs)
 da_log/
+
+# Python bytecode (interop checkers)
+__pycache__/

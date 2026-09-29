@@ -4,6 +4,7 @@ members = [
     "crates/fpp-wire",
     "crates/fpp-crypto",
     "crates/fpp-merkle",
+    "crates/fpp-ffi",
     "crates/common",
     "crates/gs-sim",
     "crates/vs",

@@ -62,6 +62,10 @@ make ci
 # dependency policy (advisories, licenses, sources), as in CI
 cargo deny check
 
+# C SDK for C/C++ games (include/fpp.h + libfpp.a): conformance, 64-bit and Halo's 32-bit ABI
+make ffi-c-test
+make ffi-c-test-i686
+
 # fuzz the wire decoders and verifiers (nightly + cargo-fuzz)
 cargo +nightly fuzz run wire_decode -- -max_total_time=60
 cargo +nightly fuzz run verify_untrusted -- -max_total_time=60

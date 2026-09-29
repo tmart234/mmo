@@ -52,6 +52,7 @@ What makes anti-cheat unusual when choosing a language:
 | Game Server authority kernel + Host Agent | **Rust** | Title gameplay code may be any language behind the `AuthorityRules` trait / C ABI. The audit projection must be deterministic. |
 | Protocol (`fpp-*` crates): CBOR/COSE, tokens, Merkle, suites | **Rust** | One implementation, compiled into client SDK, GS and services. |
 | Integrity Agent core (user mode) | **Rust** | Exposed through a C ABI (`extern "C"`, headers generated with cbindgen). |
+| Game SDK for C/C++ titles (`crates/fpp-ffi`) | **Rust**, C ABI | Implemented: `include/fpp.h` (cbindgen, committed, staleness-tested) + `libfpp.a`/`.so`, 32- and 64-bit. The only workspace crate with `unsafe`, confined to the boundary; every entry point catches panics. |
 | Detection modules | **Rust → WebAssembly** | Run in wasmtime (itself Rust), capability-restricted. Sandboxing, not language, is what contains a bad content push. |
 | Engine plugins | **C++ (Unreal)**, **C# (Unity)**, GDExtension (Godot) | Glue only, ≤ ~2 k LOC per engine, over the C ABI. |
 | Windows kernel component (optional, per title) | **C** today → Rust later | See exception E2. |
