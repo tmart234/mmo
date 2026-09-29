@@ -13,6 +13,10 @@
 // 4. Run a client that must be refused the `verified` queue, then
 //    client-sim --smoke-test. 5. Wait for gs-sim, kill VS. 6. Repeat with
 //    the simulated TPM. Any failure fails the run (LENIENT_SMOKE=1 only warns).
+//
+// SMOKE_VS_BIN runs another VS binary, SMOKE_VS_WRAPPER runs it through a
+// command (`make pi-vs-smoke`: the aarch64 VS for a Raspberry Pi under
+// qemu-aarch64-static), and SMOKE_VS_STARTUP_MS waits longer for it.
 
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
@@ -142,15 +146,29 @@ fn run_smoke_pass(enable_tpm: bool) -> Result<(bool, bool)> {
         pass_name
     );
 
-    // 1. Spawn VS
-    let vs_bin = bin_path("vs");
-    let mut vs_child = Command::new(&vs_bin)
+    // 1. Spawn VS (optionally another build, through a wrapper such as qemu)
+    let vs_bin = std::env::var_os("SMOKE_VS_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| bin_path("vs"));
+    let mut vs_cmd = match std::env::var_os("SMOKE_VS_WRAPPER") {
+        Some(wrapper) => {
+            let mut cmd = Command::new(wrapper);
+            cmd.arg(&vs_bin);
+            cmd
+        }
+        None => Command::new(&vs_bin),
+    };
+    let mut vs_child = vs_cmd
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| format!("spawn {:?}", vs_bin))?;
 
-    thread::sleep(Duration::from_millis(200));
+    let startup_ms = std::env::var("SMOKE_VS_STARTUP_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200);
+    thread::sleep(Duration::from_millis(startup_ms));
 
     // 2. Spawn GS (with or without TPM)
     let gs_bin = bin_path("gs-sim");

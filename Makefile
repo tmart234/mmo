@@ -18,7 +18,7 @@ PKG_FLAGS := $(foreach p,$(HEADLESS_PKGS),-p $(p))
 
 # -------- Phonies --------
 .PHONY: help ci check build-headless test-headless test-stage interop ffi-c-test ffi-c-test-i686 \
-        sim-positive clean-build clean-lock-build \
+        pi-vs pi-vs-smoke ffi-c-test-aarch64 sim-positive clean-build clean-lock-build \
         check-all build-all test-all
 
 # -------- Help --------
@@ -31,6 +31,9 @@ help:
 	@echo "  test-stage         - test headless crates + run smoke (VS <-> GS <-> client)"
 	@echo "  interop            - check FPP golden vectors with the independent Python verifier"
 	@echo "  ffi-c-test         - C SDK conformance (x86_64); ffi-c-test-i686 for the Halo ABI"
+	@echo "  pi-vs              - cross-build the VS (and gen_keys) for a Raspberry Pi (aarch64)"
+	@echo "  pi-vs-smoke        - smoke test with the aarch64 VS under qemu-aarch64-static"
+	@echo "  ffi-c-test-aarch64 - C SDK conformance for the Pi 5 host (aarch64, under qemu)"
 	@echo "  sim-positive       - just run the smoke harness (gen_keys + smoke)"
 	@echo "  clean-build        - cargo clean + fmt + build (workspace, all targets)"
 	@echo "  clean-lock-build   - destructive: clean + remove Cargo.lock + fmt + build (workspace)"
@@ -150,3 +153,43 @@ play-full:
 	@echo "Ensuring VS keys + launching VS, GS, and Bevy client..."
 	cargo run -p tools --bin gen_keys
 	cargo run -p tools --bin play
+# -------- Raspberry Pi (aarch64): VS on a Pi Zero 2 W, SDK for the Pi 5 host --------
+# Cross-builds with clang + lld and Debian/Ubuntu's aarch64 sysroot, so no
+# aarch64 gcc is needed:
+#   rustup target add aarch64-unknown-linux-gnu
+#   apt-get install clang lld llvm libc6-dev-arm64-cross libgcc-13-dev-arm64-cross qemu-user-static
+# deploy/pi/README.md installs the result.
+PI_TARGET := aarch64-unknown-linux-gnu
+PI_ENV := CC_aarch64_unknown_linux_gnu=clang CXX_aarch64_unknown_linux_gnu=clang++ \
+	CFLAGS_aarch64_unknown_linux_gnu=--target=aarch64-linux-gnu \
+	CXXFLAGS_aarch64_unknown_linux_gnu=--target=aarch64-linux-gnu \
+	AR_aarch64_unknown_linux_gnu=llvm-ar \
+	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=clang \
+	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=--target=aarch64-linux-gnu -C link-arg=-fuse-ld=lld"
+PI_QEMU := qemu-aarch64-static
+PI_SYSROOT := /usr/aarch64-linux-gnu
+
+pi-vs:
+	$(PI_ENV) cargo build --release -p vs -p tools --target $(PI_TARGET)
+	@echo "VS for the Pi: target/$(PI_TARGET)/release/vs (install: deploy/pi/README.md)"
+
+# The full smoke test (both passes), with the VS the Pi runs, emulated.
+pi-vs-smoke: pi-vs
+	cargo build -p vs -p gs-sim -p client-core -p tools
+	cargo run -p tools --bin gen_keys
+	SMOKE_VS_BIN=target/$(PI_TARGET)/release/vs SMOKE_VS_WRAPPER=$(PI_QEMU) SMOKE_VS_STARTUP_MS=1500 \
+		QEMU_LD_PREFIX=$(PI_SYSROOT) cargo run -p tools --bin smoke
+
+# libfpp.a for the Pi 5 host loader (LP64 aarch64; the game itself is ILP32,
+# docs/anticheat/08 §8), checked as ffi-c-test checks the x86 builds.
+ffi-c-test-aarch64:
+	$(PI_ENV) cargo build -p fpp-ffi --target $(PI_TARGET)
+	clang --target=aarch64-linux-gnu -fuse-ld=lld -std=c99 -Wall -Wextra -Werror -pedantic \
+		-Icrates/fpp-ffi/include crates/fpp-ffi/tests/c/conformance.c \
+		target/$(PI_TARGET)/debug/libfpp.a $(FFI_LIBS) -o target/fpp-conformance-aarch64
+	QEMU_LD_PREFIX=$(PI_SYSROOT) $(PI_QEMU) ./target/fpp-conformance-aarch64 > target/fpp-conformance-aarch64.jsonl
+	python3 interop/python/check_c_sdk.py target/fpp-conformance-aarch64.jsonl
+	clang --target=aarch64-linux-gnu -fuse-ld=lld -std=c99 -Wall -Wextra -Werror -pedantic \
+		-Icrates/fpp-ffi/include crates/fpp-ffi/tests/c/p2p.c \
+		target/$(PI_TARGET)/debug/libfpp.a $(FFI_LIBS) -o target/fpp-p2p-aarch64
+	QEMU_LD_PREFIX=$(PI_SYSROOT) $(PI_QEMU) ./target/fpp-p2p-aarch64
