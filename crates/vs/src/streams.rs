@@ -3,13 +3,13 @@ use common::{
     crypto::{heartbeat_sign_bytes, now_ms, sha256, sign, verify},
     framing::{recv_msg, recv_msg_max, send_msg, MAX_TRANSCRIPT_FRAME},
     proto::{Heartbeat, PlayTicket, ProtectedReceipt, TranscriptDigest},
-    tpm::verify_quote,
 };
 use ed25519_dalek::VerifyingKey;
 use quinn::Connection;
 use std::time::Duration;
 use tokio::time::sleep;
 
+use crate::attest::{appraise_reattest_quote, RECENT_TICKETS};
 use crate::ctx::VsCtx;
 use crate::enforcer::enforcer;
 use crate::metrics::{HEARTBEATS_TOTAL, TPM_VERIFICATIONS_TOTAL, TPM_VERIFICATION_LATENCY};
@@ -63,6 +63,13 @@ pub fn spawn_ticket_loop(conn: &Connection, ctx: VsCtx, session_id: [u8; 16]) {
                 sig_vs: sign(vs_sk.as_ref(), &body_bytes),
             };
             prev_hash = sha256(&body_bytes);
+            // Remember it before sending: the GS may seed a quote with it at once.
+            if let Some(mut s) = ctx.sessions.get_mut(&session_id) {
+                s.recent_tickets.push_back((counter, pt.sig_vs.to_vec()));
+                while s.recent_tickets.len() > RECENT_TICKETS {
+                    s.recent_tickets.pop_front();
+                }
+            }
 
             match conn.open_bi().await {
                 Ok((mut send, _recv)) => {
@@ -328,19 +335,25 @@ pub fn spawn_uni_heartbeat_listener(conn: &Connection, ctx: VsCtx, session_id: [
                 continue;
             }
 
-            // Stage 1.2: verify TPM quote when present.
+            // Stage 1.2: appraise the re-attestation quote when present (F04):
+            // pinned attestation key, seeded by a recent VS ticket, baseline PCRs.
             if let Some(ref quote) = hb.tpm_quote {
                 let timer = TPM_VERIFICATION_LATENCY.start_timer();
-
-                let expected_nonce = {
-                    let mut buf = Vec::with_capacity(56);
-                    buf.extend_from_slice(&session_id);
-                    buf.extend_from_slice(&hb.gs_counter.to_le_bytes());
-                    buf.extend_from_slice(&hb.receipt_tip);
-                    sha256(&buf)
+                let (pinned_ak, recent) = match ctx.sessions.get(&session_id) {
+                    Some(s) => (s.tpm_ak.clone(), s.recent_tickets.clone()),
+                    None => continue,
                 };
-
-                match verify_quote(quote, &expected_nonce, baseline_pcrs.as_ref()) {
+                let result = appraise_reattest_quote(
+                    &ctx.config,
+                    &session_id,
+                    hb.gs_counter,
+                    quote,
+                    hb.tpm_quote_ticket,
+                    pinned_ak.as_deref(),
+                    &recent,
+                    baseline_pcrs.as_ref(),
+                );
+                match result {
                     Ok(()) => {
                         TPM_VERIFICATIONS_TOTAL
                             .with_label_values(&["success"])

@@ -39,6 +39,14 @@ pub struct Session {
     /// Notified whenever a new Heartbeat is staged into `staged_hbs`, waking
     /// any bi-stream handlers that are waiting for their matching HB.
     pub hb_notify: Arc<Notify>,
+
+    /// TPM attestation key pinned at join; re-attestation quotes must use it.
+    pub tpm_ak: Option<Vec<u8>>,
+
+    /// (counter, signature) of the latest PlayTickets issued, newest last
+    /// (at most `attest::RECENT_TICKETS`). Re-attestation quotes are seeded
+    /// by one of these signatures.
+    pub recent_tickets: std::collections::VecDeque<(u64, Vec<u8>)>,
 }
 
 impl VsCtx {

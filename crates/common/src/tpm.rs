@@ -37,6 +37,7 @@
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, HashMap};
 
 /// PCR (Platform Configuration Register) index.
@@ -103,6 +104,29 @@ pub trait TpmProvider: Send + Sync {
 
     /// Get current value of a PCR (for debugging).
     fn read_pcr(&self, pcr_index: PcrIndex) -> Result<PcrValue>;
+}
+
+/// Qualifying data for the join quote: the VS's single-use challenge and the
+/// exact signed JoinRequest body (which includes the session's ephemeral key),
+/// so a quote is good for one admission only (finding F04).
+pub fn join_quote_nonce(challenge: &[u8; 32], join_sign_bytes: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"mmo/tpm/join-quote/v1\0");
+    h.update(challenge);
+    h.update(join_sign_bytes);
+    h.finalize().into()
+}
+
+/// Qualifying data for a re-attestation quote, seeded by the signature of a
+/// recent VS PlayTicket. Ed25519 signatures cannot be predicted without the
+/// VS key, so the GS cannot produce quotes before the VS asks (F04).
+pub fn reattest_quote_nonce(session_id: &[u8; 16], gs_counter: u64, ticket_sig: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"mmo/tpm/reattest-quote/v1\0");
+    h.update(session_id);
+    h.update(gs_counter.to_le_bytes());
+    h.update(ticket_sig);
+    h.finalize().into()
 }
 
 /// Verify a TPM quote.

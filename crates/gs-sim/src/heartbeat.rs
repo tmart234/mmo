@@ -5,7 +5,7 @@
 //! - Implements retry logic with exponential backoff for network resilience.
 //! - Stage 1.2: Periodic TPM re-attestation every ~60 seconds to detect hot-patching.
 
-use common::tpm::TpmProvider;
+use common::tpm::{reattest_quote_nonce, TpmProvider};
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 
@@ -40,8 +40,8 @@ pub async fn heartbeat_loop(
 /// - Configuration was changed after startup
 /// - Any PCR values drifted from the baseline established at join
 ///
-/// The quote nonce is derived from (session_id || gs_counter || receipt_tip)
-/// to ensure freshness and prevent replay of old quotes.
+/// The quote nonce is seeded by the latest VS PlayTicket signature
+/// (`tpm::reattest_quote_nonce`), so the VS, not the GS, controls freshness.
 pub async fn heartbeat_loop_with_tpm(
     conn: quinn::Connection,
     counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -136,47 +136,41 @@ pub async fn heartbeat_loop_with_tpm(
         // - An attacker could modify memory AFTER startup (hot-patching)
         // - Periodic quotes prove code hasn't been modified since join
         //
-        // Quote nonce derivation:
-        // - nonce = sha256(session_id || gs_counter || receipt_tip)
-        // - This binds the quote to a specific point in time/state
-        // - VS can verify nonce matches what it expects
-        // - Prevents replay of old valid quotes
+        // Quote nonce derivation (F04: freshness chosen by the VS):
+        // - nonce = reattest_quote_nonce(session_id, gs_counter, sig of the
+        //   latest VS PlayTicket)
+        // - A ticket signature cannot be predicted without the VS key, so the
+        //   GS cannot make quotes ahead of time; the VS accepts only tickets it
+        //   issued recently and only the attestation key pinned at join.
         // =====================================================================
-        let tpm_quote = if let Some(ref tpm_arc) = tpm {
-            // Only re-attest every TPM_REATTEST_INTERVAL heartbeats
-            if c >= last_tpm_counter + TPM_REATTEST_INTERVAL {
+        let latest_ticket = shared
+            .lock()
+            .ok()
+            .and_then(|g| g.ticket_history.back().map(|t| (t.counter, t.sig_vs)));
+        let (tpm_quote, tpm_quote_ticket) = match (&tpm, latest_ticket) {
+            (Some(tpm_arc), Some((ticket, ticket_sig)))
+                if c >= last_tpm_counter + TPM_REATTEST_INTERVAL =>
+            {
                 last_tpm_counter = c;
-
-                // Derive nonce from session state for freshness
-                let nonce_preimage = {
-                    let mut buf = Vec::with_capacity(16 + 8 + 32);
-                    buf.extend_from_slice(&session_id);
-                    buf.extend_from_slice(&c.to_le_bytes());
-                    buf.extend_from_slice(&receipt_tip_now);
-                    buf
-                };
-                let nonce_32 = sha256(&nonce_preimage);
+                let nonce_32 = reattest_quote_nonce(&session_id, c, &ticket_sig);
 
                 // Generate TPM quote (this may take a few ms)
                 match tpm_arc.lock().await.quote(TPM_PCRS, &nonce_32) {
                     Ok(quote) => {
                         println!(
-                            "[GS] TPM re-attestation quote generated (counter={}, pcrs={:?})",
-                            c, TPM_PCRS
+                            "[GS] TPM re-attestation quote generated (counter={}, ticket={}, pcrs={:?})",
+                            c, ticket, TPM_PCRS
                         );
-                        Some(quote)
+                        (Some(quote), ticket)
                     }
                     Err(e) => {
                         eprintln!("[GS] TPM re-attestation failed (counter={}): {:?}", c, e);
                         // Continue without quote - VS will notice missing re-attestation
-                        None
+                        (None, 0)
                     }
                 }
-            } else {
-                None
             }
-        } else {
-            None
+            _ => (None, 0),
         };
 
         // (1) HEARTBEAT — unidirectional stream with retry
@@ -193,6 +187,7 @@ pub async fn heartbeat_loop_with_tpm(
             snapshot_root,
             sig_gs: sig_gs_bytes.to_vec(),
             tpm_quote, // Stage 1.2: Include TPM quote when available
+            tpm_quote_ticket,
         };
 
         let send_heartbeat = || {

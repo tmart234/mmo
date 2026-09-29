@@ -39,6 +39,17 @@ pub struct VsConfig {
     /// In production, fill this with known-good measurements for the approved OS
     /// and firmware stack so a compromised hypervisor cannot pass attestation.
     pub required_pcr_baselines: std::collections::BTreeMap<u8, [u8; 32]>,
+
+    /// Enrolled TPM attestation keys (Ed25519 AK public keys) allowed to sign
+    /// quotes. A quote carries its own AK, so without enrollment anyone can
+    /// sign a "quote" for any PCR values with a key they made up. If the vec
+    /// is **empty** (dev mode) any AK is accepted at join and then pinned for
+    /// the session. Production replaces this with EK-certificate chains and
+    /// credential activation in the Verifier (roadmap P3).
+    pub trusted_ak_keys: Vec<[u8; 32]>,
+
+    /// Reject a JoinRequest that carries no TPM quote (default: false).
+    pub require_tpm_quote: bool,
 }
 
 impl Default for VsConfig {
@@ -51,6 +62,8 @@ impl Default for VsConfig {
             admission_timeout_ms: 10_000,
             sw_hash_allowlist: Vec::new(),
             required_pcr_baselines: std::collections::BTreeMap::new(),
+            trusted_ak_keys: Vec::new(),
+            require_tpm_quote: false,
         }
     }
 }

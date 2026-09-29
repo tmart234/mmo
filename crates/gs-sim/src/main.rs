@@ -3,9 +3,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use common::{
     crypto::{file_sha256, join_request_sign_bytes, now_ms, sign},
-    framing::{recv_msg, send_msg},
-    proto::{JoinAccept, JoinRequest, PlayTicket, Sig},
-    tpm::{SimulatedTpm, TpmProvider},
+    framing::{recv_msg, send_msg, send_msg_continue},
+    proto::{AttestChallenge, ChallengeRequest, JoinAccept, JoinRequest, PlayTicket, Sig},
+    tpm::{join_quote_nonce, SimulatedTpm, TpmProvider},
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use quinn::{Connection, Endpoint};
@@ -163,17 +163,18 @@ async fn main() -> Result<()> {
     let to_sign = join_request_sign_bytes(&opts.gs_id, &sw_hash, now, &nonce, &eph_pub_bytes);
     let sig_gs: Sig = sign(&gs_sk_long, &to_sign).to_vec();
 
-    // Generate TPM quote if TPM is enabled
+    // Admission stream: ask for the VS's attestation challenge first, so the
+    // quote covers a nonce the VS chose (F04), then send the JoinRequest.
+    let (mut jsend, mut jrecv) = conn.open_bi().await?;
+    send_msg_continue(&mut jsend, &ChallengeRequest { version: 1 }).await?;
+    let challenge: AttestChallenge = recv_msg(&mut jrecv).await.context("recv AttestChallenge")?;
+
     let tpm_quote = if let Some(ref tpm_arc) = tpm {
         println!("[GS] generating initial TPM attestation quote (PCRs 0,1)");
-        let quote_nonce = nonce;
-        let mut nonce_32 = [0u8; 32];
-        nonce_32[..16].copy_from_slice(&quote_nonce);
-
         let tpm_guard = tpm_arc.lock().await;
         Some(
             tpm_guard
-                .quote(&[0, 1], &nonce_32)
+                .quote(&[0, 1], &join_quote_nonce(&challenge.nonce, &to_sign))
                 .context("generate initial TPM quote")?,
         )
     } else {
@@ -191,7 +192,6 @@ async fn main() -> Result<()> {
         tpm_quote,
     };
 
-    let (mut jsend, mut jrecv) = conn.open_bi().await?;
     send_msg(&mut jsend, &jr).await?;
     let ja: JoinAccept = recv_msg(&mut jrecv).await?;
 

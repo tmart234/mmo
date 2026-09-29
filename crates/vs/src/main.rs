@@ -8,6 +8,7 @@
 // - enforcer.rs  : physics/logic invariants and revocation
 
 mod admission;
+mod attest;
 mod ctx;
 mod enforcer;
 mod metrics;

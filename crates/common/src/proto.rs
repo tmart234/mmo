@@ -11,7 +11,20 @@ pub type OpId = [u8; 16];
 // Re-export TPM types for protocol use
 pub use crate::tpm::TpmQuote;
 
-/// GS → VS during admission.
+/// GS → VS, first message of admission: asks for an attestation challenge.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ChallengeRequest {
+    pub version: u32,
+}
+
+/// VS → GS: single-use nonce the join TPM quote must cover (finding F04: the
+/// verifier, not the attester, chooses quote freshness).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AttestChallenge {
+    pub nonce: [u8; 32],
+}
+
+/// GS → VS during admission, after `AttestChallenge`.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct JoinRequest {
     pub gs_id: String,
@@ -234,6 +247,11 @@ pub struct Heartbeat {
     /// Optional TPM re-attestation quote (proves code hasn't changed).
     /// If present during continuous operation, VS verifies PCR values match initial state.
     pub tpm_quote: Option<TpmQuote>,
+
+    /// Counter of the VS PlayTicket whose signature seeds `tpm_quote`'s nonce
+    /// (`tpm::reattest_quote_nonce`); 0 when there is no quote. The GS cannot
+    /// predict a ticket signature, so it cannot make quotes ahead of time.
+    pub tpm_quote_ticket: u64,
 }
 
 /// GS → VS: "Here's my current transcript digest at counter C."
