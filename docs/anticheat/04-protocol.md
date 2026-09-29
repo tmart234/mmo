@@ -378,6 +378,71 @@ keeps the last *N* heads and, after the match, submits a random sample through
 equivocation proof if it holds a different checkpoint for the same
 `(match_id, epoch)`.
 
+### 7.7 Player-hosted sessions (P2P profile)
+
+For titles where a player hosts the match and no Broker or Verifier is in the
+path (server class S-Community; Halo: CE invite games, 08 §3), the session
+plane runs over the game's own UDP socket instead of QUIC. Implemented by
+`crates/fpp-session` (sans-I/O) and exposed to C as `fpp_p2p_*` in `fpp.h`.
+It replaces tunnel keying that let any invite holder read and forge other
+players' traffic (08, H03–H05).
+
+**Handshake.** `Noise_IK_25519_ChaChaPoly_SHA256`, prologue `fpp/1/p2p`.
+The invite carries the host's static X25519 public key and, optionally, a
+32-byte invite secret. The joiner uses a fresh static key per join.
+
+| Message | Carries (deterministic CBOR inside the Noise payload) |
+|---------|-------------------------------------------------------|
+| 1 joiner → host | `{v: 1, invite, session_key, admit_pop, attestation, app}` |
+| 2 host → joiner | `{v: 1, instance_key, app}` |
+
+- `invite` is compared in constant time. It **authorizes** only; it is never
+  key material, so every invite holder may know it.
+- `admit_pop` is a COSE_Sign1 `AdmitPop {channel: "fpp-p2p/noise-ik",
+  binding: host_static ‖ joiner_static}` under `fpp/1/admit-pop`, signed by
+  `session_key` (the key that later signs this player's InputCommits). The
+  joiner static key is only usable by its holder (the Noise `ss`/`se` DH), so
+  a proof relayed to another host or channel fails. The host keeps it in the
+  evidence bundle.
+- `attestation` is the device's Attestation Result (§6.1), empty for none
+  (tier D0). The SDK passes it through unverified; the host (or, in verified
+  playlists, the Broker) appraises it and places or refuses the player
+  (03 §4.4). ≤ 512 B; `app` ≤ 256 B each way.
+- `instance_key` is the Ed25519 key the host signs Checkpoints with.
+
+The host admits a joiner only on its **first authenticated data packet**
+after message 2, so a replayed message 1 gets an answer nobody can use and
+never displaces a session. Answered-but-unconfirmed handshakes are capped
+(oldest dropped first). A confirmed join whose `session_key` matches an
+existing peer replaces that peer's session and keeps its peer id.
+
+**Datagrams** (little-endian; ≤ 1452 bytes, so never fragmented):
+
+```text
+Init = 0x01 ‖ sender_index:u32 ‖ noise_msg1
+Resp = 0x02 ‖ sender_index:u32 ‖ receiver_index:u32 ‖ noise_msg2
+Data = 0x03 ‖ receiver_index:u32 ‖ counter:u64 ‖ AEAD(kind:u8 ‖ body)
+kind: 0 app · 1 keepalive (empty) · 2 path challenge (8 B) · 3 path response (8 B) · 4 close (u16 reason)
+```
+
+- **Replay.** The counter is the AEAD nonce. Receivers keep a 2048-packet
+  sliding window and mark a counter only after it authenticates. Senders stop
+  at 2⁶⁰ (join again).
+- **Path validation.** An authenticated packet from a new address is
+  delivered, but the peer's address changes only when it answers a random
+  challenge sent *to the new address*, with the response arriving *from* it.
+  Challenges repeat every 8th packet from the unproven address; traffic from
+  the validated address cancels the probe. Replayed or raced packets cannot
+  redirect a session.
+- **Close** carries a §11 reason code (e.g. `TIER_INSUFFICIENT`, `SERVER_FULL`).
+
+**Known limits.** Transport is X25519 only; hybrid ML-KEM (§3, FPP-T1) waits
+for a standardized PQ Noise variant. No stateless cookie: CPU cost of
+message 1 floods is bounded only by the pending cap and the game's per-source
+rate limiting. The host is still the omnipotent authority of a player-hosted
+match (08, H09); this profile secures the transport and binds evidence keys,
+and accountability comes from InputCommits, Checkpoints and replay.
+
 ## 8. Evidence plane
 
 ### 8.1 Checkpoint
@@ -526,6 +591,7 @@ store) and expire after 60 s (ATT-02).
 | 10 | `INPUT_EQUIVOCATION` | Conflicting frames for one tick |
 | 11 | `POLICY_KICK` | Enforcement action |
 | 12 | `SERVER_DRAINING` | Graceful shutdown |
+| 13 | `SERVER_FULL` | No free player slot |
 
 ## 12. Versioning and extensibility
 

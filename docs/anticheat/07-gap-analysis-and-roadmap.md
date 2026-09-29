@@ -17,8 +17,8 @@ because several **chain together**.
 | F01 | **Critical** | TLS certificate verification disabled on client→GS and GS→VS. A network or local proxy can read and alter unsigned traffic (snapshots) and impersonate either server. | `crates/client-core/src/lib.rs:33,51`; `crates/gs-sim/src/main.rs:359,401-402` | ✅ Fixed (P0): dev CA + CA-signed VS/GS certificates (`common::pki`); insecure verifiers removed |
 | F02 | **Critical** | The GS does not pin the VS key: it verifies `JoinAccept` with the `vs_pub` *contained in the same message*, then trusts tickets signed by that key. Combined with F01, any MITM or fake VS can "bless" a GS. | `crates/gs-sim/src/main.rs:173,181` | ✅ Fixed (P0): GS pins `keys/vs_ed25519.pub` (`gs_sim::admission::verify_join_accept`) |
 | F03 | **High** | The client verifies the VS signature and freshness only on the first ticket. `TicketUpdate`s are accepted unverified and freshness is computed but ignored. **F01 + F02 + F03 = revocation bypass**: after the handshake a revoked GS (or a MITM feeding it tickets) keeps clients playing. | `crates/client-core/src/lib.rs:335,401-403` | ✅ Fixed (P0): `common::tickets::TicketChain` verifies every update (signature, session, chain, expiry); GS forwards every ticket in order |
-| F04 | **High** | TPM quote freshness is attester-controlled. The VS checks the quote against its *own* nonce, whose first 16 bytes equal the GS-chosen `JoinRequest.nonce`, and join nonces are not tracked. A captured quote can be replayed forever. | `crates/vs/src/admission.rs:94,115` | Verifier-issued single-use nonces (P1) |
-| F05 | **High** | Hardware TPM path is non-functional or incorrect: `extend_pcr` ignores its index (always slot 0); `verify_quote` rejects non-Ed25519 AKs and does not parse `TPMS_ATTEST`, so real quotes can never verify; no EK chain or AK credential activation. The docs (`TPM_GUIDE.md`) and the code disagree on what is implemented. | `crates/common/src/tpm.rs:155,284,438,504,518` | Replace with Verifier-side appraisal (P3) |
+| F04 | **High** | TPM quote freshness is attester-controlled. The VS checks the quote against its *own* nonce, whose first 16 bytes equal the GS-chosen `JoinRequest.nonce`, and join nonces are not tracked. A captured quote can be replayed forever. | `crates/vs/src/admission.rs:94,115` | ✅ Fixed in the prototype: VS-issued single-use `AttestChallenge` per connection, quote bound to it and to the signed JoinRequest; re-attestation quotes seeded by a recent VS ticket signature (`vs/src/attest.rs`). The Verifier (P3) keeps the same rule. |
+| F05 | **High** | Hardware TPM path is non-functional or incorrect: `extend_pcr` ignores its index (always slot 0); `verify_quote` rejects non-Ed25519 AKs and does not parse `TPMS_ATTEST`, so real quotes can never verify; no EK chain or AK credential activation. The docs (`TPM_GUIDE.md`) and the code disagree on what is implemented. | `crates/common/src/tpm.rs:155,284,438,504,518` | ◐ Partly mitigated: see F21. Real-TPM appraisal (EK chain, credential activation, `TPMS_ATTEST`, event log) remains Verifier work (P3); the `hardware-tpm` feature is not built in CI |
 | F06 | **High** | `sw_hash` is self-reported (the binary hashes itself), and PCR 0 is extended with an app hash. The allowlist and "attestation" provide no assurance against a modified GS. | `crates/gs-sim/src/main.rs:88,99` | Measured launch / CVM + Build Registry (P3/P5) |
 | F07 | Medium | Unbounded allocation from a peer-controlled length prefix on the VS bi-stream path (bypasses the 16 MiB cap in `framing::recv_msg`). An admitted GS can force up to 4 GiB allocations per stream. | `crates/vs/src/streams.rs:110` | ✅ Fixed (P0): `framing::recv_msg_max`, 64 KiB default cap, explicit caps for snapshots (1 MiB) and transcripts (4 MiB) |
 | F08 | Medium | No timeout on accepting or reading the `JoinRequest`: idle connections hold VS tasks indefinitely (slowloris). | `crates/vs/src/admission.rs:30-34` | ✅ Fixed (P0): `admission_timeout_ms` deadline + QUIC Retry address validation |
@@ -33,6 +33,7 @@ because several **chain together**.
 | F17 | Low | `.gitignore` ignores `*.lock` while `Cargo.lock` is tracked. Lockfiles for binaries must be tracked for reproducible builds. | `.gitignore:23` | ✅ Fixed (P0) |
 | F18 | Info | Revocation state lives in three places. | `vs/src/ctx.rs:22`, `vs/src/enforcer.rs:33`, `gs-sim/src/state.rs:103` | Single subject-state model (P2) |
 | F19 | Info | GS client port is hard-coded to `127.0.0.1:50000`. | `crates/gs-sim/src/client_port.rs:78` | Config (P1) |
+| F21 | **Critical** | `verify_quote` checked a quote's signature with the attestation key *carried in the quote*. Anyone could sign a "quote" for any PCR values, including the configured baselines, with a key they made up; PCR baselines gave no assurance. | `crates/common/src/tpm.rs` `verify_quote` | ✅ Mitigated: `VsConfig.trusted_ak_keys` (enrolled AKs); in dev mode the join AK is pinned for the session and re-attestation must use it; `require_tpm_quote`. Full fix: EK-certified AKs in the Verifier (P3) |
 | F20 | **High** | Vulnerable dependencies, hidden by the non-blocking audit (F16): quinn-proto remote DoS and memory exhaustion (RUSTSEC-2026-0037, -0185), rustls accepting TLS 1.3 handshake messages across encryption levels (RUSTSEC-2026-0285), rustls-webpki name-constraint and CRL flaws, aws-lc-sys X.509/PKCS7 bypasses, unsound `lru` used directly by gs-sim, protobuf recursion crash via prometheus 0.13, plus bytes, time and anyhow issues. | `Cargo.lock`, `crates/gs-sim/Cargo.toml`, `Cargo.toml` | ✅ Fixed (P0): lockfile updates, lru 0.18, prometheus 0.14; remaining ignores documented in `deny.toml` (bincode, until P1 replaces it) |
 
 ## 2. Requirements coverage
@@ -43,7 +44,7 @@ because several **chain together**.
 |------|--------|---------|
 | AUTH (server authority) | ◐ | Movement clamped server-side (`MAX_STEP`) and token-bucket rate limits. No tick model, no lag-comp bounds, no VRF, no determinism contract. |
 | INFO (information minimization) | ✗ | `WorldSnapshot.others` sends every player's position to every client: a built-in ESP. |
-| ATT (attestation) | ✗ | Simulated TPM only; issues F04–F06. No client attestation at all. |
+| ATT (attestation) | ◐ | Simulated TPM only. Freshness (F04) and self-asserted AKs (F21) fixed in the prototype; F05/F06 remain. No client attestation yet, but player-hosted joins now carry an AR slot (04 §7.7). |
 | ID (identity) | ✗ | Self-generated client keys; no account, device, or ban-durable identity. |
 | PROTO (protocol/crypto) | ◐ | QUIC + Ed25519 are good foundations. Unverified TLS, bincode tuples, no domain separation or versioning, no PQ, no datagrams. |
 | EVD (evidence) | ◐ | Hash-chained receipts + notarization exist (good instinct). Linear chain, local files, no log or witnesses. |
@@ -126,6 +127,9 @@ implementation (`interop/python/fpp_interop.py`, run by `make ci`). Fuzz
 target `fpp_decode` asserts that every accepted encoding is canonical.
 Found while building: RFC 9162 proofs do not authenticate tree size, so
 Checkpoint roots now carry leaf counts.
+**Player-hosted session ✅ (milestone M2):** `fpp-session` (Noise IK,
+replay window, path validation, AdmitPop session-key binding, AR slot) and the
+`fpp_p2p_*` C ABI; spec in 04 §7.7.
 **Remaining slices:** tokens (AR / SAT / SAR with `cnf` and TLS-exporter PoP),
 ALPN + Hello/Admit handshake, aws-lc-rs with X25519MLKEM768, datagram input
 frames, and replacing Heartbeat/TranscriptDigest in `vs`/`gs-sim` with

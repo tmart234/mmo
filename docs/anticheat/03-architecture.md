@@ -161,6 +161,61 @@ checkpoint_epoch_ms: 1000
 audit_sample_rate: 0.05
 ```
 
+### 4.4 Trust-tiered lobbies across client platforms
+
+Clients will not all be equally trustworthy: native PC, consoles, mobile,
+browsers and whatever comes next. The framework does not try to make every
+client equally secure. It **measures** each device (the tier is a signed
+claim in its Attestation Result) and lets the **queue policy** decide who may
+play with whom. Trusted players get lobbies where everyone is trusted; nobody
+is locked out of playing.
+
+| Client platform | Best evidence available | Typical tier | Notes |
+|-----------------|-------------------------|--------------|-------|
+| Windows 11 (TPM 2.0, Secure Boot, HVCI, IOMMU) | TPM quote + measured boot + `GetRuntimeAttestationReport` | D3 | D2 without runtime attestation or HVCI |
+| Consoles, cloud gaming | Platform attestation (NDA SDKs) | D3-equivalent | Memory cheats need a platform exploit |
+| Android | Play Integrity `MEETS_STRONG_INTEGRITY` + key attestation | D2 | Rooted / unlocked → D0–D1 |
+| iOS / iPadOS | App Attest (+ DeviceCheck) | D2 | Jailbreak detection is best-effort; App Attest proves app + device, not memory integrity |
+| macOS | App Attest (Apple silicon) | D2 | |
+| Linux desktop, Steam Deck | none portable today | D0 (D1 with an IA) | Segregated, never rejected |
+| Browser (WASM / WebGPU) | none: WebAuthn attests an authenticator, not the device or page | D0 | A browser client can be any script; treat it as a bot until behavior says otherwise |
+
+Rules:
+
+1. **Tier is a floor, not a score.** A lobby says `min_device_tier` per
+   platform (§4.3). A player below it is `segregate`d into a pool whose floor
+   they meet, never silently mixed in.
+2. **Trust can move down, not up.** A D3 player may choose an open lobby; a D0
+   player cannot enter a verified one. Mixed lobbies take the *lowest* tier
+   present for any decision that depends on it (e.g. ranked credit).
+3. **Priority, not privilege.** Higher tiers get matchmaking priority in
+   verified queues (they are the scarce, trusted pool), shorter re-attestation
+   waits, and eligibility for ranked and economy writes. They get no gameplay
+   advantage.
+4. **Behavior still decides.** Hardware attestation defeats cheats that need a
+   modified client or kernel; it does nothing against the analog hole
+   (capture-card aimbots) or a second device. Server-side detection (§8)
+   applies to every tier, and a low trust score can demote a D3 device.
+5. **Player-hosted matches are D0 for the host.** A player-hosted lobby may
+   require joiners to present an AR (04 §7.7 carries it), but the host itself
+   is an unattested player PC (server class S-Community). Verified lobbies
+   therefore need dedicated hosts (S-FirstParty), which is milestone M5.
+
+Example open-plus-verified pair of queues:
+
+```yaml
+queue: verified-slayer
+min_device_tier: { windows: D3, console: D3, android: D2, ios: D2, macos: D2 }  # linux, browser absent: not eligible
+below_tier: segregate          # → open-slayer
+server_classes: [S-FirstParty, S-FirstParty-CVM]
+priority_by_tier: true
+---
+queue: open-slayer
+min_device_tier: {}            # everyone, including browsers and Linux
+server_classes: [S-Community, S-FirstParty]
+ranked: false
+```
+
 ## 5. Key flows
 
 ### 5.1 Device attestation (passport model, RFC 9334 §5.1)
