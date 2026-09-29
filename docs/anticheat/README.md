@@ -15,6 +15,7 @@ keeping its best ideas.
 | 06 | [ADR-001: Language](06-adr-001-language.md) | *Rust or C/C++?* |
 | 07 | [Gap analysis and roadmap](07-gap-analysis-and-roadmap.md) | Security findings in current code, coverage, phased plan |
 | 08 | [Reference title: Halo: CE](08-reference-title-halo.md) | Using the Halo decompilation port as the first real game: netcode security review, FPP hook points, staged plan |
+| 09 | [ADR-002: Transport per plane](09-adr-002-transport.md) | *Is QUIC the most efficient transport?* Encrypted UDP for native game data, QUIC for browsers and the control plane |
 
 ## Executive summary
 

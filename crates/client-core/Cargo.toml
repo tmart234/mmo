@@ -22,5 +22,15 @@ rustls         = { workspace = true }
 bincode        = { workspace = true }
 ed25519-dalek  = { workspace = true }
 common         = { path = "../common" }
+fpp-types      = { path = "../fpp-types" }
+fpp-wire       = { path = "../fpp-wire" }
+fpp-crypto     = { path = "../fpp-crypto" }
+fpp-merkle     = { path = "../fpp-merkle" }
+fpp-tokens     = { path = "../fpp-tokens" }
+fpp-session    = { path = "../fpp-session" }
 rand           = { workspace = true }
 hex            = { workspace = true }
+
+[dev-dependencies]
+gs-sim         = { path = "../gs-sim" }
+ed25519-dalek  = { workspace = true }

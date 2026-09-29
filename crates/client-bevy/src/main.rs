@@ -13,17 +13,13 @@ use bevy::prelude::Gizmos;
 use bevy::core_pipeline::tonemapping::Tonemapping;
 
 use client_bevy::{gather_input_impl, pump_snapshots_impl};
-use client_core::{connect_and_handshake_with_retry, recv_world, send_input};
-use common::framing::send_msg_continue;
-use common::proto::{ClientCmd, ClientToGs, WorldSnapshot};
+use client_core::{request_admission, ClientEvent, ClientTrust, GameClient};
+use common::proto::{ClientCmd, WorldSnapshot};
 use std::{sync::Mutex, time::Duration};
 use tokio::sync::mpsc;
-use tokio::time::{interval, MissedTickBehavior};
 
 // Bevy 0.17 mesh primitives
 use bevy::math::primitives::{Cuboid, Plane3d, Sphere};
-
-const TICK_MS: u64 = 100; // 10 Hz client net loop
 
 /// 0.17+: buffered messages
 #[derive(Message)]
@@ -241,7 +237,7 @@ fn net_startup(mut commands: Commands) {
         rx_ws: Mutex::new(rx_ws),
     });
 
-    let gs_addr = String::from("127.0.0.1:50000");
+    let vs_addr = String::from("127.0.0.1:4444");
 
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -250,67 +246,45 @@ fn net_startup(mut commands: Commands) {
             .expect("tokio runtime");
 
         rt.block_on(async move {
-            println!("[NET] connecting to {}...", gs_addr);
-
-            let mut sess =
-                match connect_and_handshake_with_retry(&gs_addr, 10, Duration::from_millis(200))
-                    .await
-                {
-                    Ok(s) => {
-                        println!(
-                            "[NET] connected! session={}",
-                            hex::encode(&s.session_id[..4])
-                        );
-                        s
-                    }
-                    Err(e) => {
-                        eprintln!("[NET] failed to connect/handshake: {e:#}");
-                        return;
-                    }
-                };
-
-            let mut nonce: u64 = 1;
-            let mut tick = interval(Duration::from_millis(TICK_MS));
-            tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            // Admission via the VS (stub Verifier + Broker), then the game
+            // server over fpp-session; see client_core.
+            let trust = match ClientTrust::load_default() {
+                Ok(t) => t,
+                Err(e) => return eprintln!("[NET] trust roots: {e:#}"),
+            };
+            println!("[NET] requesting admission from {vs_addr}...");
+            let creds = match request_admission(&vs_addr, &trust, "open").await {
+                Ok(c) => c,
+                Err(e) => return eprintln!("[NET] admission failed: {e:#}"),
+            };
+            let mut game = match GameClient::connect(creds, &trust, Duration::from_secs(10)).await {
+                Ok(g) => g,
+                Err(e) => return eprintln!("[NET] join failed: {e:#}"),
+            };
+            println!("[NET] joined as slot {}", game.slot());
 
             loop {
-                tick.tick().await;
-
-                // Drain to most recent intent
+                // Latest intent wins; `step` paces the loop at the server tick rate.
                 let mut latest: Option<ClientCmd> = None;
                 while let Ok(cmd) = rx_cmd.try_recv() {
                     latest = Some(cmd);
                 }
-
-                // Always send something (prevents recv_world from stalling)
                 let cmd = latest.unwrap_or(ClientCmd::Move { dx: 0.0, dy: 0.0 });
-                if let Err(e) = send_input(&mut sess, nonce, cmd).await {
-                    eprintln!("[NET] send_input failed: {e:#}");
-                    break;
-                }
-                nonce = nonce.wrapping_add(1);
-
-                match recv_world(&mut sess).await {
-                    Ok(ws) => {
-                        bevy::log::debug!(
-                            target: "client",
-                            "recv WorldSnapshot you=({:.2},{:.2}) tick={}",
-                            ws.you.0,
-                            ws.you.1,
-                            ws.tick
-                        );
-                        let _ = tx_ws.try_send(ws);
+                match game.step(&cmd).await {
+                    Ok(events) => {
+                        for ev in events {
+                            if let ClientEvent::Snapshot(ws) = ev {
+                                let _ = tx_ws.try_send(ws);
+                            }
+                        }
                     }
                     Err(e) => {
-                        eprintln!("[NET] recv_world failed: {e:#}");
+                        eprintln!("[NET] session ended: {e:#}");
                         break;
                     }
                 }
             }
-
-            // Graceful shutdown: send Bye over QUIC stream (not TCP!)
-            println!("[NET] sending Bye...");
-            let _ = send_msg_continue(&mut sess.send_stream, &ClientToGs::Bye).await;
+            let _ = game.bye().await;
             println!("[NET] disconnected.");
         });
     });

@@ -7,14 +7,14 @@ lazy_static! {
     pub static ref REGISTRY: Registry = Registry::new();
 
     // Counter metrics
-    pub static ref HEARTBEATS_TOTAL: Counter = Counter::new(
-        "vs_heartbeats_total",
-        "Total number of heartbeats received from game servers"
+    pub static ref CHECKPOINTS_TOTAL: Counter = Counter::new(
+        "vs_checkpoints_total",
+        "Total number of verified Checkpoints received from game servers"
     ).unwrap();
 
-    pub static ref PROTECTED_RECEIPTS_TOTAL: Counter = Counter::new(
-        "vs_protected_receipts_total",
-        "Total number of protected receipts issued"
+    pub static ref SARS_ISSUED_TOTAL: Counter = Counter::new(
+        "vs_sars_issued_total",
+        "Total number of Server Attestation Results issued"
     ).unwrap();
 
     pub static ref JOIN_REQUESTS_TOTAL: IntCounterVec = IntCounterVec::new(
@@ -44,10 +44,10 @@ lazy_static! {
     ).unwrap();
 
     // Histogram metrics
-    pub static ref HEARTBEAT_LATENCY: Histogram = Histogram::with_opts(
+    pub static ref CHECKPOINT_LATENCY: Histogram = Histogram::with_opts(
         prometheus::HistogramOpts::new(
-            "vs_heartbeat_latency_seconds",
-            "Heartbeat processing latency in seconds"
+            "vs_checkpoint_latency_seconds",
+            "Checkpoint verification latency in seconds"
         ).buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0])
     ).unwrap();
 
@@ -62,10 +62,10 @@ lazy_static! {
 /// Initialize and register all metrics.
 pub fn register_metrics() {
     REGISTRY
-        .register(Box::new(HEARTBEATS_TOTAL.clone()))
+        .register(Box::new(CHECKPOINTS_TOTAL.clone()))
         .unwrap();
     REGISTRY
-        .register(Box::new(PROTECTED_RECEIPTS_TOTAL.clone()))
+        .register(Box::new(SARS_ISSUED_TOTAL.clone()))
         .unwrap();
     REGISTRY
         .register(Box::new(JOIN_REQUESTS_TOTAL.clone()))
@@ -83,7 +83,7 @@ pub fn register_metrics() {
         .register(Box::new(ACTIVE_CONNECTIONS.clone()))
         .unwrap();
     REGISTRY
-        .register(Box::new(HEARTBEAT_LATENCY.clone()))
+        .register(Box::new(CHECKPOINT_LATENCY.clone()))
         .unwrap();
     REGISTRY
         .register(Box::new(TPM_VERIFICATION_LATENCY.clone()))

@@ -214,20 +214,33 @@ ServerAttestationResult = {
   -65643 => tstr,           ; region
   -65644 => uint,           ; seq: strictly increasing per instance
   -65645 => bstr .size 32,  ; prev: SHA-256 of previous SAR payload (chain)
-  -65646 => COSE_Key,       ; vrf_pub
+  ? -65646 => COSE_Key,     ; vrf_pub (once the server uses FPP-VRF1, P4)
+  ? -65647 => bstr .size 32, ; noise_static: X25519 key of the fpp-session endpoint
 }
 server_class = &( community: 0, partner: 1, first_party: 2, first_party_cvm: 3 )
+; At least one transport binding (-65640 or -65647) is required, and
+; sub == SHA-256(COSE_Key(cnf)).
 ```
 
 Clients MUST check: signature chains to the region key bundle; `exp` in the
 future (±60 s skew); `tls_spki_sha256` equals the SPKI of the connection's TLS
 leaf; `server_class` is allowed by the SAT's queue policy; and `seq`/`prev`
 continue the chain on every `SarUpdate`. A gap, fork or expiry means disconnect
-(`SAR_LAPSED`).
+(`SAR_LAPSED`). Because `exp` is checked with ±60 s skew, clients and servers
+also measure liveness on their own clock: no valid `SarUpdate` for 3 issue
+intervals (prototype: 6 s at one SAR per 2 s, `exp = iat + 10`) is a lapse.
+This, not `exp`, bounds revocation latency. Implemented as
+`fpp_tokens::SarChain`.
 
 ## 7. Session plane
 
 ### 7.1 Connection
+
+Transport per plane is decided in [ADR-002](09-adr-002-transport.md): native
+clients carry game data over `fpp-session` (§7.7, encrypted UDP) for both
+player-hosted and dedicated servers; this QUIC profile serves browsers
+(WebTransport) and the control plane. On QUIC, game data uses DATAGRAM frames
+only, never a reliable stream.
 
 - ALPN `fpp/1`. The client MUST validate the GS certificate chain (publisher
   game-server CA) **and** the SAR binding (§6.3). No "insecure" mode exists in
@@ -272,12 +285,14 @@ Admit = [ 3, {
   "pop" => COSE_Sign1,               ; by session key, fpp-ctx "fpp/1/admit-pop"
 } ]
 
-AdmitPoP = {                         ; payload of "pop"
-  "exporter" => bstr .size 32,       ; TLS-Exporter("EXPORTER-fpp-admit", "", 32)
-  "hs_hash"  => bstr .size 32,       ; SHA-256(Hello bytes ‖ HelloAck bytes)
-  "server_nonce" => bstr .size 32,
-  "sat_cti" => bstr .size 16,
+AdmitPop = {                         ; payload of "pop" (one object type for both transports)
+  "channel" => tstr,                 ; "fpp/quic-tls" here; "fpp-p2p/noise-ik" on fpp-session (§7.7)
+  "binding" => bstr .size (32..64),
 }
+; fpp/quic-tls: binding = TLS-Exporter("EXPORTER-fpp-admit", "", 32)
+;   ‖ SHA-256("fpp/1/quic-admit\0" ‖ u64le(len) ‖ Hello bytes ‖ u64le(len)
+;             ‖ HelloAck bytes ‖ server_nonce ‖ sat_cti)
+; (fpp_tokens::control::quic_pop)
 
 Admitted = [ 4, { "slot" => uint, "start_tick" => uint } ]
 Reject   = [ 5, { "code" => reason, ? "retry_after_s" => uint } ]
@@ -300,6 +315,20 @@ Bye  = [ 11, {} ]
 4. Revocation cache: `sat.cti`, `did`, `acct`, `build_id` not revoked.
 
 Failure yields `Reject{code}` and the connection closes. Codes are listed in §11.
+Implemented by `fpp_tokens::admission::admit` (both transports) with the
+revocation cache fed by the revocation feed (P2); a SAT's `cti` is also
+revoked locally once admitted, so it cannot be used twice in one match.
+
+**On fpp-session (native clients, ADR-002)** the same messages travel on the
+reliable channel after the Noise handshake, which already proved the session
+key (AdmitPop, §7.7) and authenticated the server's static key. The server
+sends `SarUpdate` first; the client checks the SAR (signature, chain, `exp`,
+**`noise_static` equals the key it dialled**, `sub` equals `sat.aud`) and only
+then sends `Admit{sat, ar}` (empty `pop`); the server answers `Admitted` or
+`Reject`. Hello/HelloAck are unnecessary there: the Noise prologue carries
+the version. Two additional control messages carry evidence on that channel:
+`CheckpointHead = [12, {match_id, epoch, digest}]` (§7.6) and
+`InputCommit = [13, {commit: COSE_Sign1}]` (§7.4).
 
 ### 7.3 Input frames (DATAGRAM)
 
@@ -377,6 +406,91 @@ keeps the last *N* heads and, after the match, submits a random sample through
 `POST /v1/gossip`. The Log answers with an inclusion proof, or with an
 equivocation proof if it holds a different checkpoint for the same
 `(match_id, epoch)`.
+
+### 7.7 Player-hosted sessions (P2P profile)
+
+For titles where a player hosts the match and no Broker or Verifier is in the
+path (server class S-Community; Halo: CE invite games, 08 §3), the session
+plane runs over the game's own UDP socket instead of QUIC. Implemented by
+`crates/fpp-session` (sans-I/O) and exposed to C as `fpp_p2p_*` in `fpp.h`.
+It replaces tunnel keying that let any invite holder read and forge other
+players' traffic (08, H03–H05).
+
+**Handshake.** `Noise_IK_25519_ChaChaPoly_SHA256`, prologue `fpp/1/p2p`.
+The invite carries the host's static X25519 public key and, optionally, a
+32-byte invite secret. The joiner uses a fresh static key per join.
+
+| Message | Carries (deterministic CBOR inside the Noise payload) |
+|---------|-------------------------------------------------------|
+| 1 joiner → host | `{v: 1, invite, session_key, admit_pop, attestation, app}` |
+| 2 host → joiner | `{v: 1, instance_key, app}` |
+
+- `invite` is compared in constant time. It **authorizes** only; it is never
+  key material, so every invite holder may know it.
+- `admit_pop` is a COSE_Sign1 `AdmitPop {channel: "fpp-p2p/noise-ik",
+  binding: host_static ‖ joiner_static}` under `fpp/1/admit-pop`, signed by
+  `session_key` (the key that later signs this player's InputCommits). The
+  joiner static key is only usable by its holder (the Noise `ss`/`se` DH), so
+  a proof relayed to another host or channel fails. The host keeps it in the
+  evidence bundle.
+- `attestation` is the device's Attestation Result (§6.1), empty for none
+  (tier D0). The SDK passes it through unverified; the host (or, in verified
+  playlists, the Broker) appraises it and places or refuses the player
+  (03 §4.4). ≤ 512 B; `app` ≤ 256 B each way.
+- `instance_key` is the Ed25519 key the host signs Checkpoints with.
+
+The host admits a joiner only on its **first authenticated data packet**
+after message 2, so a replayed message 1 gets an answer nobody can use and
+never displaces a session. Answered-but-unconfirmed handshakes are capped
+(oldest dropped first). A confirmed join whose `session_key` matches an
+existing peer replaces that peer's session and keeps its peer id.
+
+**Datagrams** (little-endian; ≤ 1452 bytes, so never fragmented):
+
+```text
+Init = 0x01 ‖ sender_index:u32 ‖ noise_msg1
+Resp = 0x02 ‖ sender_index:u32 ‖ receiver_index:u32 ‖ noise_msg2
+Data = 0x03 ‖ receiver_index:u32 ‖ counter:u64 ‖ AEAD(kind:u8 ‖ body)
+kind: 0 app · 1 keepalive (empty) · 2 path challenge (8 B) · 3 path response (8 B) · 4 close (u16 reason)
+      5 reliable (seq:u32 ‖ message) · 6 ack (next_expected:u32 ‖ bitmap:u64)
+Cookie     = 0x04 ‖ receiver_index:u32 ‖ cookie:16
+InitCookie = 0x05 ‖ cookie:16 ‖ sender_index:u32 ‖ noise_msg1
+```
+
+- **Selective reliability.** `app` datagrams are unreliable and latest-wins
+  (per-tick state, `InputFrame`s with redundancy). `reliable` messages
+  (InputCommits, CheckpointHeads, title events that must arrive) are delivered
+  once and in order: the receiver buffers up to 64 early messages and sends one
+  `ack` per tick (cumulative plus a selective bitmap of the next 64); the
+  sender retransmits after an RTO of 2 × smoothed RTT (60 ms – 2 s, doubling
+  per retry; retransmissions give no RTT sample) and refuses new messages
+  while 64 are unacknowledged. Messages ≤ 1418 bytes. Endpoints are
+  clock-free except for `tick(now_ms)`, called once per game tick.
+- **Join cookies.** When half the pending-join budget is in use, the host
+  answers `Init` with `Cookie` instead of doing any DH work:
+  `cookie = SHA-256("fpp/1/p2p-cookie\0" ‖ secret ‖ minute ‖ len(addr) ‖ addr)[..16]`,
+  valid for the current and previous minute. The joiner repeats the handshake
+  as `InitCookie`. The 21-byte reply is smaller than any `Init`, so the host
+  cannot be used for amplification, and a spoofed flood costs it one hash per
+  packet. A cookie from another address or an older period is refused.
+
+- **Replay.** The counter is the AEAD nonce. Receivers keep a 2048-packet
+  sliding window and mark a counter only after it authenticates. Senders stop
+  at 2⁶⁰ (join again).
+- **Path validation.** An authenticated packet from a new address is
+  delivered, but the peer's address changes only when it answers a random
+  challenge sent *to the new address*, with the response arriving *from* it.
+  Challenges repeat every 8th packet from the unproven address; traffic from
+  the validated address cancels the probe. Replayed or raced packets cannot
+  redirect a session.
+- **Close** carries a §11 reason code (e.g. `TIER_INSUFFICIENT`, `SERVER_FULL`).
+
+**Known limits.** Transport is X25519 only; hybrid ML-KEM (§3, FPP-T1) waits
+for a standardized PQ Noise variant. Join cookies bound the DH work of
+spoofed floods; a flood from real addresses still needs the game's per-source
+rate limiting. No send pacing yet (the game's tick rate bounds it). The host
+is still the omnipotent authority of a player-hosted match (08, H09); this profile secures the transport and binds evidence keys,
+and accountability comes from InputCommits, Checkpoints and replay.
 
 ## 8. Evidence plane
 
@@ -526,6 +640,7 @@ store) and expire after 60 s (ATT-02).
 | 10 | `INPUT_EQUIVOCATION` | Conflicting frames for one tick |
 | 11 | `POLICY_KICK` | Enforcement action |
 | 12 | `SERVER_DRAINING` | Graceful shutdown |
+| 13 | `SERVER_FULL` | No free player slot |
 
 ## 12. Versioning and extensibility
 

@@ -5,8 +5,7 @@ use tokio::time::{sleep, Duration};
 use crate::ctx::VsCtx;
 use common::crypto::now_ms;
 
-/// Close the connection if heartbeats stop or the session is revoked.
-/// Now uses configurable timeout from VsConfig.
+/// Revoke and close when Checkpoints stop arriving, or once revoked.
 pub fn spawn_watchdog(conn: &Connection, ctx: VsCtx, session_id: [u8; 16]) {
     let conn = conn.clone();
     let ctx = ctx.clone();
@@ -32,16 +31,11 @@ pub fn spawn_watchdog(conn: &Connection, ctx: VsCtx, session_id: [u8; 16]) {
             }
 
             let idle_ms = now_ms().saturating_sub(last_seen_ms);
-            let timeout_ms = ctx.config.heartbeat_timeout_ms;
+            let timeout_ms = ctx.config.checkpoint_timeout_ms;
 
             if idle_ms > timeout_ms {
-                eprintln!(
-                    "[VS] heartbeat timeout for session {}.. ({} ms idle, limit {} ms) -> closing",
-                    hex::encode(&session_id[..4]),
-                    idle_ms,
-                    timeout_ms
-                );
-                conn.close(0u32.into(), b"heartbeat timeout");
+                ctx.revoke(&session_id, &format!("no checkpoint for {idle_ms} ms"));
+                conn.close(0u32.into(), b"checkpoint timeout");
                 break;
             }
         }

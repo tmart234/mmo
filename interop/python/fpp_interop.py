@@ -43,6 +43,10 @@ HYBRID_REQUIRED = {"publisher_root", "build_signing", "policy_signing", "log"}
 TYPES = {
     "input-commit": ("fpp/1/input-commit", "application/fpp-input-commit+cbor"),
     "checkpoint": ("fpp/1/checkpoint", "application/fpp-checkpoint+cbor"),
+    "admit-pop": ("fpp/1/admit-pop", "application/fpp-admit-pop+cbor"),
+    "attestation-result": ("fpp/1/attestation-result", "application/fpp-ar+cwt"),
+    "sat": ("fpp/1/sat", "application/fpp-sat+cwt"),
+    "sar": ("fpp/1/sar", "application/fpp-sar+cwt"),
 }
 
 
@@ -356,7 +360,133 @@ def parse_checkpoint(m):
     return c
 
 
-PARSERS = {"input-commit": parse_input_commit, "checkpoint": parse_checkpoint}
+def parse_admit_pop(m):
+    _require(isinstance(m, dict), "AdmitPop is not a map")
+    channel, binding = m.get("channel"), m.get("binding")
+    _require(isinstance(channel, str) and 1 <= len(channel.encode()) <= 32, "channel")
+    _require(isinstance(binding, bytes) and 32 <= len(binding) <= 64, "binding")
+    return {"channel": channel, "binding": binding.hex()}
+
+
+# ---- tokens (04-protocol.md §6): integer claim keys, CWT/EAT style
+
+AR_MAX_S, SAT_MAX_S, SAR_MAX_S = 1800, 6 * 3600, 120
+FEATURE_FLAGS = ("secure_boot", "measured_boot", "hvci", "vbs", "iommu", "runtime_report",
+                 "key_in_hw", "strong_integrity", "app_attested")
+
+
+def _claim(m, key, what):
+    _require(key in m, what)
+    return m[key]
+
+
+def _cuint(m, key, what, bits=64):
+    v = _claim(m, key, what)
+    _require(isinstance(v, int) and not isinstance(v, bool) and 0 <= v < 1 << bits, what)
+    return v
+
+
+def _cbytes(m, key, what, size):
+    v = _claim(m, key, what)
+    _require(isinstance(v, bytes) and len(v) == size, what)
+    return v.hex()
+
+
+def _ctext(m, key, what, max_len):
+    v = _claim(m, key, what)
+    _require(isinstance(v, str) and 0 < len(v.encode()) <= max_len, what)
+    return v
+
+
+def _okp_key(v, what):
+    """An Ed25519 COSE_Key {1: 1, -1: 6, -2: x}, exactly."""
+    _require(isinstance(v, dict) and set(v) == {1, -1, -2} and v[1] == 1 and v[-1] == 6
+             and isinstance(v[-2], bytes) and len(v[-2]) == 32, what)
+    _require(_decompress(v[-2]) is not None, what)
+    return v[-2]
+
+
+def _cnf(m):
+    v = _claim(m, 8, "cnf")
+    _require(isinstance(v, dict) and set(v) == {1}, "cnf")
+    return _okp_key(v[1], "cnf").hex()
+
+
+def _lifetime(m, max_s):
+    iat, exp = _cuint(m, 6, "iat"), _cuint(m, 4, "exp")
+    _require(iat < exp <= iat + max_s, "exp: lifetime")
+    return iat, exp
+
+
+def _tier(m):
+    t = _cuint(m, -65602, "tier")
+    _require(t <= 3, "tier")
+    return t
+
+
+def parse_attestation_result(m):
+    _require(isinstance(m, dict), "AR is not a map")
+    _require(m.get(265) == "tag:fpp,2026:ar/1", "eat_profile")
+    iat, exp = _lifetime(m, AR_MAX_S)
+    feats_in = _claim(m, -65603, "features")
+    _require(isinstance(feats_in, dict), "features")
+    feats = {}
+    for k, v in feats_in.items():
+        _require(isinstance(k, str), "features key")
+        if k in FEATURE_FLAGS:
+            _require(isinstance(v, bool), k)
+            feats[k] = v
+        elif k == "os_patch_age_days":
+            _require(isinstance(v, int) and not isinstance(v, bool) and v >= 0, k)
+            feats[k] = v
+    warnings = m.get(-65607, [])
+    if -65607 in m:
+        _require(isinstance(warnings, list) and 0 < len(warnings) <= 16
+                 and all(isinstance(w, str) for w in warnings), "warnings")
+    return {
+        "iss": _ctext(m, 1, "iss", 64), "iat": iat, "exp": exp,
+        "cti": _cbytes(m, 7, "cti", 16), "cnf": _cnf(m), "nonce": _cbytes(m, 10, "eat_nonce", 32),
+        "did": _cbytes(m, -65601, "did", 32), "tier": _tier(m), "features": feats,
+        "client_build": _cbytes(m, -65604, "client_build", 32),
+        "platform": _ctext(m, -65605, "platform", 32), "policy_ver": _cuint(m, -65606, "policy_ver"),
+        "warnings": warnings,
+    }
+
+
+def parse_sat(m):
+    _require(isinstance(m, dict), "SAT is not a map")
+    iat, exp = _lifetime(m, SAT_MAX_S)
+    return {
+        "iss": _ctext(m, 1, "iss", 64), "sub": _cbytes(m, 2, "sub", 32), "aud": _cbytes(m, 3, "aud", 32),
+        "iat": iat, "exp": exp, "cti": _cbytes(m, 7, "cti", 16), "cnf": _cnf(m),
+        "did": _cbytes(m, -65601, "did", 32), "tier": _tier(m),
+        "match_id": _cbytes(m, -65620, "match_id", 16), "slot": _cuint(m, -65621, "slot", 16),
+        "queue": _ctext(m, -65622, "queue", 64), "policy_ver": _cuint(m, -65606, "policy_ver"),
+        "ar_cti": _cbytes(m, -65623, "ar_cti", 16),
+    }
+
+
+def parse_sar(m):
+    _require(isinstance(m, dict), "SAR is not a map")
+    iat, exp = _lifetime(m, SAR_MAX_S)
+    opt = lambda key, what: _cbytes(m, key, what, 32) if key in m else None
+    c = {
+        "iss": _ctext(m, 1, "iss", 64), "sub": _cbytes(m, 2, "sub", 32), "iat": iat, "exp": exp,
+        "cnf": _cnf(m), "tls_spki_sha256": opt(-65640, "tls_spki_sha256"),
+        "noise_static": opt(-65647, "noise_static"),
+        "server_class": _cuint(m, -65641, "server_class"), "build_id": _cbytes(m, -65642, "build_id", 32),
+        "region": _ctext(m, -65643, "region", 32), "seq": _cuint(m, -65644, "seq"),
+        "prev": _cbytes(m, -65645, "prev", 32),
+        "vrf_pub": _okp_key(m[-65646], "vrf_pub").hex() if -65646 in m else None,
+    }
+    _require(c["server_class"] <= 3, "server_class")
+    _require(c["sub"] == key_digest(bytes.fromhex(c["cnf"])).hex(), "sub != digest(cnf)")
+    _require(c["tls_spki_sha256"] or c["noise_static"], "no transport binding")
+    return c
+
+
+PARSERS = {"input-commit": parse_input_commit, "checkpoint": parse_checkpoint, "admit-pop": parse_admit_pop,
+           "attestation-result": parse_attestation_result, "sat": parse_sat, "sar": parse_sar}
 
 
 def verify(cose, kind, keys):
@@ -459,6 +589,26 @@ def run(path):
         r.check(hashlib.sha256(cose).hexdigest() == o["digest"], f"{name}: object digest")
         derive = o["derive"]
         r.check(key["name"] == derive["signer"], f"{name}: signer")
+        if o["type"] in ("attestation-result", "sat"):
+            if o["type"] == "sat":
+                ar = parse_attestation_result(cbor_decode(cbor_decode(bytes.fromhex(by_object[derive["ar_object"]]["cose"]))[2]))
+                r.check(payload["ar_cti"] == ar["cti"] and payload["cnf"] == ar["cnf"] and payload["tier"] <= ar["tier"],
+                        f"{name}: SAT backed by its AR (cti, cnf, tier)")
+            continue
+        if o["type"] == "sar":
+            prev = derive["prev_object"]
+            expected = (hashlib.sha256(cbor_decode(bytes.fromhex(by_object[prev]["cose"]))[2]).hexdigest()
+                        if prev else "00" * 32)
+            r.check(payload["prev"] == expected, f"{name}: prev is SHA-256 of the previous SAR payload")
+            if prev:
+                r.check(payload["seq"] == parse_sar(cbor_decode(cbor_decode(bytes.fromhex(by_object[prev]["cose"]))[2]))["seq"] + 1,
+                        f"{name}: seq continues")
+            continue
+        if o["type"] == "admit-pop":
+            binding = derive["host_static"] + derive["joiner_static"]
+            r.check(payload["channel"] == "fpp-p2p/noise-ik" and payload["binding"] == binding,
+                    f"{name}: binding is host static key || joiner static key")
+            continue
         prev = derive["prev_object"]
         expected_prev = hashlib.sha256(bytes.fromhex(by_object[prev]["cose"])).hexdigest() if prev else "00" * 32
         r.check(payload["prev"] == expected_prev, f"{name}: prev chain")

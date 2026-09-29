@@ -19,6 +19,13 @@ fn main() {
 
     println!("Generated keys: keys/vs_ed25519.pk8 + .pub");
 
+    // Public role keys (Verifier, Broker, Server Liveness) derived from the VS seed.
+    common::keys::ServiceKeys::derive(&sk.to_bytes())
+        .bundle()
+        .save(common::keys::DEFAULT_BUNDLE)
+        .expect("write key bundle");
+    println!("Generated key bundle: {}", common::keys::DEFAULT_BUNDLE);
+
     // Dev CA + VS/GS TLS certificates; every QUIC link verifies against the CA.
     DevPki::generate()
         .and_then(|pki| pki.write_to("keys"))

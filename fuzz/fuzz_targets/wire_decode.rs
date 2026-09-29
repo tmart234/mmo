@@ -1,16 +1,17 @@
-//! Every message a peer can send, decoded exactly as the receive paths do.
+//! Every control-link message a peer can send, decoded exactly as the
+//! receive paths do.
 #![no_main]
 
-use common::framing::{decode_frame, MAX_CONTROL_FRAME, MAX_SNAPSHOT_FRAME, MAX_TRANSCRIPT_FRAME};
+use common::framing::{decode_frame, MAX_CONTROL_FRAME};
 use common::proto::{
-    ClientHello, ClientInput, ClientToGs, GsToClient, Heartbeat, JoinAccept, JoinRequest,
-    PlayTicket, ProtectedReceipt, ServerHello, TranscriptDigest,
+    AttestChallenge, ChallengeRequest, CheckpointSubmit, ClientAdmission, ClientAdmissionRequest,
+    ClientCmd, JoinAccept, JoinRequest, SarIssue, WorldSnapshot,
 };
 use common::tpm::TpmQuote;
 use libfuzzer_sys::fuzz_target;
 
-fn decode<T: serde::de::DeserializeOwned>(body: &[u8], max: usize) {
-    let _ = decode_frame::<T>(body, max);
+fn decode<T: serde::de::DeserializeOwned>(body: &[u8]) {
+    let _ = decode_frame::<T>(body, MAX_CONTROL_FRAME);
     let _ = bincode::deserialize::<T>(body);
 }
 
@@ -18,18 +19,17 @@ fuzz_target!(|data: &[u8]| {
     let Some((&selector, body)) = data.split_first() else {
         return;
     };
-    match selector % 12 {
-        0 => decode::<JoinRequest>(body, MAX_CONTROL_FRAME),
-        1 => decode::<JoinAccept>(body, MAX_CONTROL_FRAME),
-        2 => decode::<PlayTicket>(body, MAX_CONTROL_FRAME),
-        3 => decode::<ClientHello>(body, MAX_CONTROL_FRAME),
-        4 => decode::<ServerHello>(body, MAX_CONTROL_FRAME),
-        5 => decode::<ClientToGs>(body, MAX_CONTROL_FRAME),
-        6 => decode::<GsToClient>(body, MAX_SNAPSHOT_FRAME),
-        7 => decode::<Heartbeat>(body, MAX_CONTROL_FRAME),
-        8 => decode::<TranscriptDigest>(body, MAX_TRANSCRIPT_FRAME),
-        9 => decode::<ProtectedReceipt>(body, MAX_CONTROL_FRAME),
-        10 => decode::<TpmQuote>(body, MAX_CONTROL_FRAME),
-        _ => decode::<ClientInput>(body, MAX_CONTROL_FRAME),
+    match selector % 11 {
+        0 => decode::<JoinRequest>(body),
+        1 => decode::<JoinAccept>(body),
+        2 => decode::<ChallengeRequest>(body),
+        3 => decode::<AttestChallenge>(body),
+        4 => decode::<SarIssue>(body),
+        5 => decode::<CheckpointSubmit>(body),
+        6 => decode::<ClientAdmissionRequest>(body),
+        7 => decode::<ClientAdmission>(body),
+        8 => decode::<ClientCmd>(body),
+        9 => decode::<WorldSnapshot>(body),
+        _ => decode::<TpmQuote>(body),
     }
 });

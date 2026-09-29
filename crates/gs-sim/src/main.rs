@@ -1,36 +1,44 @@
 // crates/gs-sim/src/main.rs
+//! Prototype game server: joins the VS, keeps its SAR chain, submits one
+//! signed Checkpoint per epoch, and serves one match to clients over
+//! fpp-session (see `game.rs`).
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use common::{
     crypto::{file_sha256, join_request_sign_bytes, now_ms, sign},
-    framing::{recv_msg, send_msg},
-    proto::{JoinAccept, JoinRequest, PlayTicket, Sig},
-    tpm::{SimulatedTpm, TpmProvider},
+    framing::{recv_msg, send_msg, send_msg_continue},
+    keys::KeyBundle,
+    proto::{
+        AttestChallenge, ChallengeRequest, CheckpointSubmit, JoinAccept, JoinRequest, PeerRole,
+        SarIssue, Sig,
+    },
+    tpm::{join_quote_nonce, reattest_quote_nonce, SimulatedTpm, TpmProvider},
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use fpp_crypto::Ed25519Signer;
+use fpp_session::{Host, HostConfig, StaticKeypair};
+use fpp_tokens::SarChain;
+use fpp_types::{BuildId, DeviceTier, MatchId};
+use gs_sim::{
+    admission,
+    game::{self, Match, MatchConfig},
+    ledger::Ledger,
+};
 use quinn::{Connection, Endpoint};
 use rand::{rngs::OsRng, RngCore};
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
     path::PathBuf,
-    sync::{atomic::AtomicU64, Arc, Mutex},
+    sync::{atomic::AtomicBool, Arc, Mutex},
     time::Duration,
 };
-use tokio::sync::{watch, Mutex as TokioMutex};
-use tokio::time::sleep;
+use tokio::sync::{mpsc, watch, Mutex as TokioMutex};
 
-mod admission;
-mod client_port;
-mod heartbeat;
-mod ledger;
-mod state;
-mod tickets;
+/// (seq, exact bytes) of the newest verified SAR, for seeding TPM quotes.
+type LatestSar = Arc<Mutex<Option<(u64, Vec<u8>)>>>;
 
-use crate::client_port::client_port_task;
-use crate::heartbeat::heartbeat_loop_with_tpm;
-use crate::ledger::Ledger;
-use crate::state::{GsShared, Shared};
-use crate::tickets::ticket_listener;
+/// Re-attest with the TPM every this many Checkpoints.
+const TPM_REATTEST_EPOCHS: u32 = 10;
 
 #[derive(Parser, Debug)]
 struct Opts {
@@ -38,9 +46,15 @@ struct Opts {
     #[arg(long, default_value = "127.0.0.1:4444")]
     vs: String,
 
-    /// Exit after first join/heartbeat/ticket/client-proof exchange.
+    /// UDP address of the game port clients join (fpp-session).
+    #[arg(long, default_value = "127.0.0.1:50000")]
+    game_addr: String,
+
+    /// Serve for `--test-secs` seconds, then exit.
     #[arg(long)]
     test_once: bool,
+    #[arg(long, default_value_t = 15)]
+    test_secs: u64,
 
     /// Logical GS ID label
     #[arg(long, default_value = "gs-sim-local")]
@@ -52,97 +66,64 @@ struct Opts {
     #[arg(long, default_value = "keys/gs_ed25519.pub")]
     gs_pk: String,
 
-    /// Enable TPM attestation (uses simulated TPM for testing)
-    /// Stage 1.2: When enabled, GS will:
-    /// - Generate initial TPM quote at JoinRequest
-    /// - Periodically re-attest every ~60 seconds in heartbeats
+    /// Simulated TPM: quote at join (bound to the VS challenge) and
+    /// re-attest every few Checkpoints (seeded by a recent SAR).
     #[arg(long)]
     enable_tpm: bool,
 
-    /// Pinned VS signing key. JoinAccept and PlayTickets must be signed by it.
+    /// Pinned VS key for JoinAccept.
     #[arg(long, default_value = "keys/vs_ed25519.pub")]
     vs_pk: String,
+
+    /// Key bundle: Verifier, Broker and Server Liveness keys.
+    #[arg(long, default_value = common::keys::DEFAULT_BUNDLE)]
+    bundle: String,
 
     /// CA certificate (DER) the VS's TLS certificate must chain to.
     #[arg(long, default_value = common::pki::DEFAULT_CA_CERT)]
     ca_cert: String,
-
-    /// TLS certificate (DER) presented on the client port; must chain to the CA clients pin.
-    #[arg(long, default_value = common::pki::DEFAULT_GS_TLS_CERT)]
-    tls_cert: String,
-    /// PKCS#8 private key (DER) for `--tls-cert`.
-    #[arg(long, default_value = common::pki::DEFAULT_GS_TLS_KEY)]
-    tls_key: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let opts = Opts::parse();
 
-    // rustls 0.23+ needs a global CryptoProvider (ring or aws-lc-rs).
-    {
-        use rustls::crypto::{ring, CryptoProvider};
-        CryptoProvider::install_default(ring::default_provider())
-            .expect("install ring CryptoProvider");
-    }
-
-    //
-    // 1. Load/generate GS long-term keypair.
-    //
     let (gs_sk_long, gs_pk_long) = load_or_make_keys(&opts.gs_sk, &opts.gs_pk)?;
-
-    //
-    // 1b. Trust roots: the pinned VS signing key, the CA for TLS, and our own
-    //     client-port certificate. Loaded up front so a misconfigured GS fails fast.
-    //
     let pinned_vs = common::crypto::load_verifying_key(&opts.vs_pk)?;
     let ca_der = common::pki::load_ca(&opts.ca_cert)?;
-    let client_port_identity = common::pki::ServerIdentity::load(&opts.tls_cert, &opts.tls_key)?;
+    let bundle = KeyBundle::load(&opts.bundle)?;
+    let keyset = bundle.keyset();
 
-    //
-    // 2. Create per-session ephemeral signing key (this run).
-    //
-    let eph_sk = SigningKey::generate(&mut OsRng);
-    let eph_pub_bytes = eph_sk.verifying_key().to_bytes();
+    // Instance key (signs Checkpoints; certified by SARs) and the game
+    // port's static key, both fresh per run.
+    let instance_sk = SigningKey::generate(&mut OsRng);
+    let instance_pub = instance_sk.verifying_key().to_bytes();
+    let noise = StaticKeypair::generate();
 
-    //
-    // 3. Compute sw_hash of our running binary (attestation of code identity).
-    //
     let exe = std::env::current_exe()?;
     let sw_hash = file_sha256(&exe)?;
 
-    //
-    // 3b. Initialize TPM (simulated for testing, hardware for production).
-    //     Stage 1.2: TPM is now passed to heartbeat loop for continuous attestation.
-    //
-    let tpm: Option<Arc<TokioMutex<Box<dyn TpmProvider>>>> = if opts.enable_tpm {
-        println!("[GS] initializing simulated TPM for attestation");
+    let tpm: Option<Arc<TokioMutex<SimulatedTpm>>> = if opts.enable_tpm {
         let mut tpm = SimulatedTpm::new();
-
-        // Extend PCR 0 with binary hash (code measurement)
-        tpm.extend_pcr(0, &sw_hash)
-            .context("extend PCR 0 with sw_hash")?;
-
-        // Extend PCR 1 with GS ID (configuration measurement)
+        tpm.extend_pcr(0, &sw_hash).context("extend PCR 0")?;
         tpm.extend_pcr(1, opts.gs_id.as_bytes())
-            .context("extend PCR 1 with gs_id")?;
-
+            .context("extend PCR 1")?;
         println!(
-            "[GS] TPM PCRs extended: PCR0=sw_hash, PCR1=gs_id ({})",
+            "[GS] simulated TPM: PCR0=sw_hash, PCR1=gs_id ({})",
             opts.gs_id
         );
-
-        // Wrap in Arc<TokioMutex> for async sharing with heartbeat loop
-        Some(Arc::new(TokioMutex::new(
-            Box::new(tpm) as Box<dyn TpmProvider>
-        )))
+        Some(Arc::new(TokioMutex::new(tpm)))
     } else {
         None
     };
 
-    //
-    // 4. QUIC connect to Validation Server (VS).
-    //
+    // Bind the game port first: we advertise it in the JoinRequest.
+    let game_addr: SocketAddr = opts.game_addr.parse().context("bad --game-addr")?;
+    let socket = tokio::net::UdpSocket::bind(game_addr)
+        .await
+        .with_context(|| format!("bind game port {game_addr}"))?;
+
+    // ---- Control link to the VS (QUIC, pinned CA).
     let (endpoint, server_addr) = make_endpoint_and_addr(&opts.vs)?;
     let conn: Connection = endpoint
         .connect_with(
@@ -153,178 +134,172 @@ async fn main() -> Result<()> {
         .await?;
     println!("[GS] connected to VS at {server_addr}");
 
-    //
-    // 5. Send JoinRequest over a bi-stream and receive JoinAccept.
-    //
     let mut nonce = [0u8; 16];
     OsRng.fill_bytes(&mut nonce);
-
     let now = now_ms();
-    let to_sign = join_request_sign_bytes(&opts.gs_id, &sw_hash, now, &nonce, &eph_pub_bytes);
+    let to_sign = join_request_sign_bytes(
+        &opts.gs_id,
+        &sw_hash,
+        now,
+        &nonce,
+        &instance_pub,
+        &noise.public,
+        &opts.game_addr,
+    );
     let sig_gs: Sig = sign(&gs_sk_long, &to_sign).to_vec();
 
-    // Generate TPM quote if TPM is enabled
-    let tpm_quote = if let Some(ref tpm_arc) = tpm {
-        println!("[GS] generating initial TPM attestation quote (PCRs 0,1)");
-        let quote_nonce = nonce;
-        let mut nonce_32 = [0u8; 32];
-        nonce_32[..16].copy_from_slice(&quote_nonce);
-
-        let tpm_guard = tpm_arc.lock().await;
-        Some(
-            tpm_guard
-                .quote(&[0, 1], &nonce_32)
-                .context("generate initial TPM quote")?,
-        )
-    } else {
-        None
+    // Ask for the VS's challenge first so the quote covers a nonce the VS chose (F04).
+    let (mut jsend, mut jrecv) = conn.open_bi().await?;
+    send_msg_continue(
+        &mut jsend,
+        &ChallengeRequest {
+            version: 2,
+            role: PeerRole::GameServer,
+        },
+    )
+    .await?;
+    let challenge: AttestChallenge = recv_msg(&mut jrecv).await.context("recv AttestChallenge")?;
+    let tpm_quote = match &tpm {
+        Some(t) => Some(
+            t.lock()
+                .await
+                .quote(&[0, 1], &join_quote_nonce(&challenge.nonce, &to_sign))
+                .context("join TPM quote")?,
+        ),
+        None => None,
     };
-
     let jr = JoinRequest {
         gs_id: opts.gs_id.clone(),
         sw_hash,
         t_unix_ms: now,
         nonce,
-        ephemeral_pub: eph_pub_bytes,
+        ephemeral_pub: instance_pub,
+        noise_static: noise.public,
+        game_addr: opts.game_addr.clone(),
         sig_gs,
         gs_pub: gs_pk_long.to_bytes(),
         tpm_quote,
     };
-
-    let (mut jsend, mut jrecv) = conn.open_bi().await?;
     send_msg(&mut jsend, &jr).await?;
     let ja: JoinAccept = recv_msg(&mut jrecv).await?;
-
-    //
-    // 6. Verify JoinAccept against the pinned VS key (never the key it carries).
-    //
     admission::verify_join_accept(&pinned_vs, &ja)?;
-    let vs_vk = pinned_vs;
+    let session_id = ja.session_id;
+    println!("[GS] joined; match {}..", hex::encode(&session_id[..4]));
 
-    println!(
-        "[GS] joined. session_id={}.. (vs sig OK, len={})",
-        hex::encode(&ja.session_id[..4]),
-        ja.sig_vs.len()
-    );
-
-    //
-    // 7. Shared GS state (session, sw_hash, latest ticket, receipt_tip, revoked flag...).
-    //
-    let shared: Shared = Arc::new(Mutex::new(GsShared::new(ja.session_id, vs_vk, sw_hash)));
-
-    //
-    // 7b. Open a session ledger (best-effort).
-    //
+    // ---- SAR chain from the VS: verified, and must certify our own keys.
+    let (sar_tx, sar_rx) = watch::channel::<Option<Vec<u8>>>(None);
+    let latest_sar: LatestSar = Arc::new(Mutex::new(None));
     {
-        let mut guard = shared.lock().unwrap();
-        let hex4 = format!("{:02x}{:02x}", guard.session_id[0], guard.session_id[1]);
-        guard.ledger = Ledger::open_for_session(&hex4).ok();
-    }
-
-    //
-    // 8. Channels:
-    //    - revoke_tx / revoke_rx: broadcast "VS revoked this GS"
-    //    - ticket_tx / ticket_rx: broadcast latest PlayTicket
-    //
-    let (revoke_tx, revoke_rx) = watch::channel(false);
-    let (ticket_tx, ticket_rx) = watch::channel::<Option<PlayTicket>>(None);
-
-    //
-    // 9. Spawn runtime tasks: heartbeat, ticket listener, (client port later).
-    //
-    // a) heartbeat_loop: GS → VS liveness + receipt_tip + sw_hash re-attestation
-    //    Stage 1.2: Now includes periodic TPM quotes when TPM is enabled
-    let hb_counter = Arc::new(AtomicU64::new(0));
-    let heartbeat_task = tokio::spawn(heartbeat_loop_with_tpm(
-        conn.clone(),
-        hb_counter.clone(),
-        eph_sk,
-        ja.session_id,
-        shared.clone(),
-        tpm, // Stage 1.2: Pass TPM for continuous attestation
-    ));
-
-    // b) ticket_listener:
-    //    VS → GS PlayTickets stream + revocation watchdog
-    let tickets_task = tokio::spawn(ticket_listener(
-        conn.clone(),
-        shared.clone(),
-        vs_vk,
-        revoke_tx.clone(),
-        ticket_tx.clone(),
-    ));
-
-    // === CRITICAL FIX: gate client port with timeout to prevent deadlock ===
-    {
-        use common::config::GsConfig;
-        use tokio::time::timeout;
-
-        let config = GsConfig::default();
-        let first_ticket_timeout = Duration::from_millis(config.first_ticket_timeout_ms);
-
-        let mut first_ticket_rx = ticket_tx.subscribe();
-        let wait_for_ticket = async {
-            while first_ticket_rx.borrow().is_none() {
-                if first_ticket_rx.changed().await.is_err() {
-                    bail!("ticket channel closed before first ticket");
+        let conn = conn.clone();
+        let latest = latest_sar.clone();
+        let keyset = keyset.clone();
+        tokio::spawn(async move {
+            let mut chain: Option<SarChain> = None;
+            loop {
+                let Ok(mut uni) = conn.accept_uni().await else {
+                    break;
+                };
+                let Ok(issue) = recv_msg::<SarIssue>(&mut uni).await else {
+                    continue;
+                };
+                let now = now_ms() / 1000;
+                let verified = match chain.as_mut() {
+                    None => SarChain::start(&issue.sar, &keyset, now).map(|c| {
+                        chain = Some(c);
+                    }),
+                    Some(c) => c.update(&issue.sar, &keyset, now),
+                };
+                let ours = chain.as_ref().is_some_and(|c| {
+                    c.current().cnf == instance_pub
+                        && c.current().noise_static == Some(noise.public)
+                });
+                if let Err(e) = verified.map_err(|e| e.to_string()).and_then(|_| {
+                    ours.then_some(())
+                        .ok_or("SAR does not certify our keys".to_string())
+                }) {
+                    eprintln!("[GS] rejected SAR from VS: {e}; stopping");
+                    break;
+                }
+                let seq = chain.as_ref().map(|c| c.current().seq).unwrap_or(0);
+                *latest.lock().unwrap() = Some((seq, issue.sar.clone()));
+                if sar_tx.send(Some(issue.sar)).is_err() {
+                    break;
                 }
             }
-            Ok::<_, anyhow::Error>(())
-        };
-
-        match timeout(first_ticket_timeout, wait_for_ticket).await {
-            Ok(Ok(_)) => {
-                println!("[GS] first PlayTicket received — opening client port");
-            }
-            Ok(Err(e)) => {
-                bail!("ticket channel error: {}", e);
-            }
-            Err(_) => {
-                bail!(
-                    "timeout waiting for first ticket from VS after {}ms - check VS connectivity",
-                    config.first_ticket_timeout_ms
-                );
-            }
-        }
+            // Dropping `sar_tx` tells the match it lost its blessing.
+        });
     }
 
-    // c) client_port_task:
-    //    TCP listener accepting local client-sim connections.
-    let client_port_task_handle = tokio::spawn(client_port_task(
-        client_port_identity,
-        shared.clone(),
-        revoke_rx.clone(),
-        ticket_rx.clone(),
-    ));
+    // ---- Checkpoints to the VS (with periodic TPM re-attestation).
+    let (cp_tx, mut cp_rx) = mpsc::unbounded_channel::<(u32, Vec<u8>)>();
+    {
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            while let Some((epoch, checkpoint)) = cp_rx.recv().await {
+                let seeded = latest_sar.lock().unwrap().clone();
+                let (tpm_quote, quote_sar_seq) = match (&tpm, seeded) {
+                    (Some(t), Some((seq, sar)))
+                        if epoch % TPM_REATTEST_EPOCHS == TPM_REATTEST_EPOCHS - 1 =>
+                    {
+                        let nonce = reattest_quote_nonce(&session_id, u64::from(epoch), &sar);
+                        match t.lock().await.quote(&[0, 1], &nonce) {
+                            Ok(q) => {
+                                println!(
+                                    "[GS] TPM re-attestation with checkpoint {epoch} (SAR #{seq})"
+                                );
+                                (Some(q), seq)
+                            }
+                            Err(_) => (None, 0),
+                        }
+                    }
+                    _ => (None, 0),
+                };
+                let submit = CheckpointSubmit {
+                    checkpoint,
+                    tpm_quote,
+                    quote_sar_seq,
+                };
+                let sent = async {
+                    let mut uni = conn.open_uni().await?;
+                    send_msg(&mut uni, &submit).await
+                };
+                if let Err(e) = sent.await {
+                    eprintln!("[GS] checkpoint submit failed: {e:#}");
+                    break;
+                }
+            }
+        });
+    }
 
-    //
-    // 10. --test_once mode: let smoke test run, then exit.
-    //
+    // ---- The match.
+    let mut host_cfg = HostConfig::new(noise);
+    host_cfg.max_peers = 64;
+    let m = Match::new(
+        MatchConfig {
+            match_id: MatchId(session_id),
+            instance: Ed25519Signer::new(instance_sk),
+            build_id: BuildId(sw_hash),
+            keys: keyset,
+            min_tier: DeviceTier::D0Unknown,
+            sar_grace_ms: game::SAR_GRACE_MS,
+        },
+        Host::new(host_cfg),
+    );
+    let ledger = Ledger::open_for_session(&hex::encode(&session_id[..2])).ok();
+    let stop = Arc::new(AtomicBool::new(false));
+    println!("[GS] game port (fpp-session/UDP) on {game_addr}");
+    let game_task = tokio::spawn(game::run(socket, m, sar_rx, cp_tx, ledger, stop.clone()));
+
     if opts.test_once {
-        sleep(Duration::from_secs(15)).await;
-
-        heartbeat_task.abort();
-        tickets_task.abort();
-        client_port_task_handle.abort();
-
-        println!("[GS] test_once complete.");
-        return Ok(());
+        tokio::time::sleep(Duration::from_secs(opts.test_secs)).await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-
-    //
-    // 11. "Prod-ish": loop until any task dies.
-    //
-    loop {
-        sleep(Duration::from_secs(60)).await;
-        if heartbeat_task.is_finished()
-            || tickets_task.is_finished()
-            || client_port_task_handle.is_finished()
-        {
-            eprintln!("[GS] background task ended, exiting main loop");
-            break;
-        }
+    game_task.await.map_err(|e| anyhow!("game task: {e}"))??;
+    conn.close(0u32.into(), b"done");
+    println!("[GS] match over.");
+    if !opts.test_once {
+        bail!("match ended: SAR chain lapsed");
     }
-
     Ok(())
 }
 
@@ -336,7 +311,6 @@ fn load_or_make_keys(sk_path: &str, pk_path: &str) -> Result<(SigningKey, Verify
     if skp.exists() && pkp.exists() {
         let sk_bytes = std::fs::read(&skp).context("read gs_sk")?;
         let pk_bytes = std::fs::read(&pkp).context("read gs_pk")?;
-
         let sk = SigningKey::from_bytes(
             &sk_bytes
                 .try_into()
@@ -368,17 +342,12 @@ fn make_endpoint_and_addr(vs: &str) -> Result<(Endpoint, SocketAddr)> {
     use quinn::{EndpointConfig, TokioRuntime};
 
     let server_addr: SocketAddr = vs.parse().context("bad vs address")?;
-
     let bind_ip = match server_addr {
         SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
         SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
     };
-    let local_addr = SocketAddr::new(bind_ip, 0);
-
-    let udp = UdpSocket::bind(local_addr)?;
+    let udp = UdpSocket::bind(SocketAddr::new(bind_ip, 0))?;
     udp.set_nonblocking(true)?;
-
     let endpoint = Endpoint::new(EndpointConfig::default(), None, udp, Arc::new(TokioRuntime))?;
-
     Ok((endpoint, server_addr))
 }

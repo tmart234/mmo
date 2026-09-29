@@ -5,35 +5,6 @@
 use common::crypto::sha256;
 use common::tpm::{verify_quote, SimulatedTpm, TpmProvider};
 
-/// Test that nonce derivation is consistent between GS and VS.
-/// Both must derive: sha256(session_id || gs_counter || receipt_tip)
-#[test]
-fn nonce_derivation_matches_gs_and_vs() {
-    let session_id = [0xAA; 16];
-    let gs_counter = 42u64;
-    let receipt_tip = [0xBB; 32];
-
-    // GS-side derivation (from heartbeat.rs)
-    let gs_nonce = {
-        let mut buf = Vec::with_capacity(16 + 8 + 32);
-        buf.extend_from_slice(&session_id);
-        buf.extend_from_slice(&gs_counter.to_le_bytes());
-        buf.extend_from_slice(&receipt_tip);
-        sha256(&buf)
-    };
-
-    // VS-side derivation (from streams.rs)
-    let vs_nonce = {
-        let mut buf = Vec::with_capacity(16 + 8 + 32);
-        buf.extend_from_slice(&session_id);
-        buf.extend_from_slice(&gs_counter.to_le_bytes());
-        buf.extend_from_slice(&receipt_tip);
-        sha256(&buf)
-    };
-
-    assert_eq!(gs_nonce, vs_nonce, "GS and VS must derive same nonce");
-}
-
 /// Test that VS verifies quotes correctly with matching PCRs.
 #[test]
 fn vs_accepts_valid_quote_with_matching_pcrs() {
@@ -120,9 +91,9 @@ fn vs_rejects_replayed_quote_with_old_nonce() {
     );
 }
 
-/// Test that nonce changes with each heartbeat counter.
+/// Test that nonce changes with each checkpoint counter.
 #[test]
-fn nonce_is_unique_per_heartbeat() {
+fn nonce_is_unique_per_checkpoint() {
     let session_id = [0xAA; 16];
     let receipt_tip = [0xBB; 32];
 
@@ -144,7 +115,10 @@ fn nonce_is_unique_per_heartbeat() {
         set.len()
     };
 
-    assert_eq!(unique_count, 100, "Each heartbeat should have unique nonce");
+    assert_eq!(
+        unique_count, 100,
+        "Each checkpoint should have a unique nonce"
+    );
 }
 
 /// Test that quote verification works without baseline (first attestation).
@@ -171,7 +145,7 @@ fn first_attestation_establishes_baseline() {
     assert!(quote.pcr_values.contains_key(&1));
 }
 
-/// Simulate full attestation flow: join -> heartbeat -> re-attest -> verify
+/// Simulate full attestation flow: join -> checkpoints -> re-attest -> verify
 #[test]
 fn full_continuous_attestation_flow() {
     let mut tpm = SimulatedTpm::new();
@@ -197,9 +171,9 @@ fn full_continuous_attestation_flow() {
     );
 
     // === HEARTBEAT PHASE (no TPM) ===
-    // Heartbeats 1-29 don't include TPM quotes
+    // Checkpoints 1-29 don't include TPM quotes
 
-    // === RE-ATTESTATION PHASE (heartbeat 30) ===
+    // === RE-ATTESTATION PHASE (checkpoint 30) ===
     let receipt_tip = [0xAB; 32];
     let gs_counter = 30u64;
 

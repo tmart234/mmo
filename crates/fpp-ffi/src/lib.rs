@@ -26,6 +26,9 @@ use sha2::{Digest as _, Sha256};
 use std::ffi::{c_char, c_int};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
+mod p2p;
+pub use p2p::*;
+
 /// Result of every SDK call. Verification failures map one-to-one onto the
 /// rejection categories of 04-protocol.md §2.1.
 #[repr(C)]
@@ -38,6 +41,8 @@ pub enum FppStatus {
     InvalidArgument = 2,
     /// `*out_len` holds the required size.
     BufferTooSmall = 3,
+    /// Nothing queued (poll functions).
+    Empty = 4,
     Encoding = 10,
     Header = 11,
     Version = 12,
@@ -47,6 +52,36 @@ pub enum FppStatus {
     Algorithm = 16,
     Signature = 17,
     Schema = 18,
+    /// P2P sessions (`fpp_p2p_*`): why a datagram was dropped or a call
+    /// refused. Drop the datagram and carry on; none of these is fatal.
+    /// Not a packet of this protocol, or too large.
+    P2pMalformed = 30,
+    /// No session with that receiver index (stale, or never existed).
+    P2pUnknownSession = 31,
+    /// Packet counter already seen or older than the replay window.
+    P2pReplay = 32,
+    /// Authentication failed (wrong keys, or tampered).
+    P2pDecrypt = 33,
+    /// Noise handshake failed (e.g. the joiner used another host key).
+    P2pHandshake = 34,
+    /// The join did not carry the host's invite secret.
+    P2pInvite = 35,
+    /// The joiner's session-key proof (AdmitPop) is invalid.
+    P2pBinding = 36,
+    /// The host has no free player slot.
+    P2pFull = 37,
+    /// Not valid in the current state (e.g. sending before connected).
+    P2pState = 38,
+    /// Packet counter limit reached; join again.
+    P2pExhausted = 39,
+    /// Payload, hello or attestation above its limit.
+    P2pTooLarge = 40,
+    /// No such peer.
+    P2pUnknownPeer = 41,
+    /// Reliable channel full (64 unacknowledged messages); retry after a tick.
+    P2pCongested = 42,
+    /// Host under load and the join's cookie is missing or wrong (dropped).
+    P2pCookie = 43,
     /// A bug in the SDK (a caught panic). Please report it.
     Internal = 99,
 }
@@ -192,6 +227,7 @@ pub extern "C" fn fpp_status_str(status: c_int) -> *const c_char {
         1 => b"null pointer\0",
         2 => b"invalid argument\0",
         3 => b"buffer too small\0",
+        4 => b"empty: nothing queued\0",
         10 => b"encoding: not deterministic CBOR\0",
         11 => b"header: malformed COSE_Sign1 or protected header\0",
         12 => b"version: unsupported protocol version\0",
@@ -201,6 +237,20 @@ pub extern "C" fn fpp_status_str(status: c_int) -> *const c_char {
         16 => b"alg: algorithm does not match key\0",
         17 => b"signature: verification failed\0",
         18 => b"schema: payload fields invalid\0",
+        30 => b"p2p: malformed or oversized packet\0",
+        31 => b"p2p: unknown session\0",
+        32 => b"p2p: replayed or too old\0",
+        33 => b"p2p: authentication failed\0",
+        34 => b"p2p: handshake failed\0",
+        35 => b"p2p: invite secret missing or wrong\0",
+        36 => b"p2p: session key proof invalid\0",
+        37 => b"p2p: host full\0",
+        38 => b"p2p: not valid in this state\0",
+        39 => b"p2p: packet counter exhausted\0",
+        40 => b"p2p: too large\0",
+        41 => b"p2p: unknown peer\0",
+        42 => b"p2p: reliable channel congested\0",
+        43 => b"p2p: join cookie invalid\0",
         99 => b"internal SDK error\0",
         _ => b"unknown status\0",
     };

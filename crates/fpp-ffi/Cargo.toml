@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Fair-Play Protocol v1 SDK for C/C++ games: stable C ABI over fpp-wire, fpp-crypto and fpp-merkle"
+description = "Fair-Play Protocol v1 SDK for C/C++ games: stable C ABI over fpp-wire, fpp-crypto, fpp-merkle and fpp-session"
 
 [lib]
 name = "fpp"
@@ -15,6 +15,7 @@ fpp-types = { path = "../fpp-types" }
 fpp-wire = { path = "../fpp-wire" }
 fpp-crypto = { path = "../fpp-crypto" }
 fpp-merkle = { path = "../fpp-merkle" }
+fpp-session = { path = "../fpp-session" }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }

@@ -11,6 +11,24 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// Largest datagram the SDK produces or accepts (no IP fragmentation).
+#define FPP_P2P_MAX_PACKET 1452
+
+// Largest payload for `fpp_p2p_host_send` / `fpp_p2p_joiner_send`.
+#define FPP_P2P_MAX_PAYLOAD 1422
+
+// Largest message for `fpp_p2p_*_send_reliable`.
+#define FPP_P2P_MAX_MESSAGE 1418
+
+// Largest address blob.
+#define FPP_P2P_MAX_ADDRESS 128
+
+// Largest Attestation Result a joiner may attach.
+#define FPP_P2P_MAX_ATTESTATION 512
+
+// Largest title-defined hello, either direction.
+#define FPP_P2P_MAX_HELLO 256
+
 // Result of every SDK call. Verification failures map one-to-one onto the
 // rejection categories of 04-protocol.md §2.1.
 typedef enum FppStatus {
@@ -21,6 +39,8 @@ typedef enum FppStatus {
   FPP_STATUS_INVALID_ARGUMENT = 2,
   // `*out_len` holds the required size.
   FPP_STATUS_BUFFER_TOO_SMALL = 3,
+  // Nothing queued (poll functions).
+  FPP_STATUS_EMPTY = 4,
   FPP_STATUS_ENCODING = 10,
   FPP_STATUS_HEADER = 11,
   FPP_STATUS_VERSION = 12,
@@ -30,15 +50,74 @@ typedef enum FppStatus {
   FPP_STATUS_ALGORITHM = 16,
   FPP_STATUS_SIGNATURE = 17,
   FPP_STATUS_SCHEMA = 18,
+  // P2P sessions (`fpp_p2p_*`): why a datagram was dropped or a call
+  // refused. Drop the datagram and carry on; none of these is fatal.
+  // Not a packet of this protocol, or too large.
+  FPP_STATUS_P2P_MALFORMED = 30,
+  // No session with that receiver index (stale, or never existed).
+  FPP_STATUS_P2P_UNKNOWN_SESSION = 31,
+  // Packet counter already seen or older than the replay window.
+  FPP_STATUS_P2P_REPLAY = 32,
+  // Authentication failed (wrong keys, or tampered).
+  FPP_STATUS_P2P_DECRYPT = 33,
+  // Noise handshake failed (e.g. the joiner used another host key).
+  FPP_STATUS_P2P_HANDSHAKE = 34,
+  // The join did not carry the host's invite secret.
+  FPP_STATUS_P2P_INVITE = 35,
+  // The joiner's session-key proof (AdmitPop) is invalid.
+  FPP_STATUS_P2P_BINDING = 36,
+  // The host has no free player slot.
+  FPP_STATUS_P2P_FULL = 37,
+  // Not valid in the current state (e.g. sending before connected).
+  FPP_STATUS_P2P_STATE = 38,
+  // Packet counter limit reached; join again.
+  FPP_STATUS_P2P_EXHAUSTED = 39,
+  // Payload, hello or attestation above its limit.
+  FPP_STATUS_P2P_TOO_LARGE = 40,
+  // No such peer.
+  FPP_STATUS_P2P_UNKNOWN_PEER = 41,
+  // Reliable channel full (64 unacknowledged messages); retry after a tick.
+  FPP_STATUS_P2P_CONGESTED = 42,
+  // Host under load and the join's cookie is missing or wrong (dropped).
+  FPP_STATUS_P2P_COOKIE = 43,
   // A bug in the SDK (a caught panic). Please report it.
   FPP_STATUS_INTERNAL = 99,
 } FppStatus;
+
+// What a poll returned (`FppP2pEvent.kind`).
+typedef enum FppP2pEventKind {
+  // Host: a player joined. `peer`; `key` = its session key (verify its
+  // InputCommits with it); data = attestation ‖ admit_pop ‖ hello.
+  FPP_P2P_EVENT_KIND_PEER_JOINED = 1,
+  // Host (`peer` set) or joiner: an application datagram; data = payload.
+  FPP_P2P_EVENT_KIND_DATA = 2,
+  // Host: `peer`'s address changed after it answered a path challenge.
+  FPP_P2P_EVENT_KIND_PEER_MIGRATED = 3,
+  // Host: `peer` left with `reason`.
+  FPP_P2P_EVENT_KIND_PEER_LEFT = 4,
+  // Joiner: connected. `has_key`/`key` = the host's Checkpoint key;
+  // data = the host's hello.
+  FPP_P2P_EVENT_KIND_CONNECTED = 5,
+  // Joiner: the host's address changed after it answered a path challenge.
+  FPP_P2P_EVENT_KIND_HOST_MIGRATED = 6,
+  // Joiner: the host closed the session with `reason`.
+  FPP_P2P_EVENT_KIND_CLOSED = 7,
+  // Host (`peer` set) or joiner: a reliable-channel message, delivered
+  // once and in order; data = payload.
+  FPP_P2P_EVENT_KIND_MESSAGE = 8,
+} FppP2pEventKind;
 
 // Accumulates a host's commitment for one match epoch (04-protocol.md §8.1).
 typedef struct FppCheckpointBuilder FppCheckpointBuilder;
 
 // Accumulates one player's input frames for one epoch (04-protocol.md §7.4).
 typedef struct FppInputCommitBuilder FppInputCommitBuilder;
+
+// The hosting player's endpoint.
+typedef struct FppP2pHost FppP2pHost;
+
+// A joining player's endpoint.
+typedef struct FppP2pJoiner FppP2pJoiner;
 
 // An Ed25519 signing key (a player's session key or a host's instance key).
 typedef struct FppSigner FppSigner;
@@ -77,6 +156,25 @@ typedef struct FppCheckpointInfo {
   uint32_t roster_n;
   uint8_t digest[32];
 } FppCheckpointInfo;
+
+// One event. Variable-size fields go into the caller's data buffer; the
+// `*_len` fields say how to split it.
+typedef struct FppP2pEvent {
+  enum FppP2pEventKind kind;
+  uint32_t peer;
+  // `fpp_types::Reason` code (PeerLeft, Closed).
+  uint16_t reason;
+  uint8_t has_key;
+  uint8_t key[32];
+  // PeerJoined: the first `attestation_len` data bytes are the joiner's
+  // Attestation Result (0 = none, device tier D0). Not verified by the SDK.
+  size_t attestation_len;
+  // PeerJoined: the next `admit_pop_len` bytes are its signed AdmitPop
+  // (keep it in the match's evidence bundle).
+  size_t admit_pop_len;
+  // Total bytes written to the data buffer.
+  size_t data_len;
+} FppP2pEvent;
 
 #ifdef __cplusplus
 extern "C" {
@@ -276,6 +374,225 @@ enum FppStatus fpp_verify_checkpoint(const uint8_t *object,
                                      size_t len,
                                      const uint8_t *instance_public_key,
                                      struct FppCheckpointInfo *info);
+
+// Generate a static X25519 key pair (the host's identity for its invites).
+// `private_out` and `public_out`: 32 bytes each. Keep the private key secret;
+// put the public key in the invite.
+//
+// # Safety
+// Both pointers valid for 32 writes.
+enum FppStatus fpp_p2p_keypair_generate(uint8_t *private_out, uint8_t *public_out);
+
+// The public key for a 32-byte static private key (e.g. one the game saved).
+//
+// # Safety
+// Both pointers valid for 32 bytes.
+enum FppStatus fpp_p2p_public_key(const uint8_t *private_key, uint8_t *public_out);
+
+// Create a host. `static_private`: 32 bytes. `invite_secret`: 32 bytes that
+// joiners must present, or NULL for none (it authorizes only; it is never
+// used as a key). `instance_public_key`: 32-byte Ed25519 key that signs this
+// host's Checkpoints, announced to joiners, or NULL. `hello`: title bytes
+// for every joiner (≤ `FPP_P2P_MAX_HELLO`). `max_peers`: player limit.
+//
+// # Safety
+// Pointers valid as documented; `out` valid for a pointer write.
+enum FppStatus fpp_p2p_host_new(const uint8_t *static_private,
+                                const uint8_t *invite_secret,
+                                const uint8_t *instance_public_key,
+                                const uint8_t *hello,
+                                size_t hello_len,
+                                uint32_t max_peers,
+                                struct FppP2pHost **out);
+
+// Feed one datagram received from `from`. A non-OK status means it was
+// dropped (count it; do not disconnect anyone over it).
+//
+// # Safety
+// `host` a live handle; `from` valid for `from_len`; `datagram` valid for `len`.
+enum FppStatus fpp_p2p_host_recv(struct FppP2pHost *host,
+                                 const uint8_t *from,
+                                 size_t from_len,
+                                 const uint8_t *datagram,
+                                 size_t len);
+
+// Queue an application datagram for `peer` (≤ `FPP_P2P_MAX_PAYLOAD` bytes).
+//
+// # Safety
+// `host` a live handle; `payload` valid for `len` bytes.
+enum FppStatus fpp_p2p_host_send(struct FppP2pHost *host,
+                                 uint32_t peer,
+                                 const uint8_t *payload,
+                                 size_t len);
+
+// Queue a message on `peer`'s reliable ordered channel (≤
+// `FPP_P2P_MAX_MESSAGE` bytes): InputCommits, Checkpoint heads, events that
+// must arrive. It is resent from `fpp_p2p_host_tick` until acknowledged.
+// Per-tick game state belongs in `fpp_p2p_host_send` (unreliable).
+//
+// # Safety
+// `host` a live handle; `payload` valid for `len` bytes.
+enum FppStatus fpp_p2p_host_send_reliable(struct FppP2pHost *host,
+                                          uint32_t peer,
+                                          const uint8_t *payload,
+                                          size_t len);
+
+// Advance time (a monotonic clock in ms): queues acks and due
+// retransmissions for every peer and ages join cookies. Call once per game
+// tick, then drain `fpp_p2p_host_poll_transmit`.
+//
+// # Safety
+// `host` a live handle.
+enum FppStatus fpp_p2p_host_tick(struct FppP2pHost *host, uint64_t now_ms);
+
+// Queue an empty keepalive for `peer` (when idle, to hold NAT bindings open).
+//
+// # Safety
+// `host` a live handle.
+enum FppStatus fpp_p2p_host_keepalive(struct FppP2pHost *host, uint32_t peer);
+
+// Tell `peer` why (an `fpp_types::Reason` code, e.g. 5 = tier insufficient)
+// and forget it.
+//
+// # Safety
+// `host` a live handle.
+enum FppStatus fpp_p2p_host_disconnect(struct FppP2pHost *host, uint32_t peer, uint16_t reason);
+
+// Take the next datagram to send: its destination into `(to, to_cap)` and
+// its bytes into `(packet, cap)`. Returns `FPP_STATUS_EMPTY` when none is
+// queued. On `FPP_STATUS_BUFFER_TOO_SMALL` both sizes are reported and the
+// datagram stays queued. Buffers of `FPP_P2P_MAX_ADDRESS` and
+// `FPP_P2P_MAX_PACKET` bytes always suffice.
+//
+// # Safety
+// `host` a live handle; `to`/`packet` NULL or valid for their capacities;
+// `to_len`/`len` valid for writes.
+enum FppStatus fpp_p2p_host_poll_transmit(struct FppP2pHost *host,
+                                          uint8_t *to,
+                                          size_t to_cap,
+                                          size_t *to_len,
+                                          uint8_t *packet,
+                                          size_t cap,
+                                          size_t *len);
+
+// Take the next event into `*event`, with its variable-size data in
+// `(data, cap)`. Returns `FPP_STATUS_EMPTY` when none is queued. On
+// `FPP_STATUS_BUFFER_TOO_SMALL`, `event->data_len` holds the size needed and
+// the event stays queued. A buffer of `FPP_P2P_MAX_PACKET` bytes always suffices.
+//
+// # Safety
+// `host` a live handle; `event` valid for a write; `data` NULL or valid for `cap`.
+enum FppStatus fpp_p2p_host_poll_event(struct FppP2pHost *host,
+                                       struct FppP2pEvent *event,
+                                       uint8_t *data,
+                                       size_t cap);
+
+// Number of joined players.
+//
+// # Safety
+// `host` a live handle; `out` valid for a write.
+enum FppStatus fpp_p2p_host_peer_count(const struct FppP2pHost *host, uint32_t *out);
+
+// # Safety
+// `host` NULL or a live handle; not used afterwards.
+void fpp_p2p_host_free(struct FppP2pHost *host);
+
+// Start joining the host at `host_addr`. `host_static_public`: 32 bytes from
+// the invite (never from the network). `invite_secret`: 32 bytes or NULL.
+// `session_key`: this player's FPP session key, which proves itself to the
+// host now and signs InputCommits later. `attestation`: this device's
+// Attestation Result, or empty (≤ `FPP_P2P_MAX_ATTESTATION`). `hello`:
+// title bytes for the host (≤ `FPP_P2P_MAX_HELLO`). The first handshake
+// datagram is queued; drain `fpp_p2p_joiner_poll_transmit`.
+//
+// # Safety
+// Pointers valid as documented; `out` valid for a pointer write.
+enum FppStatus fpp_p2p_joiner_new(const uint8_t *host_static_public,
+                                  const uint8_t *invite_secret,
+                                  const struct FppSigner *session_key,
+                                  const uint8_t *attestation,
+                                  size_t attestation_len,
+                                  const uint8_t *hello,
+                                  size_t hello_len,
+                                  const uint8_t *host_addr,
+                                  size_t host_addr_len,
+                                  struct FppP2pJoiner **out);
+
+// Feed one datagram received from `from`. Non-OK: it was dropped.
+//
+// # Safety
+// `joiner` a live handle; `from` valid for `from_len`; `datagram` valid for `len`.
+enum FppStatus fpp_p2p_joiner_recv(struct FppP2pJoiner *joiner,
+                                   const uint8_t *from,
+                                   size_t from_len,
+                                   const uint8_t *datagram,
+                                   size_t len);
+
+// Queue an application datagram for the host (≤ `FPP_P2P_MAX_PAYLOAD`).
+// `FPP_STATUS_P2P_STATE` until connected.
+//
+// # Safety
+// `joiner` a live handle; `payload` valid for `len` bytes.
+enum FppStatus fpp_p2p_joiner_send(struct FppP2pJoiner *joiner, const uint8_t *payload, size_t len);
+
+// Queue a message on the reliable ordered channel (≤ `FPP_P2P_MAX_MESSAGE`).
+//
+// # Safety
+// `joiner` a live handle; `payload` valid for `len` bytes.
+enum FppStatus fpp_p2p_joiner_send_reliable(struct FppP2pJoiner *joiner,
+                                            const uint8_t *payload,
+                                            size_t len);
+
+// Advance time (monotonic ms): queues an ack and due retransmissions.
+// Call once per game tick.
+//
+// # Safety
+// `joiner` a live handle.
+enum FppStatus fpp_p2p_joiner_tick(struct FppP2pJoiner *joiner, uint64_t now_ms);
+
+// Queue an empty keepalive.
+//
+// # Safety
+// `joiner` a live handle.
+enum FppStatus fpp_p2p_joiner_keepalive(struct FppP2pJoiner *joiner);
+
+// Queue a fresh handshake if not connected yet (call on a retry timer,
+// e.g. every 500 ms). No effect once connected.
+//
+// # Safety
+// `joiner` a live handle.
+enum FppStatus fpp_p2p_joiner_retry(struct FppP2pJoiner *joiner);
+
+// Tell the host we leave (`reason`: an `fpp_types::Reason` code), then stop.
+//
+// # Safety
+// `joiner` a live handle.
+enum FppStatus fpp_p2p_joiner_close(struct FppP2pJoiner *joiner, uint16_t reason);
+
+// Like `fpp_p2p_host_poll_transmit`.
+//
+// # Safety
+// As for `fpp_p2p_host_poll_transmit`, with a live joiner handle.
+enum FppStatus fpp_p2p_joiner_poll_transmit(struct FppP2pJoiner *joiner,
+                                            uint8_t *to,
+                                            size_t to_cap,
+                                            size_t *to_len,
+                                            uint8_t *packet,
+                                            size_t cap,
+                                            size_t *len);
+
+// Like `fpp_p2p_host_poll_event`.
+//
+// # Safety
+// As for `fpp_p2p_host_poll_event`, with a live joiner handle.
+enum FppStatus fpp_p2p_joiner_poll_event(struct FppP2pJoiner *joiner,
+                                         struct FppP2pEvent *event,
+                                         uint8_t *data,
+                                         size_t cap);
+
+// # Safety
+// `joiner` NULL or a live handle; not used afterwards.
+void fpp_p2p_joiner_free(struct FppP2pJoiner *joiner);
 
 #ifdef __cplusplus
 }  // extern "C"

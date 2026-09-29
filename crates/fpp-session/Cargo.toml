@@ -1,0 +1,20 @@
+[package]
+name = "fpp-session"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Fair-Play Protocol v1: secure player-hosted sessions (Noise IK over UDP, replay window, path validation), sans-I/O"
+
+[dependencies]
+fpp-types = { path = "../fpp-types" }
+fpp-wire = { path = "../fpp-wire" }
+fpp-crypto = { path = "../fpp-crypto" }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+# Noise Protocol Framework. Pure Rust (RustCrypto primitives), so it builds for
+# i686, Android, iOS and wasm alike; no ring, no C.
+snow = { version = "0.10", default-features = false, features = ["use-chacha20poly1305", "use-sha2", "use-curve25519", "use-getrandom"] }
+curve25519-dalek = { version = "4.1", default-features = false }
+subtle = "2.6"

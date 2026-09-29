@@ -1,270 +1,140 @@
+//! Prototype control-plane messages (QUIC, bincode-framed) and the reference
+//! title's game payloads.
+//!
+//! FPP objects themselves (ARs, SATs, SARs, Checkpoints, InputCommits) travel
+//! as opaque signed bytes inside these messages and are verified with
+//! `fpp-tokens` / `fpp-crypto`; bincode only frames the envelope. Game data
+//! between clients and the GS uses `fpp-session` (ADR-002), not these types.
+
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 
-/// Unified signature type: ed25519 signature bytes (64 bytes).
-/// Some sigs are still Vec<u8> (e.g. Heartbeat.sig_gs) and will eventually
-/// become [u8;64] everywhere.
+/// Signature bytes (Ed25519, 64 bytes).
 pub type Sig = Vec<u8>;
 
 pub type OpId = [u8; 16];
 
-// Re-export TPM types for protocol use
 pub use crate::tpm::TpmQuote;
 
-/// GS → VS during admission.
+/// Who is opening a control connection to the VS.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerRole {
+    GameServer,
+    Client,
+}
+
+/// First message on a control connection: asks for a single-use challenge.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ChallengeRequest {
+    pub version: u32,
+    pub role: PeerRole,
+}
+
+/// VS → peer: single-use nonce. A GS's join TPM quote must cover it (F04);
+/// a client's session key signs it to prove possession.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AttestChallenge {
+    pub nonce: [u8; 32],
+}
+
+// ---------------------------------------------------------------- GS <-> VS
+
+/// GS → VS during admission, after `AttestChallenge`.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct JoinRequest {
     pub gs_id: String,
-
-    /// Hash of the GS binary (attestation / build identity).
+    /// Hash of the GS binary (build identity; self-reported until P3, F06).
     pub sw_hash: [u8; 32],
-
-    /// Wallclock time (ms since Unix epoch) when this was signed.
     pub t_unix_ms: u64,
-
-    /// Anti-replay nonce.
     pub nonce: [u8; 16],
-
-    /// Ephemeral per-session GS public key (Ed25519).
+    /// Per-session Ed25519 **instance key**: signs this GS's Checkpoints;
+    /// SARs certify it (`cnf`), SATs name its digest (`aud`).
     pub ephemeral_pub: [u8; 32],
-
-    /// Signature by GS long-term key over the canonical JoinRequest body.
+    /// Static X25519 key of the GS's fpp-session game port (SAR `noise_static`).
+    pub noise_static: [u8; 32],
+    /// Where clients reach the game port (UDP), e.g. "127.0.0.1:50000".
+    pub game_addr: String,
+    /// Signature by the GS long-term key over `join_request_sign_bytes`.
     pub sig_gs: Sig,
-
-    /// GS long-term public key (Ed25519).
     pub gs_pub: [u8; 32],
-
-    /// Optional TPM attestation quote (for hardware root of trust).
-    /// If present, VS will verify TPM signature and PCR values.
     pub tpm_quote: Option<TpmQuote>,
 }
 
 /// VS → GS after admitting it.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct JoinAccept {
-    /// VS-minted session ID (random 16 bytes).
+    /// VS-minted session id; also the match id of the match this GS hosts.
     pub session_id: [u8; 16],
-
     /// VS signature binding this session_id to the GS.
     pub sig_vs: Sig,
-
-    /// VS long-term public key (Ed25519).
     pub vs_pub: [u8; 32],
 }
 
-/// VS → GS (and then GS → client).
-/// This is "proof GS is currently blessed."
+/// VS → GS: the next Server Attestation Result in this instance's chain
+/// (successor of the PlayTicket, 04 §6.3). Every ~2 s while blessed.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct PlayTicket {
-    pub session_id: [u8; 16],
+pub struct SarIssue {
+    pub sar: Vec<u8>,
+}
 
-    /// Optional binding to a specific client pubkey.
-    /// [0u8;32] means "any client".
-    pub client_binding: [u8; 32],
+/// GS → VS: one signed Checkpoint per epoch (04 §8.1), replacing the
+/// Heartbeat + TranscriptDigest pair. Optionally carries a TPM
+/// re-attestation quote seeded by the SAR with sequence `quote_sar_seq`.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CheckpointSubmit {
+    pub checkpoint: Vec<u8>,
+    pub tpm_quote: Option<TpmQuote>,
+    pub quote_sar_seq: u64,
+}
 
-    /// Monotonic counter (1,2,3,...) per session.
-    pub counter: u64,
+// ---------------------------------------------------------------- client <-> VS
 
-    /// Earliest ms timestamp this ticket is allowed to be used.
-    pub not_before_ms: u64,
-
-    /// Latest ms timestamp this ticket is allowed to be used.
-    pub not_after_ms: u64,
-
-    /// Hash(chain) of previous ticket body. Lets client/GS detect gaps or forks.
-    pub prev_ticket_hash: [u8; 32],
-
-    /// VS signature on the canonical tuple:
-    /// (session_id, client_binding, counter, not_before_ms, not_after_ms, prev_ticket_hash)
+/// Client → VS after `AttestChallenge`: device evidence for the (stub)
+/// Verifier and an admission request for the (stub) Broker.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ClientAdmissionRequest {
+    /// Ed25519 session key the AR and SAT will be bound to.
+    pub session_pub: [u8; 32],
+    /// Session-key signature over `client_admission_sign_bytes` (proof of
+    /// possession, bound to the challenge).
     #[serde(with = "BigArray")]
-    pub sig_vs: [u8; 64],
+    pub pop_sig: [u8; 64],
+    pub platform: String,
+    pub client_build: [u8; 32],
+    pub queue: String,
+    /// Platform evidence (TPM quote, Play Integrity token, ...), opaque to
+    /// everyone but the Verifier. Empty: no evidence (tier D0).
+    pub evidence: Vec<u8>,
 }
 
-/// Client → GS as the very first message to materialize the QUIC bi-stream.
-///
-/// In QUIC (quinn), a bi-stream created via `open_bi()` is NOT visible to the
-/// peer's `accept_bi()` until data actually flows on it. This means:
-///   - Client calls `open_bi()` → gets (SendStream, RecvStream)
-///   - Client waits on RecvStream for ServerHello
-///   - GS calls `accept_bi()` → BLOCKS forever because no data has flowed
-///
-/// The fix: client MUST send something first. This `ClientHello` message
-/// serves that purpose and also provides early client identification.
+/// VS → client.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ClientHello {
-    /// Client's public key (for early identification/binding check).
-    pub client_pub: [u8; 32],
-    /// Protocol version (for future compatibility).
-    pub protocol_version: u32,
-}
-
-impl ClientHello {
-    /// Current protocol version. Bump when making breaking changes.
-    pub const CURRENT_PROTOCOL_VERSION: u32 = 1;
-
-    /// Create a new ClientHello with the current protocol version.
-    pub fn new(client_pub: [u8; 32]) -> Self {
-        Self {
-            client_pub,
-            protocol_version: Self::CURRENT_PROTOCOL_VERSION,
-        }
-    }
-}
-
-/// GS → client as first response after receiving ClientHello.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ServerHello {
-    pub session_id: [u8; 16],
-    pub ticket: PlayTicket,
-    pub vs_pub: [u8; 32],
-}
-
-/// Client → GS input packet (one per "frame"/tick).
-/// The client staples a recent VS-signed PlayTicket and signs the whole thing.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ClientInput {
-    /// Which GS session this input is for.
-    pub session_id: [u8; 16],
-
-    /// Which PlayTicket this input is stapled to.
-    pub ticket_counter: u64,
-
-    /// Exact VS signature from that PlayTicket.
-    /// (GS will check it matches the latest ticket it forwarded.)
-    #[serde(with = "BigArray")]
-    pub ticket_sig_vs: [u8; 64],
-
-    /// Client-side strictly monotonic nonce (1,2,3,...).
-    pub client_nonce: u64,
-
-    /// The actual command (Move, etc.).
-    pub cmd: ClientCmd,
-
-    /// Ephemeral/peristent client pubkey (Ed25519, 32 bytes) for this player.
-    pub client_pub: [u8; 32],
-
-    /// Client signature (Ed25519, 64 bytes) over canonical tuple:
-    /// (session_id,
-    ///  ticket_counter,
-    ///  ticket_sig_vs,
-    ///  client_nonce,
-    ///  cmd)
-    #[serde(with = "BigArray")]
-    pub client_sig: [u8; 64],
-}
-
-/// GS authoritative events that matter for transcript / audit / replay.
-/// We hash these into receipt_tip so GS can't rewrite history later.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum AuthoritativeEvent {
-    MoveResolved {
-        who: [u8; 32],
-        x: f32,
-        y: f32,
-        tick: u64,
+pub enum ClientAdmission {
+    Granted {
+        ar: Vec<u8>,
+        sat: Vec<u8>,
+        /// The game server to join and its static key (checked against its SAR).
+        gs_addr: String,
+        gs_noise_static: [u8; 32],
+    },
+    Refused {
+        /// `fpp_types::Reason` code.
+        code: u16,
     },
 }
 
-/// GS → client: snapshot of world state for rendering / HUD / etc.
-///
-/// This is what the future Vulkan/wgpu client will consume.
-/// We no longer send session_id here; the client already knows which session it's in.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct WorldSnapshot {
-    pub tick: u64,
-    pub you: (f32, f32),
-    pub others: Vec<([u8; 32], f32, f32)>,
-}
+// ---------------------------------------------------------------- title payloads
 
-/// GS → client: "Here's a fresher PlayTicket from VS, use this now."
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct TicketUpdate {
-    pub ticket: PlayTicket,
-}
-
-/// Messages flowing Client -> GS over the local TCP link.
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
-pub enum ClientToGs {
-    Input(Box<ClientInput>),
-    Bye,
-}
-
-/// Messages flowing GS -> Client over the local TCP link.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum GsToClient {
-    ServerHello(ServerHello),
-    WorldSnapshot(WorldSnapshot),
-    TicketUpdate(TicketUpdate),
-}
-
-// -------------------------
-// GS <-> VS runtime protocol
-// -------------------------
-
-/// GS → VS heartbeat (~2s).
-/// Proves liveness and re-attests code identity and transcript tip.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct Heartbeat {
-    pub session_id: [u8; 16],
-
-    /// Monotonic GS counter (1,2,3,...). VS kills session if it stalls or regresses.
-    pub gs_counter: u64,
-
-    /// GS local time in ms (used for debug / replay forensics).
-    pub gs_time_ms: u64,
-
-    /// Rolling hash / commitment of accepted client inputs + authoritative GS outcomes.
-    pub receipt_tip: [u8; 32],
-
-    /// sw_hash of the GS binary this tick.
-    /// VS compares this to the allowlist and to the hash from JoinRequest.
-    pub sw_hash: [u8; 32],
-
-    /// Priority 2 (Ghost Snapshot fix): sha256 of bincode-serialised player positions
-    /// at this tick.  Including this field in the signed Heartbeat cryptographically
-    /// commits the GS to a specific positions array *before* the TranscriptDigest is
-    /// sent.  The VS enforcer extracts this value from the verified signature and
-    /// checks sha256(td.positions) == hb.snapshot_root, so a rogue GS cannot swap
-    /// in a fake positions array after signing.
-    pub snapshot_root: [u8; 32],
-
-    /// Signature by GS's ephemeral session key over the canonical heartbeat bytes.
-    pub sig_gs: Sig,
-
-    /// Optional TPM re-attestation quote (proves code hasn't changed).
-    /// If present during continuous operation, VS verifies PCR values match initial state.
-    pub tpm_quote: Option<TpmQuote>,
-}
-
-/// GS → VS: "Here's my current transcript digest at counter C."
-/// VS can sanity-check movement and physics using these positions.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct TranscriptDigest {
-    pub session_id: [u8; 16],
-    pub gs_counter: u64,
-    pub receipt_tip: [u8; 32],
-
-    /// Player positions as GS claims them *right now*.
-    /// Vec of (player_pubkey, x, y).
-    pub positions: Vec<([u8; 32], f32, f32)>,
-
-    /// Priority 1 (DA Black Hole fix): raw bytes of every ClientInput accepted
-    /// by the GS since the previous TranscriptDigest.  The VS writes these to
-    /// durable DA storage *before* signing the ProtectedReceipt, so an auditor
-    /// can always reconstruct the transcript even if the GS later goes rogue
-    /// and deletes its local ledger.
-    pub da_payload: Vec<Vec<u8>>,
-}
-
-/// VS → GS. VS signs what GS claimed, so GS can't deny it later.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ProtectedReceipt {
-    pub session_id: [u8; 16],
-    pub gs_counter: u64,
-    pub receipt_tip: [u8; 32],
-
-    /// VS signature binding (session_id, gs_counter, receipt_tip).
-    pub sig_vs: Sig,
+/// The reference title's input intent (04 §7.3 payload): what the player
+/// wants, never positions or outcomes.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum ClientCmd {
+    Move {
+        dx: f32,
+        dy: f32,
+    },
+    /// Value-changing example, idempotent via `op_id`.
+    SpendCoins(SpendCoins),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -273,9 +143,12 @@ pub struct SpendCoins {
     pub amount: u64,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub enum ClientCmd {
-    Move { dx: f32, dy: f32 },
-    // Value-changing example (idempotent via op_id)
-    SpendCoins(SpendCoins),
+/// GS → client each tick (unreliable, latest wins).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct WorldSnapshot {
+    pub tick: u64,
+    pub you: (f32, f32),
+    /// Every other player (the prototype has no interest management yet:
+    /// a built-in ESP, INFO-01, roadmap P4).
+    pub others: Vec<(u16, f32, f32)>,
 }

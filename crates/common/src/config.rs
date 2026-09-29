@@ -11,18 +11,12 @@ pub struct VsConfig {
     /// Maximum time skew allowed for JoinRequest timestamp (default: 30s for cross-region).
     pub join_max_skew_ms: u64,
 
-    /// Watchdog timeout for heartbeat liveness (default: 30s, was 10s).
-    /// Should be 3-5x the heartbeat interval to tolerate packet loss.
-    pub heartbeat_timeout_ms: u64,
+    /// Revoke a game server after this long without a verified Checkpoint
+    /// (default: 30 s; Checkpoints arrive once per epoch, about every second).
+    pub checkpoint_timeout_ms: u64,
 
-    /// How long to wait for TranscriptDigest physics verification (default: 10s).
-    pub physics_check_timeout_ms: u64,
-
-    /// Grace period for out-of-order heartbeat vs transcript (default: 5s).
-    pub heartbeat_grace_period_ms: u64,
-
-    /// Deadline for a new connection to finish the QUIC handshake and deliver
-    /// its JoinRequest (default: 10s). Idle connections are dropped after it.
+    /// Deadline for a new connection to finish the QUIC handshake, the
+    /// challenge and its request (default: 10s). Idle connections are dropped.
     pub admission_timeout_ms: u64,
 
     /// Priority 3 (TOFU/TPM fix): allowlist of approved GS binary hashes (sw_hash).
@@ -39,81 +33,29 @@ pub struct VsConfig {
     /// In production, fill this with known-good measurements for the approved OS
     /// and firmware stack so a compromised hypervisor cannot pass attestation.
     pub required_pcr_baselines: std::collections::BTreeMap<u8, [u8; 32]>,
+
+    /// Enrolled TPM attestation keys (Ed25519 AK public keys) allowed to sign
+    /// quotes. A quote carries its own AK, so without enrollment anyone can
+    /// sign a "quote" for any PCR values with a key they made up. If the vec
+    /// is **empty** (dev mode) any AK is accepted at join and then pinned for
+    /// the session. Production replaces this with EK-certificate chains and
+    /// credential activation in the Verifier (roadmap P3).
+    pub trusted_ak_keys: Vec<[u8; 32]>,
+
+    /// Reject a JoinRequest that carries no TPM quote (default: false).
+    pub require_tpm_quote: bool,
 }
 
 impl Default for VsConfig {
     fn default() -> Self {
         Self {
-            join_max_skew_ms: 30_000,     // 30s (was 10s)
-            heartbeat_timeout_ms: 30_000, // 30s (was 10s)
-            physics_check_timeout_ms: 10_000,
-            heartbeat_grace_period_ms: 5_000,
+            join_max_skew_ms: 30_000, // 30s (was 10s)
+            checkpoint_timeout_ms: 30_000,
             admission_timeout_ms: 10_000,
             sw_hash_allowlist: Vec::new(),
             required_pcr_baselines: std::collections::BTreeMap::new(),
-        }
-    }
-}
-
-/// Network robustness configuration for GS (Game Server).
-#[derive(Debug, Clone)]
-pub struct GsConfig {
-    /// Heartbeat send interval (default: 2s).
-    pub heartbeat_interval_ms: u64,
-
-    /// Timeout for first ticket from VS during GS startup (default: 30s, was infinite).
-    pub first_ticket_timeout_ms: u64,
-
-    /// Timeout for VS response to TranscriptDigest (default: 15s, was infinite).
-    pub transcript_response_timeout_ms: u64,
-
-    /// Ticket starvation timeout - marks session revoked (default: 10s, was 2.5s).
-    /// Should be 3-5x the ticket interval to tolerate VS slowness.
-    pub ticket_starvation_timeout_ms: u64,
-
-    /// Retry configuration for network operations.
-    pub retry: RetryConfig,
-
-    /// Maximum QUIC stream concurrency (default: 100).
-    pub max_concurrent_streams: u64,
-}
-
-impl Default for GsConfig {
-    fn default() -> Self {
-        Self {
-            heartbeat_interval_ms: 2_000,
-            first_ticket_timeout_ms: 30_000,
-            transcript_response_timeout_ms: 15_000,
-            ticket_starvation_timeout_ms: 10_000, // Much more lenient than 2.5s
-            retry: RetryConfig::default(),
-            max_concurrent_streams: 100,
-        }
-    }
-}
-
-/// Network robustness configuration for Client.
-#[derive(Debug, Clone)]
-pub struct ClientConfig {
-    /// Timeout for ServerHello handshake (default: 5s, was 3s).
-    pub hello_timeout_ms: u64,
-
-    /// Retry configuration for handshake.
-    pub retry: RetryConfig,
-
-    /// Tolerance for ticket time window (default: 1000ms, was 500ms).
-    pub ticket_time_grace_ms: u64,
-
-    /// Maximum nonce jump allowed for out-of-order packets (default: 8, was 4).
-    pub nonce_window: u64,
-}
-
-impl Default for ClientConfig {
-    fn default() -> Self {
-        Self {
-            hello_timeout_ms: 5_000,
-            retry: RetryConfig::default(),
-            ticket_time_grace_ms: 1_000,
-            nonce_window: 8,
+            trusted_ak_keys: Vec::new(),
+            require_tpm_quote: false,
         }
     }
 }

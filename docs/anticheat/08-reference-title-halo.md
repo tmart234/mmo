@@ -77,7 +77,7 @@ Hook points (file names from the port):
 
 | FPP element | Where it attaches in Halo | Notes |
 |-------------|---------------------------|-------|
-| Session transport + admission (04 §7.1–7.2) | `port/linux/src/p2p.c`, `p2p_signal.c`: replace the tunnel's keying and sealing with the SDK's QUIC session. P2P mode puts the host key fingerprint in the invite. Verified mode adds SAT + PoP. | Fixes H03–H05. The game still sees a LAN (keep the `xnet.c` stand-ins). |
+| Session transport + admission (04 §7.7; §7.1–7.2 in verified mode) | `port/linux/src/p2p.c`, `p2p_signal.c`: replace the tunnel's keying and sealing with `fpp_p2p_host_*` / `fpp_p2p_joiner_*` over the existing UDP socket. The invite carries the host's static public key and an invite secret. Verified mode adds SAT + PoP. | Fixes H03–H05. The game still sees a LAN (keep the `xnet.c` stand-ins). |
 | Input frames (04 §7.3) | The existing per-tick `_message_client_game_update` (`source/networking/network_game_globals.c:665` in the port, `:596` in the decomp) plus distributed predictions and hit reports | Title payload stays as is. |
 | **InputCommit** (04 §7.4) | Client branch of `network_distributed_tick()` (`network_distributed.c`): Merkle root per epoch over the client's own actions, position reports and hit reports, signed with the session key | ≈ 100 B/s per player |
 | **Checkpoint** (04 §8.1) | Host branch of `network_distributed_tick()`: `inputs_root` over everything the host accepted, `events_root` over damage/deaths/pickups/scores it decided, `state_root` over the unit states it sends, randomness from `get_random_seed()` | Signed by the host's instance or session key |
@@ -130,7 +130,7 @@ each needs from the `mmo` roadmap ([07](07-gap-analysis-and-roadmap.md) §4).
 | **H0 Run it** | Build the port. You supply your own disc image. Play a two-machine LAN or invite match; run `debug.network_test` with scripted bots. | Two machines, one match, both logs agree | — |
 | **H1 Red-team clients** | In the fork, behind a debug-only flag: a client that exploits H01 (movement steps), H02 (unobstructed-path gap), and H06 (reads relayed state as a radar); plus a cheating host (H09) | Each attack reproducibly works against the stock netcode | — |
 | **H2 Host hardening** | Fix H01 and H02; turn every host rejection into a structured Signal (JSON log first) | H1 attacks rejected and flagged; no false rejects in a scripted-bot soak under `debug.network_latency` / `debug.network_loss` | — |
-| **H3 Transport** | Replace tunnel keying and sealing (H03–H05) with the SDK's QUIC session; host key fingerprint in invites | An invite holder can no longer decrypt or impersonate another player (test) | P0, P1 (`fpp-wire`, `fpp-crypto`, C ABI) |
+| **H3 Transport** | Replace tunnel keying and sealing (H03–H05) with the SDK's P2P session (Noise IK); host static key in invites | An invite holder can no longer decrypt or impersonate another player (test) | ✅ SDK side (M2): `fpp-session`, `fpp_p2p_*`; attack tests in `crates/fpp-session/tests/attacks.rs` and `crates/fpp-ffi/tests/c/p2p.c`. Glue in the fork remains |
 | **H4 Evidence and audit** | InputCommits, host Checkpoints and a local evidence bundle; headless replay auditor; a determinism check of the distributed netcode across Linux, Windows and Android | The auditor flags the H1 cheating host; identical replays across platforms | P1 (`fpp-merkle`, `fpp-tokens`) |
 | **H5 Verified playlists** | Dedicated headless host mode, Verifier + Broker + SAR from `mmo`, device tiers, segregated pools | Tiered matchmaking in a staging deployment | P2, P3 |
 | **H6 Anti-ESP** | Host-side relevance filtering in the distributed netcode | The radar client from H1 loses occluded players, with no visible pop-in at normal latency | — |
@@ -192,7 +192,7 @@ halo-ce-universal fork                         mmo
 │  network_distributed.c  ─┐           │       │  ├ keys, digests             │
 │  network_damage.c       ─┼─ hooks ──►│ glue  │  ├ InputCommit builder/verify│
 │  p2p.c / p2p_signal.c   ─┘           │ (C)  ─┼─►├ Checkpoint builder/verify │
-│ host validators (H01/H02 fixes, C)   │       │  └ (M2) secure P2P session   │
+│ host validators (H01/H02 fixes, C)   │       │  └ fpp_p2p_* secure session  │
 │ evidence bundle on disk              │       │ fpp-wire / fpp-crypto / merkle│
 └──────────────────────────────────────┘       └──────────────────────────────┘
 ```
@@ -201,9 +201,12 @@ What the glue does with the SDK (distributed netcode, player-hosted):
 
 | Where | When | SDK calls |
 |-------|------|-----------|
-| Client join | Once per match | `fpp_signer_generate` (session key); send the public key to the host with the join |
+| Host start | Once per match | `fpp_p2p_keypair_generate` (or a saved key + `fpp_p2p_public_key`); put the public key and a random invite secret in the invite; `fpp_p2p_host_new` |
+| Client join | Once per match | `fpp_signer_generate` (session key); `fpp_p2p_joiner_new` with the invite's host key and secret, the session key, and the device's AR if it has one. The host learns the session key from `FPP_P2P_EVENT_KIND_PEER_JOINED` |
+| Both, socket I/O | Every datagram | `fpp_p2p_*_recv` on each received datagram; `fpp_p2p_*_send` for game packets; drain `fpp_p2p_*_poll_transmit` into `sendto` and `fpp_p2p_*_poll_event`; joiner calls `fpp_p2p_joiner_retry` every ~500 ms until connected |
+| Both, game tick | Every tick | `fpp_p2p_*_tick(now_ms)` (acks and retransmissions for the reliable channel), then drain transmits |
 | Client, `network_distributed_tick()` | Every tick | `fpp_input_commit_add_frame(tick, bytes)` with the tick's action update, own-position report and hit reports |
-| Client, epoch end | Every `ticks_per_epoch` | `fpp_input_commit_sign`; send reliably; keep `fpp_object_digest` as the next `prev` |
+| Client, epoch end | Every `ticks_per_epoch` | `fpp_input_commit_sign`; send with `fpp_p2p_joiner_send_reliable`; keep `fpp_object_digest` as the next `prev` |
 | Host, per slot | Every tick | Its own builder over the frames it *received*; at epoch end `fpp_verify_input_commit` (player's key) and compare `frames_root` with `fpp_input_commit_frames_root`; a mismatch is a Signal |
 | Host, epoch end | Every epoch | `fpp_checkpoint_begin`; `add_input` per slot (commit digest, applied bitset); `add_event` for damage, deaths, pickups and scores it decided; `add_roster`; `fpp_checkpoint_sign` with the host instance key; send the digest to every client |
 | Everyone | Match end | Write the evidence bundle (frames, commits, checkpoints) to disk; clients `fpp_verify_checkpoint` the host's objects. Any player can later prove what the host did (H09). |
@@ -213,7 +216,7 @@ Milestones (each builds on the previous; M1 is done):
 | # | Milestone | Status / exit |
 |---|-----------|---------------|
 | **M1** | C SDK for evidence primitives (`fpp-ffi`), 32- and 64-bit | ✅ The C conformance program (`make ffi-c-test`, `ffi-c-test-i686`) signs objects byte-identical to the golden vectors, verified by the independent Python implementation. Linked statically into a local build of the 32-bit port, it runs at start-up: `fpp-probe: SDK ABI 1, signed a 312-byte InputCommit for 30 ticks, verify: ok`. |
-| **M2** | Secure P2P session in the SDK: authenticated key exchange with the host's static key fingerprint in the invite, per-packet counters with a replay window, path validation before endpoint changes | Replaces the port's tunnel keying (fixes H03–H05). Proposed construction: Noise IK/XX over the port's existing UDP tunnel. It fits its datagram design better than embedding a QUIC stack in the game loop. Decide when M2 starts. |
+| **M2** | Secure P2P session in the SDK: authenticated key exchange with the host's static key in the invite, per-packet counters with a replay window, path validation before endpoint changes | ✅ `crates/fpp-session` + `fpp_p2p_*` (04 §7.7): `Noise_IK_25519_ChaChaPoly_SHA256` over the port's existing UDP socket, session key bound by a signed AdmitPop, 2048-packet replay window, challenge-response path validation, AR slot for tiered lobbies. Attack tests (invite holder cannot read or forge, replay, raced-packet redirect, NAT rebinding) pass in Rust and through the C ABI on x86_64 and i686. Wiring it into `p2p.c` is part of M3. |
 | **M3** | Fork + glue: evidence recording as in the table above; host validators fixing H01/H02 emit structured Signals | Red-team clients from H1 are rejected or flagged; each match leaves a verifiable evidence bundle |
 | **M4** | Headless replay auditor built from the port | Re-simulates host decisions from a bundle; flags a cheating host; identical results on Linux, Windows and Android |
 | **M5** | Verified playlists: dedicated host mode, Verifier/Broker/SAR from `mmo`, device tiers (Windows, Android) | Needs roadmap P2 and P3 |

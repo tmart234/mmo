@@ -32,8 +32,6 @@ allow = [
     "CC0-1.0",
     "BSL-1.0",
     "0BSD",
-    # Mozilla CA certificate data (webpki roots)
-    "CDLA-Permissive-2.0",
 ]
 
 [bans]

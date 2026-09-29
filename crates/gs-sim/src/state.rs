@@ -1,31 +1,16 @@
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 
-use common::proto::{OpId, PlayTicket};
-use ed25519_dalek::VerifyingKey;
+use common::proto::OpId;
 use lru::LruCache;
 use std::num::NonZeroUsize;
-
-use crate::ledger::Ledger;
 
 /// Maximum number of processed operations to track per player.
 /// Sized to cover ~10 minutes of rapid operations at 10 ops/sec.
 const OP_CACHE_SIZE: usize = 6000;
 
-/// Verified PlayTickets kept for client handlers (~64 s at one ticket per 2 s).
-pub const TICKET_HISTORY_MAX: usize = 32;
-
 #[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
 pub enum CmdKey {
     Move, // future: Econ, Craft, etc.
-}
-
-/// Per-player world state tracked by GS.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct PlayerState {
-    pub x: f32,
-    pub y: f32,
-    pub last_nonce: u64,
 }
 
 /// Result of a processed economy operation (for idempotent replay).
@@ -82,88 +67,6 @@ impl Default for PlayerRuntime {
     }
 }
 
-/// Global mutable GS session state shared across tasks.
-/// Wrapped as `Shared = Arc<Mutex<GsShared>>`.
-#[derive(Debug)]
-pub struct GsShared {
-    // Session basics
-    pub session_id: [u8; 16],
-    pub vs_pub: VerifyingKey,
-    pub sw_hash: [u8; 32], // included so heartbeat can attach it
-
-    // Rolling transcript tip advertised in heartbeats
-    pub receipt_tip: [u8; 32],
-
-    // Verified PlayTickets in chain order, newest last. Client handlers read
-    // this rather than the ticket watch channel (which can skip values), so
-    // every client can be sent every ticket and verify the chain end to end.
-    pub ticket_history: VecDeque<PlayTicket>,
-    pub last_ticket_ms: u64,
-
-    // World state
-    pub players: HashMap<[u8; 32], PlayerState>,
-
-    // Trust state
-    pub revoked: bool,
-
-    // Economy/audit (initialized on first use)
-    pub ledger: Option<Ledger>,
-
-    // Runtime buckets / guards (initialized on first use)
-    pub runtime: Option<PlayerRuntime>,
-
-    /// Priority 1 (DA Black Hole fix): accumulates raw bincode bytes of every
-    /// accepted ClientInput since the last TranscriptDigest was sent.
-    /// The heartbeat loop drains this buffer and ships it as
-    /// TranscriptDigest.da_payload so the VS can write it to durable DA
-    /// storage before signing the ProtectedReceipt.
-    pub da_buffer: Vec<Vec<u8>>,
-}
-
-impl GsShared {
-    pub fn new(session_id: [u8; 16], vs_pub: VerifyingKey, sw_hash: [u8; 32]) -> Self {
-        Self {
-            session_id,
-            vs_pub,
-            sw_hash,
-            receipt_tip: [0u8; 32],
-
-            ticket_history: VecDeque::new(),
-            last_ticket_ms: 0,
-
-            players: HashMap::new(),
-            revoked: false,
-
-            ledger: None,
-            runtime: None,
-            da_buffer: Vec::new(),
-        }
-    }
-
-    /// Record a ticket that passed chain verification.
-    pub fn push_ticket(&mut self, ticket: PlayTicket, now_ms: u64) {
-        self.ticket_history.push_back(ticket);
-        while self.ticket_history.len() > TICKET_HISTORY_MAX {
-            self.ticket_history.pop_front();
-        }
-        self.last_ticket_ms = now_ms;
-    }
-
-    /// Tickets newer than `counter`, oldest first.
-    pub fn tickets_after(&self, counter: u64) -> Vec<PlayTicket> {
-        self.ticket_history
-            .iter()
-            .filter(|t| t.counter > counter)
-            .cloned()
-            .collect()
-    }
-
-    /// Get or initialize the player runtime (lazy init).
-    pub fn runtime_mut(&mut self) -> &mut PlayerRuntime {
-        self.runtime.get_or_insert_with(PlayerRuntime::new)
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct TokenBucket {
     capacity: f32,
@@ -196,8 +99,6 @@ impl TokenBucket {
         }
     }
 }
-
-pub type Shared = Arc<Mutex<GsShared>>;
 
 #[cfg(test)]
 mod tests {

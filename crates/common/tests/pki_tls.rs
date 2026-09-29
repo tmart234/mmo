@@ -70,6 +70,47 @@ async fn rejects_certificate_for_another_name() {
     );
 }
 
+/// FPP-T1: the control links agree on the hybrid post-quantum group
+/// X25519MLKEM768, so recorded traffic resists later quantum decryption.
+#[test]
+fn handshake_negotiates_hybrid_post_quantum_key_exchange() {
+    use rustls::{ClientConnection, NamedGroup, ServerConnection};
+    use std::sync::Arc;
+
+    let pki = DevPki::generate().unwrap();
+    let client_cfg = Arc::new(pki::tls_client_config(&pki.ca_cert_der).unwrap());
+    let server_cfg = Arc::new(pki::tls_server_config(&pki.vs).unwrap());
+    let name = pki::VS_SERVER_NAME.try_into().unwrap();
+    let mut client = ClientConnection::new(client_cfg, name).unwrap();
+    let mut server = ServerConnection::new(server_cfg).unwrap();
+
+    // Shuttle bytes in memory until both sides finish the handshake.
+    for _ in 0..10 {
+        let mut buf = Vec::new();
+        while client.wants_write() {
+            client.write_tls(&mut buf).unwrap();
+        }
+        server.read_tls(&mut buf.as_slice()).unwrap();
+        server.process_new_packets().unwrap();
+        let mut buf = Vec::new();
+        while server.wants_write() {
+            server.write_tls(&mut buf).unwrap();
+        }
+        client.read_tls(&mut buf.as_slice()).unwrap();
+        client.process_new_packets().unwrap();
+        if !client.is_handshaking() && !server.is_handshaking() {
+            break;
+        }
+    }
+    assert!(!client.is_handshaking());
+    let group = client.negotiated_key_exchange_group().unwrap().name();
+    assert_eq!(group, NamedGroup::X25519MLKEM768);
+    assert_eq!(
+        server.negotiated_key_exchange_group().unwrap().name(),
+        group
+    );
+}
+
 #[test]
 fn ensure_dev_pki_writes_once() {
     let dir = std::env::temp_dir().join(format!("mmo-pki-{}", std::process::id()));

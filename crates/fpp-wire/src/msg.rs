@@ -139,7 +139,7 @@ impl InputLeaf {
 }
 
 /// GS-instance-signed commitment per match per epoch (§8.1). Replaces the
-/// prototype's Heartbeat + TranscriptDigest pair with one object.
+/// prototype's former Heartbeat + TranscriptDigest pair with one object.
 ///
 /// Every Merkle root is signed together with its leaf count: RFC 9162
 /// inclusion proofs do not authenticate the tree size on their own.
@@ -235,6 +235,59 @@ impl Payload for Checkpoint {
             rng_n: m.u32("rng_n")?,
             roster_root: Digest(m.fixed("roster_root")?),
             roster_n: m.u32("roster_n")?,
+        })
+    }
+}
+
+/// Proof that the holder of a session key opened one specific secure channel
+/// (04-protocol.md §5.2 `pop_sig`, §7.7). Signed with the session key under
+/// `fpp/1/admit-pop`, so the key that later signs InputCommits is bound to
+/// the channel its frames arrived on, and a relayed proof fails elsewhere.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdmitPop {
+    /// Channel type, e.g. [`AdmitPop::NOISE_IK`].
+    pub channel: String,
+    /// Channel binding. For `NOISE_IK`: host static key ‖ joiner static key.
+    pub binding: Vec<u8>,
+}
+
+impl AdmitPop {
+    /// Player-hosted sessions (fpp-session): Noise IK over UDP.
+    pub const NOISE_IK: &'static str = "fpp-p2p/noise-ik";
+    /// QUIC session plane: TLS exporter ‖ SHA-256(handshake, nonce, SAT cti).
+    pub const QUIC_TLS: &'static str = "fpp/quic-tls";
+    /// Longest accepted channel name.
+    pub const MAX_CHANNEL: usize = 32;
+    /// Accepted binding sizes (a 32-byte exporter up to two 32-byte keys).
+    pub const BINDING_LEN: core::ops::RangeInclusive<usize> = 32..=64;
+}
+
+impl Payload for AdmitPop {
+    const CTX: &'static str = ctx::ADMIT_POP;
+    const CONTENT_TYPE: &'static str = content_type::ADMIT_POP;
+
+    fn to_value(&self) -> Value {
+        text_map([
+            ("channel", Value::text(self.channel.clone())),
+            ("binding", Value::bytes(self.binding.clone())),
+        ])
+    }
+
+    fn from_value(v: &Value) -> Result<Self, WireError> {
+        const WHAT: &str = "AdmitPop";
+        let m = MapView::new(v, WHAT)?;
+        let channel = m
+            .field("channel")?
+            .as_text()
+            .filter(|c| !c.is_empty() && c.len() <= Self::MAX_CHANNEL)
+            .ok_or(WireError::Schema(WHAT, "channel"))?;
+        let binding = m.bytes("binding")?;
+        if !Self::BINDING_LEN.contains(&binding.len()) {
+            return Err(WireError::Schema(WHAT, "binding"));
+        }
+        Ok(Self {
+            channel: channel.to_owned(),
+            binding: binding.to_vec(),
         })
     }
 }

@@ -16,6 +16,9 @@ common = { path = "../crates/common" }
 gs-sim = { path = "../crates/gs-sim" }
 fpp-wire = { path = "../crates/fpp-wire" }
 fpp-crypto = { path = "../crates/fpp-crypto" }
+fpp-session = { path = "../crates/fpp-session" }
+fpp-tokens = { path = "../crates/fpp-tokens" }
+fpp-types = { path = "../crates/fpp-types" }
 
 # Separate workspace: built only by `cargo +nightly fuzz`, never by the main CI.
 [workspace]
@@ -38,6 +41,13 @@ bench = false
 [[bin]]
 name = "fpp_decode"
 path = "fuzz_targets/fpp_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "p2p_recv"
+path = "fuzz_targets/p2p_recv.rs"
 test = false
 doc = false
 bench = false

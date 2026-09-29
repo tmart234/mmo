@@ -1,5 +1,5 @@
 // crates/tools/src/bin/play.rs
-// Launch VS + GS (no --test-once), wait for GS TCP port, then run the Bevy client.
+// Launch VS + GS (no --test-once), give the GS time to join, then run the Bevy client.
 // Cleans up children on Bevy exit or Ctrl-C.
 
 use anyhow::{Context, Result};
@@ -7,7 +7,6 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use std::{
     fs,
-    net::TcpStream,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -61,18 +60,6 @@ fn ensure_vs_keys() -> Result<()> {
     Ok(())
 }
 
-// Poll a TCP addr until it accepts or timeout.
-fn wait_for_tcp(addr: &str, timeout_ms: u64) -> bool {
-    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
-    while std::time::Instant::now() < deadline {
-        if TcpStream::connect(addr).is_ok() {
-            return true;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    false
-}
-
 fn main() -> Result<()> {
     // Profile selector for child binaries (debug by default).
     // Use: PLAY_PROFILE=release make play-release
@@ -115,16 +102,15 @@ fn main() -> Result<()> {
         .spawn()
         .with_context(|| format!("spawn {:?}", gs_sim_bin))?;
 
-    // Wait for GS client TCP port
-    if !wait_for_tcp("127.0.0.1:50000", 8000) {
-        eprintln!("[PLAY] timeout waiting for gs-sim client port at 127.0.0.1:50000");
-        let _ = gs_child.kill();
-        let _ = gs_child.wait();
+    // The game port is UDP (fpp-session): give the GS time to join the VS
+    // and sign its first Checkpoint before the client asks the Broker.
+    thread::sleep(Duration::from_millis(2500));
+    if let Ok(Some(status)) = gs_child.try_wait() {
+        eprintln!("[PLAY] gs-sim exited early ({status})");
         let _ = vs_child.kill();
         let _ = vs_child.wait();
         std::process::exit(1);
     }
-    thread::sleep(Duration::from_millis(600));
 
     // 5) Resolve Bevy client launch plan
     let bevy_bin_candidates = [

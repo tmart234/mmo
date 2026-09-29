@@ -4,6 +4,8 @@ members = [
     "crates/fpp-wire",
     "crates/fpp-crypto",
     "crates/fpp-merkle",
+    "crates/fpp-tokens",
+    "crates/fpp-session",
     "crates/fpp-ffi",
     "crates/common",
     "crates/gs-sim",
@@ -26,10 +28,9 @@ bevy = { version = "0.17.2", default-features = false }
 anyhow = "1.0"
 tokio = { version = "1.48", features = ["full"] }
 
-quinn = { version = "0.11.9", features = ["runtime-tokio", "rustls-ring"] }
-
-# rustls, with "dangerous_configuration" so we can provide a custom cert verifier
-rustls = { version = "0.23.34", features = ["ring"] }
+# QUIC control links (ADR-002). aws-lc-rs provides X25519MLKEM768 (04 §3, FPP-T1).
+quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs", "log", "bloom"] }
+rustls = { version = "0.23.34", default-features = false, features = ["aws_lc_rs", "std", "tls12", "logging"] }
 ctrlc = "3.5"
 bincode = "1.3"
 ed25519-dalek = { version = "2.2", features = ["rand_core"] }
