@@ -4,6 +4,7 @@ members = [
     "crates/fpp-wire",
     "crates/fpp-crypto",
     "crates/fpp-merkle",
+    "crates/fpp-tokens",
     "crates/fpp-session",
     "crates/fpp-ffi",
     "crates/common",

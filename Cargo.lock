@@ -2776,6 +2776,7 @@ version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "fpp-merkle",
+ "fpp-tokens",
  "fpp-types",
  "fpp-wire",
  "hex",
@@ -2821,6 +2822,18 @@ dependencies = [
  "sha2",
  "snow",
  "subtle",
+]
+
+[[package]]
+name = "fpp-tokens"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "fpp-crypto",
+ "fpp-types",
+ "fpp-wire",
+ "hex",
+ "sha2",
 ]
 
 [[package]]

@@ -254,6 +254,8 @@ pub struct AdmitPop {
 impl AdmitPop {
     /// Player-hosted sessions (fpp-session): Noise IK over UDP.
     pub const NOISE_IK: &'static str = "fpp-p2p/noise-ik";
+    /// QUIC session plane: TLS exporter ‖ SHA-256(handshake, nonce, SAT cti).
+    pub const QUIC_TLS: &'static str = "fpp/quic-tls";
     /// Longest accepted channel name.
     pub const MAX_CHANNEL: usize = 32;
     /// Accepted binding sizes (a 32-byte exporter up to two 32-byte keys).

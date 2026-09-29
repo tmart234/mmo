@@ -8,7 +8,12 @@
 use ed25519_dalek::{Signer as _, SigningKey};
 use fpp_crypto::*;
 use fpp_merkle::{leaf_hash, root, root_from_leaf_hashes};
+use fpp_tokens::{
+    instance_id, sar_link, AttestationResult, Features, ServerAttestationResult,
+    SessionAdmissionToken,
+};
 use fpp_types::{ctx, BuildId, Digest, GsInstanceId, MatchId, FPP_VERSION};
+use fpp_types::{DeviceTier, Did, ServerClass};
 use fpp_wire::cbor::{self, Value};
 use fpp_wire::cose::{alg, ProtectedHeader, Sign1};
 use fpp_wire::msg::frame_leaf_data;
@@ -88,6 +93,53 @@ fn admit_pop_json(p: &AdmitPop) -> Json {
     json!({"channel": p.channel, "binding": h(&p.binding)})
 }
 
+fn ar_json(a: &AttestationResult) -> Json {
+    let f = &a.features;
+    let mut feats = serde_json::Map::new();
+    for (k, v) in [
+        ("secure_boot", f.secure_boot),
+        ("measured_boot", f.measured_boot),
+        ("hvci", f.hvci),
+        ("vbs", f.vbs),
+        ("iommu", f.iommu),
+        ("runtime_report", f.runtime_report),
+        ("key_in_hw", f.key_in_hw),
+        ("strong_integrity", f.strong_integrity),
+        ("app_attested", f.app_attested),
+    ] {
+        if let Some(v) = v {
+            feats.insert(k.into(), json!(v));
+        }
+    }
+    if let Some(d) = f.os_patch_age_days {
+        feats.insert("os_patch_age_days".into(), json!(d));
+    }
+    json!({
+        "iss": a.iss, "iat": a.iat, "exp": a.exp, "cti": h(a.cti), "cnf": h(a.cnf),
+        "nonce": h(a.nonce), "did": h(a.did.0), "tier": a.tier as u8, "features": feats,
+        "client_build": h(a.client_build.0), "platform": a.platform,
+        "policy_ver": a.policy_ver, "warnings": a.warnings,
+    })
+}
+
+fn sat_json(s: &SessionAdmissionToken) -> Json {
+    json!({
+        "iss": s.iss, "sub": h(s.sub), "aud": h(s.aud.0), "iat": s.iat, "exp": s.exp,
+        "cti": h(s.cti), "cnf": h(s.cnf), "did": h(s.did.0), "tier": s.tier as u8,
+        "match_id": h(s.match_id.0), "slot": s.slot, "queue": s.queue,
+        "policy_ver": s.policy_ver, "ar_cti": h(s.ar_cti),
+    })
+}
+
+fn sar_json(s: &ServerAttestationResult) -> Json {
+    json!({
+        "iss": s.iss, "sub": h(s.sub.0), "iat": s.iat, "exp": s.exp, "cnf": h(s.cnf),
+        "tls_spki_sha256": s.tls_spki_sha256.map(h), "noise_static": s.noise_static.map(h),
+        "server_class": s.server_class as u8, "build_id": h(s.build_id.0), "region": s.region,
+        "seq": s.seq, "prev": h(s.prev.0), "vrf_pub": s.vrf_pub.map(h),
+    })
+}
+
 fn checkpoint_json(c: &Checkpoint) -> Json {
     json!({
         "match_id": h(c.match_id.0), "gs_instance_id": h(c.gs_instance_id.0),
@@ -155,6 +207,21 @@ fn build() -> Json {
             true,
         ),
         key("log", 0x71, KeyRole::Log, "log", true),
+        key(
+            "verifier-ar",
+            0x11,
+            KeyRole::VerifierAr,
+            "verifier_ar",
+            true,
+        ),
+        key("broker-sat", 0x12, KeyRole::BrokerSat, "broker_sat", true),
+        key(
+            "server-liveness",
+            0x13,
+            KeyRole::ServerLiveness,
+            "server_liveness",
+            true,
+        ),
         key("unregistered", 0x7f, KeyRole::Session, "session", false),
     ];
     let k = |name: &str| keys.iter().find(|k| k.name == name).unwrap();
@@ -340,6 +407,98 @@ fn build() -> Json {
         json!({"signer": "session-slot0", "host_static": h(host_static), "joiner_static": h(joiner_static)}),
     );
 
+    // ---- Tokens (§6): an AR, the SAT it backs, and a two-link SAR chain.
+    const T0: u64 = 1_790_000_000;
+    let session_pub = k("session-slot0").signer.verifying_key().to_bytes();
+    let instance_pub = gs.verifying_key().to_bytes();
+    let ar = AttestationResult {
+        iss: "ver.golden".into(),
+        iat: T0,
+        exp: T0 + 1800,
+        cti: *b"ar-cti-golden-01",
+        cnf: session_pub,
+        nonce: Sha256::digest(b"verifier challenge").into(),
+        did: Did(Sha256::digest(b"device").into()),
+        tier: DeviceTier::D2Hardware,
+        features: Features {
+            secure_boot: Some(true),
+            measured_boot: Some(true),
+            hvci: Some(false),
+            key_in_hw: Some(true),
+            os_patch_age_days: Some(12),
+            ..Features::default()
+        },
+        client_build: BuildId(Sha256::digest(b"client-build-1").into()),
+        platform: "windows".into(),
+        policy_ver: 42,
+        warnings: vec!["os-patch-stale".into()],
+    };
+    let ar_cose = sign(&k("verifier-ar").signer, &ar);
+    valid(
+        "attestation-result/d2",
+        "attestation-result",
+        &ar_cose,
+        ar_json(&ar),
+        json!({"signer": "verifier-ar"}),
+    );
+    let sat = SessionAdmissionToken {
+        iss: "broker.golden".into(),
+        sub: Sha256::digest(b"account").into(),
+        aud: instance_id(&instance_pub),
+        iat: T0,
+        exp: T0 + 3600,
+        cti: *b"sat-cti-golden01",
+        cnf: session_pub,
+        did: ar.did,
+        tier: ar.tier,
+        match_id: MATCH,
+        slot: 0,
+        queue: "verified-slayer".into(),
+        policy_ver: 42,
+        ar_cti: ar.cti,
+    };
+    let sat_cose = sign(&k("broker-sat").signer, &sat);
+    valid(
+        "sat/slot0",
+        "sat",
+        &sat_cose,
+        sat_json(&sat),
+        json!({"signer": "broker-sat", "ar_object": "attestation-result/d2"}),
+    );
+    let sar_at = |seq: u64, prev: Digest| ServerAttestationResult {
+        iss: "live.golden".into(),
+        sub: instance_id(&instance_pub),
+        iat: T0 + 2 * seq,
+        exp: T0 + 2 * seq + 10,
+        cnf: instance_pub,
+        tls_spki_sha256: None,
+        noise_static: Some(Sha256::digest(b"noise static").into()),
+        server_class: ServerClass::FirstParty,
+        build_id: BuildId(Sha256::digest(b"gs-build-1.0.0").into()),
+        region: "eu-west".into(),
+        seq,
+        prev,
+        vrf_pub: None,
+    };
+    let sar0 = sar_at(0, Digest::default());
+    let sar0_cose = sign(&k("server-liveness").signer, &sar0);
+    let sar1 = sar_at(1, sar_link(&sar0_cose).unwrap());
+    let sar1_cose = sign(&k("server-liveness").signer, &sar1);
+    valid(
+        "sar/seq0",
+        "sar",
+        &sar0_cose,
+        sar_json(&sar0),
+        json!({"signer": "server-liveness", "prev_object": null}),
+    );
+    valid(
+        "sar/seq1",
+        "sar",
+        &sar1_cose,
+        sar_json(&sar1),
+        json!({"signer": "server-liveness", "prev_object": "sar/seq0"}),
+    );
+
     // ---- Negative vectors: each must be rejected with this category.
     let mut reject = |name: &str, kind: &str, cose: Vec<u8>, category: &str| {
         objects.push(json!({"name": name, "type": kind, "expect": "reject", "category": category, "cose": h(cose)}));
@@ -484,6 +643,43 @@ fn build() -> Json {
         "schema",
     );
 
+    reject(
+        "reject/sat-signed-by-verifier-key",
+        "sat",
+        sign(&k("verifier-ar").signer, &sat),
+        "role",
+    );
+    reject(
+        "reject/sar-presented-as-sat",
+        "sat",
+        sar1_cose.clone(),
+        "ctx",
+    );
+    let mut long_ar = ar.clone();
+    long_ar.exp = long_ar.iat + 1801;
+    reject(
+        "reject/ar-lifetime-over-1800s",
+        "attestation-result",
+        sign(&k("verifier-ar").signer, &long_ar),
+        "schema",
+    );
+    let mut stray = sar_at(1, sar_link(&sar0_cose).unwrap());
+    stray.sub = instance_id(&session_pub);
+    reject(
+        "reject/sar-sub-not-its-instance-key",
+        "sar",
+        sign(&k("server-liveness").signer, &stray),
+        "schema",
+    );
+    let mut unbound = sar_at(1, sar_link(&sar0_cose).unwrap());
+    unbound.noise_static = None;
+    reject(
+        "reject/sar-without-transport-binding",
+        "sar",
+        sign(&k("server-liveness").signer, &unbound),
+        "schema",
+    );
+
     let protected = header_for(gs, ctx::CHECKPOINT, Checkpoint::CONTENT_TYPE).to_value();
     let unprot = Value::Map(vec![(Value::int(4), Value::bytes(vec![0; 16]))]);
     reject(
@@ -572,6 +768,9 @@ fn check_with_rust(v: &Json) {
             "session" => KeyRole::Session,
             "gs_instance" => KeyRole::GsInstance,
             "log" => KeyRole::Log,
+            "verifier_ar" => KeyRole::VerifierAr,
+            "broker_sat" => KeyRole::BrokerSat,
+            "server_liveness" => KeyRole::ServerLiveness,
             other => panic!("role {other}"),
         };
         let pk: [u8; 32] = hex::decode(k["public"].as_str().unwrap())
@@ -591,6 +790,12 @@ fn check_with_rust(v: &Json) {
                     .map(|x| (checkpoint_json(&x.payload), x.digest)),
                 "admit-pop" => verify::<AdmitPop>(&cose, &keyset)
                     .map(|x| (admit_pop_json(&x.payload), x.digest)),
+                "attestation-result" => verify::<AttestationResult>(&cose, &keyset)
+                    .map(|x| (ar_json(&x.payload), x.digest)),
+                "sat" => verify::<SessionAdmissionToken>(&cose, &keyset)
+                    .map(|x| (sat_json(&x.payload), x.digest)),
+                "sar" => verify::<ServerAttestationResult>(&cose, &keyset)
+                    .map(|x| (sar_json(&x.payload), x.digest)),
                 other => panic!("type {other}"),
             };
         match o["expect"].as_str().unwrap() {
