@@ -56,6 +56,9 @@ cargo deny check
 make ffi-c-test
 make ffi-c-test-i686
 
+# Raspberry Pi: VS for a Pi Zero 2 W, SDK for the Pi 5 host (deploy/pi/README.md)
+make pi-vs pi-vs-smoke ffi-c-test-aarch64
+
 # fuzz the wire decoders and verifiers (nightly + cargo-fuzz)
 cargo +nightly fuzz run wire_decode -- -max_total_time=60
 cargo +nightly fuzz run verify_untrusted -- -max_total_time=60

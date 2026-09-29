@@ -1,0 +1,38 @@
+# systemd unit for the Validation Server on a Raspberry Pi Zero 2 W.
+# Install: deploy/pi/README.md.
+[Unit]
+Description=FPP Validation Server (VS)
+# SARs carry expiry times: the clock must be right before the first one.
+# The Pi Zero 2 W has no real-time clock.
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+
+[Service]
+Type=simple
+User=fpp-vs
+Group=fpp-vs
+# keys/ (VS seed, TLS certificate, key bundle) and ledger/ are relative to this.
+WorkingDirectory=/var/lib/fpp-vs
+ExecStart=/usr/local/bin/fpp-vs --bind 0.0.0.0:4444
+Restart=on-failure
+RestartSec=2
+
+# The VS needs only its state directory and the network.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ReadWritePaths=/var/lib/fpp-vs
+# 512 MB RAM on the board: keep the VS well inside it.
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target
