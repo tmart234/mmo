@@ -1,123 +1,141 @@
 // crates/vs/src/admission.rs
+//! Control-connection entry point. Every connection starts with
+//! `ChallengeRequest{role}` → `AttestChallenge` (single-use nonce, F04),
+//! then either a game server's `JoinRequest` or a client's
+//! `ClientAdmissionRequest` (handled by the stub Verifier and Broker in
+//! `broker.rs`).
+
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::VerifyingKey;
 use quinn::Connection;
 use rand::{rngs::OsRng, RngCore};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::Notify;
 use tokio::time::timeout;
 
+use crate::checkpoints::spawn_checkpoint_listener;
 use crate::ctx::{Session, VsCtx};
-use crate::enforcer::enforcer;
-use crate::streams::{spawn_bistream_dispatch, spawn_ticket_loop, spawn_uni_heartbeat_listener};
+use crate::liveness::spawn_sar_loop;
 use crate::watchdog::spawn_watchdog;
 
 use common::{
     crypto::{join_request_sign_bytes, now_ms, sign, verify},
     framing::{recv_msg, send_msg, send_msg_continue},
-    proto::{AttestChallenge, ChallengeRequest, JoinAccept, JoinRequest, Sig},
+    proto::{
+        AttestChallenge, ChallengeRequest, ClientAdmissionRequest, JoinAccept, JoinRequest,
+        PeerRole, Sig,
+    },
 };
 
 /// Version in `ChallengeRequest`; bump on any admission-flow change.
-pub const ADMISSION_VERSION: u32 = 1;
+pub const ADMISSION_VERSION: u32 = 2;
 
-/// Admit one GS (authenticate JoinRequest) then spawn loops for that session.
+/// Admit one peer. Game servers stay connected (SARs out, Checkpoints in);
+/// clients get their tokens and leave.
 pub async fn admit_and_run(connecting: quinn::Incoming, ctx: VsCtx) -> Result<()> {
-    // QUIC handshake, attestation challenge and JoinRequest under one
-    // deadline, so a peer that connects and then goes quiet cannot hold a VS
-    // task and connection forever.
+    // QUIC handshake, challenge and request under one deadline, so a peer
+    // that connects and goes quiet cannot hold a VS task forever (F08).
     let deadline = Duration::from_millis(ctx.config.admission_timeout_ms);
-    let (conn, mut vs_send, jr, challenge) = timeout(deadline, async {
+    let (conn, mut send, mut recv, role, challenge) = timeout(deadline, async {
         let conn: Connection = connecting.await.context("handshake accept")?;
-        println!("[VS] new conn from {}", conn.remote_address());
-
-        // First bi-stream: ChallengeRequest -> AttestChallenge -> JoinRequest.
-        let (mut vs_send, mut vs_recv) = conn
-            .accept_bi()
-            .await
-            .context("accept_bi for JoinRequest")?;
-        let hello: ChallengeRequest = recv_msg(&mut vs_recv)
-            .await
-            .context("recv ChallengeRequest")?;
+        let (mut send, mut recv) = conn.accept_bi().await.context("accept_bi")?;
+        let hello: ChallengeRequest = recv_msg(&mut recv).await.context("recv ChallengeRequest")?;
         if hello.version != ADMISSION_VERSION {
             bail!("unsupported admission version {}", hello.version);
         }
-        // F04: the verifier chooses quote freshness. One nonce per
-        // connection, used for exactly one JoinRequest.
         let mut challenge = [0u8; 32];
         OsRng.fill_bytes(&mut challenge);
-        send_msg_continue(&mut vs_send, &AttestChallenge { nonce: challenge })
+        send_msg_continue(&mut send, &AttestChallenge { nonce: challenge })
             .await
             .context("send AttestChallenge")?;
-
-        let jr: JoinRequest = recv_msg(&mut vs_recv).await.context("recv JoinRequest")?;
-        Ok::<_, anyhow::Error>((conn, vs_send, jr, challenge))
+        Ok::<_, anyhow::Error>((conn, send, recv, hello.role, challenge))
     })
     .await
     .map_err(|_| anyhow!("admission timed out after {} ms", deadline.as_millis()))??;
+
+    match role {
+        PeerRole::Client => {
+            let req: ClientAdmissionRequest = timeout(deadline, recv_msg(&mut recv))
+                .await
+                .map_err(|_| anyhow!("admission timed out after {} ms", deadline.as_millis()))?
+                .context("recv ClientAdmissionRequest")?;
+            let answer = crate::broker::admit_client(&ctx, &challenge, &req);
+            send_msg(&mut send, &answer)
+                .await
+                .context("send ClientAdmission")?;
+            // Let the reply drain before the connection is dropped.
+            let _ = timeout(Duration::from_secs(2), conn.closed()).await;
+            Ok(())
+        }
+        PeerRole::GameServer => {
+            let jr: JoinRequest = timeout(deadline, recv_msg(&mut recv))
+                .await
+                .map_err(|_| anyhow!("admission timed out after {} ms", deadline.as_millis()))?
+                .context("recv JoinRequest")?;
+            admit_game_server(conn, send, jr, challenge, ctx).await
+        }
+    }
+}
+
+async fn admit_game_server(
+    conn: Connection,
+    mut send: quinn::SendStream,
+    jr: JoinRequest,
+    challenge: [u8; 32],
+    ctx: VsCtx,
+) -> Result<()> {
     println!(
-        "[VS] got JoinRequest from gs_id={} (ephemeral pub ..{:02x}{:02x})",
-        jr.gs_id, jr.ephemeral_pub[0], jr.ephemeral_pub[1]
+        "[VS] JoinRequest from gs_id={} (instance ..{:02x}{:02x}, game port {})",
+        jr.gs_id, jr.ephemeral_pub[0], jr.ephemeral_pub[1], jr.game_addr
     );
 
-    // 1) Verify JoinRequest signature (binds gs_pub + ephemeral_pub + nonce + time + sw_hash).
-    let gs_identity_vk =
-        VerifyingKey::from_bytes(&jr.gs_pub).context("bad gs_pub in JoinRequest")?;
-
+    // 1) Signature by the GS long-term key over everything it claims.
+    let gs_identity = VerifyingKey::from_bytes(&jr.gs_pub).context("bad gs_pub")?;
     let join_bytes = join_request_sign_bytes(
         &jr.gs_id,
         &jr.sw_hash,
         jr.t_unix_ms,
         &jr.nonce,
         &jr.ephemeral_pub,
+        &jr.noise_static,
+        &jr.game_addr,
     );
-
-    let sig_gs_arr: [u8; 64] = jr
+    let sig: [u8; 64] = jr
         .sig_gs
         .clone()
         .try_into()
         .map_err(|_| anyhow!("JoinRequest sig_gs len != 64"))?;
-    if !verify(&gs_identity_vk, &join_bytes, &sig_gs_arr) {
+    if !verify(&gs_identity, &join_bytes, &sig) {
         bail!("JoinRequest sig_gs invalid");
     }
+    VerifyingKey::from_bytes(&jr.ephemeral_pub)
+        .context("instance key is not a valid Ed25519 key")?;
 
-    // 2) Anti-replay time skew.
-    let now = now_ms();
-    let skew = now.abs_diff(jr.t_unix_ms);
+    // 2) Clock skew.
+    let skew = now_ms().abs_diff(jr.t_unix_ms);
     if skew > ctx.config.join_max_skew_ms {
         bail!("JoinRequest timestamp skew too large: {skew} ms");
     }
 
-    // 3) Priority 3 (TOFU/TPM supply chain fix): sw_hash allowlist.
-    //
-    // If the allowlist is non-empty, the GS binary hash MUST be in it.
-    // An empty allowlist means "dev/TOFU mode — accept any binary", which is
-    // the safe default for local development.  Production deployments MUST
-    // populate VsConfig::sw_hash_allowlist with the sha256 hashes of every
-    // approved GS release build so a compromised or tampered binary cannot
-    // join the network even if it has valid TPM quotes.
+    // 3) Build allowlist (empty = dev mode).
     if !ctx.config.sw_hash_allowlist.is_empty()
         && !ctx.config.sw_hash_allowlist.contains(&jr.sw_hash)
     {
         bail!(
-            "sw_hash {} is not in the VS allowlist — unapproved GS build rejected",
+            "sw_hash {} is not in the VS allowlist",
             hex::encode(jr.sw_hash)
         );
     }
 
-    // 4) Appraise the TPM quote: it must cover this connection's challenge and
-    //    this exact JoinRequest, and come from an enrolled attestation key
-    //    (any key, pinned for the session, in dev mode). Baselines apply.
-    let tpm_ak = crate::attest::appraise_join_quote(
+    // 4) TPM quote: covers this connection's challenge and this exact
+    //    JoinRequest, from an enrolled (or, in dev mode, pinned) key.
+    let tpm = crate::attest::appraise_join_quote(
         &ctx.config,
         &challenge,
         &join_bytes,
         jr.tpm_quote.as_ref(),
     )
     .context("TPM quote appraisal failed")?;
-    if tpm_ak.is_some() {
+    if tpm.is_some() {
         let enrolled = if ctx.config.trusted_ak_keys.is_empty() {
             "dev mode: attestation key not enrolled, pinned for this session"
         } else {
@@ -126,46 +144,35 @@ pub async fn admit_and_run(connecting: quinn::Incoming, ctx: VsCtx) -> Result<()
         println!("[VS] TPM quote verified ({enrolled})");
     }
 
-    // Mint session id.
     let mut session_id = [0u8; 16];
     OsRng.fill_bytes(&mut session_id);
-
-    // Insert per-session state into ctx.
     ctx.sessions.insert(
         session_id,
         Session {
-            ephemeral_pub: jr.ephemeral_pub,
-            last_counter: 0,
+            instance_pub: jr.ephemeral_pub,
+            noise_static: jr.noise_static,
+            game_addr: jr.game_addr.clone(),
+            sw_hash: jr.sw_hash,
             last_seen_ms: now_ms(),
             revoked: false,
-            last_pr_counter: None,
-            last_pr_tip: [0u8; 32],
-            staged_hbs: Arc::new(Mutex::new(HashMap::new())),
-            hb_notify: Arc::new(Notify::new()),
-            tpm_ak,
-            recent_tickets: Default::default(),
+            last_checkpoint: None,
+            tpm,
+            recent_sars: Default::default(),
+            next_slot: 0,
         },
     );
+    crate::metrics::ACTIVE_SESSIONS.inc();
 
-    // Tell the enforcer the allowed sw_hash for this session.
-    enforcer().lock().unwrap().note_join(session_id, jr.sw_hash);
-
-    // Reply JoinAccept (signed by VS).
     let sig_vs: Sig = sign(ctx.vs_sk.as_ref(), &session_id).to_vec();
     let ja = JoinAccept {
         session_id,
         sig_vs,
         vs_pub: ctx.vs_sk.verifying_key().to_bytes(),
     };
+    send_msg(&mut send, &ja).await.context("send JoinAccept")?;
 
-    send_msg(&mut vs_send, &ja)
-        .await
-        .context("send JoinAccept")?;
-
-    // Spawn runtime loops for this connection/session.
-    spawn_ticket_loop(&conn, ctx.clone(), session_id);
-    spawn_bistream_dispatch(&conn, ctx.clone(), session_id);
-    spawn_uni_heartbeat_listener(&conn, ctx.clone(), session_id); // <-- add this
+    spawn_sar_loop(&conn, ctx.clone(), session_id);
+    spawn_checkpoint_listener(&conn, ctx.clone(), session_id);
     spawn_watchdog(&conn, ctx, session_id);
     Ok(())
 }
@@ -175,9 +182,10 @@ mod tests {
     use super::*;
     use common::{config::VsConfig, pki};
     use ed25519_dalek::SigningKey;
+    use std::sync::Arc;
 
     /// F08: a peer that completes the QUIC handshake but never sends a
-    /// JoinRequest is dropped at the admission deadline.
+    /// request is dropped at the admission deadline.
     #[tokio::test]
     async fn idle_peer_is_dropped_at_admission_deadline() {
         let dev = pki::DevPki::generate().unwrap();

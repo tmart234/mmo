@@ -136,8 +136,15 @@ fn missing_hint(path: &Path) -> String {
     )
 }
 
-fn provider() -> Arc<rustls::crypto::CryptoProvider> {
-    Arc::new(rustls::crypto::ring::default_provider())
+/// Suite FPP-T1 (04 §3): TLS 1.3 over aws-lc-rs with the hybrid
+/// post-quantum group `X25519MLKEM768` preferred and `X25519` as fallback,
+/// so recorded control-plane traffic (tokens, device evidence, PII) resists
+/// later decryption by a quantum computer.
+pub fn provider() -> Arc<rustls::crypto::CryptoProvider> {
+    use rustls::crypto::aws_lc_rs::{self, kx_group};
+    let mut p = aws_lc_rs::default_provider();
+    p.kx_groups = vec![kx_group::X25519MLKEM768, kx_group::X25519];
+    Arc::new(p)
 }
 
 /// Read a CA certificate (DER) to pin as the trust root.
@@ -146,33 +153,41 @@ pub fn load_ca(path: impl AsRef<Path>) -> Result<Vec<u8>> {
     fs::read(path).with_context(|| missing_hint(path))
 }
 
-/// QUIC server config presenting `identity`.
-pub fn quic_server_config(identity: &ServerIdentity) -> Result<quinn::ServerConfig> {
+/// TLS 1.3 server config presenting `identity` (FPP-T1).
+pub fn tls_server_config(identity: &ServerIdentity) -> Result<rustls::ServerConfig> {
     let chain = vec![CertificateDer::from(identity.cert_der.clone())];
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.key_der.clone()));
-    let tls = rustls::ServerConfig::builder_with_provider(provider())
+    rustls::ServerConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .context("TLS 1.3 server config")?
         .with_no_client_auth()
         .with_single_cert(chain, key)
-        .context("server certificate")?;
-    let quic = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
+        .context("server certificate")
+}
+
+/// TLS 1.3 client config that accepts only servers whose chain ends at `ca_der`.
+pub fn tls_client_config(ca_der: &[u8]) -> Result<rustls::ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(ca_der.to_vec()))
+        .context("add pinned CA to root store")?;
+    Ok(rustls::ClientConfig::builder_with_provider(provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .context("TLS 1.3 client config")?
+        .with_root_certificates(roots)
+        .with_no_client_auth())
+}
+
+/// QUIC server config presenting `identity`.
+pub fn quic_server_config(identity: &ServerIdentity) -> Result<quinn::ServerConfig> {
+    let quic = quinn::crypto::rustls::QuicServerConfig::try_from(tls_server_config(identity)?)
         .map_err(|e| anyhow!("QUIC server config: {e}"))?;
     Ok(quinn::ServerConfig::with_crypto(Arc::new(quic)))
 }
 
 /// QUIC client config that accepts only servers whose chain ends at `ca_der`.
 pub fn quic_client_config(ca_der: &[u8]) -> Result<quinn::ClientConfig> {
-    let mut roots = rustls::RootCertStore::empty();
-    roots
-        .add(CertificateDer::from(ca_der.to_vec()))
-        .context("add pinned CA to root store")?;
-    let tls = rustls::ClientConfig::builder_with_provider(provider())
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .context("TLS 1.3 client config")?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
+    let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls_client_config(ca_der)?)
         .map_err(|e| anyhow!("QUIC client config: {e}"))?;
     Ok(quinn::ClientConfig::new(Arc::new(quic)))
 }

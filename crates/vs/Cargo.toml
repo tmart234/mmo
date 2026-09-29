@@ -24,3 +24,7 @@ prometheus    = { workspace = true }
 lazy_static   = { workspace = true }
 
 common        = { path = "../common" }
+fpp-types     = { path = "../fpp-types" }
+fpp-wire      = { path = "../fpp-wire" }
+fpp-crypto    = { path = "../fpp-crypto" }
+fpp-tokens    = { path = "../fpp-tokens" }

@@ -1,11 +1,13 @@
 //! Verifiers that consume attacker-controlled messages must never panic.
 #![no_main]
 
-use common::crypto::{client_input_sign_bytes, verify_ticket_sig};
-use common::proto::{ClientInput, JoinAccept, PlayTicket};
-use common::tickets::TicketChain;
+use common::proto::JoinAccept;
 use common::tpm::{verify_quote, TpmQuote};
-use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
+use ed25519_dalek::SigningKey;
+use fpp_crypto::{Ed25519Signer, KeyRole, KeySet};
+use fpp_tokens::admission::{admit, AdmissionPolicy, Revocations};
+use fpp_tokens::{verify_ar, verify_sat, SarChain};
+use fpp_types::{DeviceTier, GsInstanceId, MatchId};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -13,40 +15,39 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let vs = SigningKey::from_bytes(&[7; 32]).verifying_key();
+    let mut keys = KeySet::default();
+    for (seed, role) in [(0x11, KeyRole::VerifierAr), (0x12, KeyRole::BrokerSat), (0x13, KeyRole::ServerLiveness)] {
+        keys.insert_ed25519(role, Ed25519Signer::new(SigningKey::from_bytes(&[seed; 32])).verifying_key());
+    }
+    let now = 1_790_000_000;
     match selector % 4 {
         0 => {
-            if let Ok(t) = bincode::deserialize::<PlayTicket>(body) {
-                let _ = verify_ticket_sig(&vs, &t);
-                if let Ok(mut chain) = TicketChain::start(vs, t.session_id, [0; 32], t.clone(), t.not_before_ms) {
-                    let _ = chain.advance(t.clone(), t.not_after_ms);
-                    let _ = chain.ensure_fresh(u64::MAX);
-                }
-            }
-        }
-        1 => {
             if let Ok(ja) = bincode::deserialize::<JoinAccept>(body) {
                 let _ = gs_sim::admission::verify_join_accept(&vs, &ja);
             }
         }
-        2 => {
+        1 => {
             if let Ok(q) = bincode::deserialize::<TpmQuote>(body) {
                 let _ = verify_quote(&q, &q.nonce, None);
                 let _ = verify_quote(&q, &[0; 32], Some(&q.pcr_values));
             }
         }
-        _ => {
-            if let Ok(ci) = bincode::deserialize::<ClientInput>(body) {
-                let bytes = client_input_sign_bytes(
-                    &ci.session_id,
-                    ci.ticket_counter,
-                    &ci.ticket_sig_vs,
-                    ci.client_nonce,
-                    &ci.cmd,
-                );
-                if let Ok(vk) = VerifyingKey::from_bytes(&ci.client_pub) {
-                    let _ = vk.verify_strict(&bytes, &Signature::from_bytes(&ci.client_sig));
-                }
+        2 => {
+            let _ = verify_ar(body, &keys, now);
+            let _ = verify_sat(body, &keys, now);
+            if let Ok(mut chain) = SarChain::start(body, &keys, now) {
+                let _ = chain.update(body, &keys, now);
+                let _ = chain.live(u64::MAX);
             }
+        }
+        _ => {
+            let mid = body.len() / 2;
+            let policy = AdmissionPolicy {
+                gs_instance_id: GsInstanceId([0; 32]),
+                matches: vec![MatchId([0; 16])],
+                min_tier: DeviceTier::D0Unknown,
+            };
+            let _ = admit(&body[..mid], &body[mid..], &[0; 32], &keys, &policy, &Revocations::default(), now);
         }
     }
 });

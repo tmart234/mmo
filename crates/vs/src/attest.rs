@@ -1,23 +1,32 @@
 // crates/vs/src/attest.rs
-//! Appraisal of the prototype's TPM quotes (findings F04 and F05 in
+//! Appraisal of the prototype's TPM quotes (findings F04, F05 and F21 in
 //! docs/anticheat/07-gap-analysis-and-roadmap.md). Pure functions, so every
 //! rule is tested without a network.
 //!
-//! What this fixes: the VS, not the GS, now chooses quote freshness (a
-//! single-use challenge at join, an unpredictable ticket signature for
-//! re-attestation), and quotes must come from an enrolled or session-pinned
-//! attestation key instead of whatever key the quote carries. What remains
-//! for the Verifier (roadmap P3): EK certificate chains, credential
-//! activation, TPMS_ATTEST parsing and event-log replay for real TPMs.
+//! What this fixes: the VS, not the GS, chooses quote freshness (a
+//! single-use challenge at join; a recent SAR, whose signature the GS cannot
+//! predict, for re-attestation), and quotes must come from an enrolled or
+//! session-pinned attestation key instead of whatever key the quote carries.
+//! Re-attestation PCRs must equal the ones measured at join (or the
+//! configured baseline). What remains for the Verifier (roadmap P3): EK
+//! certificate chains, credential activation, TPMS_ATTEST parsing and
+//! event-log replay for real TPMs.
 
 use anyhow::{anyhow, bail, Result};
 use common::config::VsConfig;
 use common::tpm::{join_quote_nonce, reattest_quote_nonce, verify_quote, TpmQuote};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
-/// Re-attestation quotes may be seeded by any of this many latest tickets
-/// (at one ticket per 2 s: the last 16 s).
-pub const RECENT_TICKETS: usize = 8;
+/// Re-attestation quotes may be seeded by any of this many latest SARs
+/// (at one SAR per 2 s: the last 16 s).
+pub const RECENT_SARS: usize = 8;
+
+/// What the join quote established for the session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PinnedTpm {
+    pub ak: Vec<u8>,
+    pub pcrs: BTreeMap<u8, [u8; 32]>,
+}
 
 fn check_ak(cfg: &VsConfig, quote: &TpmQuote) -> Result<()> {
     if cfg.trusted_ak_keys.is_empty()
@@ -32,18 +41,18 @@ fn check_ak(cfg: &VsConfig, quote: &TpmQuote) -> Result<()> {
     }
 }
 
-fn baselines(cfg: &VsConfig) -> Option<&std::collections::BTreeMap<u8, [u8; 32]>> {
+fn baselines(cfg: &VsConfig) -> Option<&BTreeMap<u8, [u8; 32]>> {
     (!cfg.required_pcr_baselines.is_empty()).then_some(&cfg.required_pcr_baselines)
 }
 
 /// Appraise the quote in a JoinRequest against the challenge this VS issued
-/// on this connection. Returns the attestation key to pin for the session.
+/// on this connection. Returns what to pin for the session.
 pub fn appraise_join_quote(
     cfg: &VsConfig,
     challenge: &[u8; 32],
     join_sign_bytes: &[u8],
     quote: Option<&TpmQuote>,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<Option<PinnedTpm>> {
     let Some(quote) = quote else {
         if cfg.require_tpm_quote {
             bail!("TPM quote required");
@@ -56,35 +65,37 @@ pub fn appraise_join_quote(
         &join_quote_nonce(challenge, join_sign_bytes),
         baselines(cfg),
     )?;
-    Ok(Some(quote.ak_pub.clone()))
+    Ok(Some(PinnedTpm {
+        ak: quote.ak_pub.clone(),
+        pcrs: quote.pcr_values.clone(),
+    }))
 }
 
-/// Appraise a re-attestation quote from a Heartbeat. It must come from the key
-/// pinned at join, be seeded by a ticket this VS issued recently, and match
-/// the PCR baseline (configured, or else the session's first re-attestation).
-#[allow(clippy::too_many_arguments)]
+/// Appraise a re-attestation quote sent with the Checkpoint for `epoch`. It
+/// must come from the key pinned at join, be seeded by a SAR this VS issued
+/// recently, and show the PCR values measured at join (or the configured
+/// baseline).
 pub fn appraise_reattest_quote(
     cfg: &VsConfig,
     session_id: &[u8; 16],
-    gs_counter: u64,
+    epoch: u64,
     quote: &TpmQuote,
-    quote_ticket: u64,
-    pinned_ak: Option<&[u8]>,
-    recent_tickets: &VecDeque<(u64, Vec<u8>)>,
-    session_baseline: Option<&std::collections::BTreeMap<u8, [u8; 32]>>,
+    quote_sar_seq: u64,
+    pinned: Option<&PinnedTpm>,
+    recent_sars: &VecDeque<(u64, Vec<u8>)>,
 ) -> Result<()> {
-    let pinned = pinned_ak.ok_or_else(|| anyhow!("no attestation key was pinned at join"))?;
-    if quote.ak_pub != pinned {
+    let pinned = pinned.ok_or_else(|| anyhow!("no attestation key was pinned at join"))?;
+    if quote.ak_pub != pinned.ak {
         bail!("re-attestation quote is signed by a different attestation key");
     }
-    let (_, sig) = recent_tickets
+    let (_, sar) = recent_sars
         .iter()
-        .find(|(counter, _)| *counter == quote_ticket)
-        .ok_or_else(|| anyhow!("quote is not seeded by a recent ticket (#{quote_ticket})"))?;
+        .find(|(seq, _)| *seq == quote_sar_seq)
+        .ok_or_else(|| anyhow!("quote is not seeded by a recent SAR (#{quote_sar_seq})"))?;
     verify_quote(
         quote,
-        &reattest_quote_nonce(session_id, gs_counter, sig),
-        baselines(cfg).or(session_baseline),
+        &reattest_quote_nonce(session_id, epoch, sar),
+        Some(baselines(cfg).unwrap_or(&pinned.pcrs)),
     )
 }
 
@@ -118,7 +129,7 @@ mod tests {
         assert!(appraise_join_quote(&cfg, &[1; 32], b"join-a", Some(&q)).is_ok());
         // Replayed on a later connection (new challenge): rejected.
         assert!(appraise_join_quote(&cfg, &[2; 32], b"join-a", Some(&q)).is_err());
-        // Same challenge, another JoinRequest (e.g. another ephemeral key): rejected.
+        // Same challenge, another JoinRequest (e.g. another instance key): rejected.
         assert!(appraise_join_quote(&cfg, &[1; 32], b"join-b", Some(&q)).is_err());
     }
 
@@ -134,7 +145,7 @@ mod tests {
         assert!(appraise_join_quote(&cfg, &[1; 32], b"join", Some(&forged)).is_err());
         let real = join_quote(&honest, &[1; 32], b"join");
         let pinned = appraise_join_quote(&cfg, &[1; 32], b"join", Some(&real)).unwrap();
-        assert_eq!(pinned.as_deref(), Some(&ak(&honest)[..]));
+        assert_eq!(pinned.unwrap().ak, ak(&honest).to_vec());
     }
 
     #[test]
@@ -152,34 +163,40 @@ mod tests {
     }
 
     #[test]
-    fn reattestation_needs_the_pinned_key_and_a_recent_ticket() {
+    fn reattestation_needs_the_pinned_key_a_recent_sar_and_unchanged_pcrs() {
         let cfg = VsConfig::default();
         let t = tpm(1);
-        let pinned = ak(&t);
-        let tickets: VecDeque<(u64, Vec<u8>)> = (10..=12).map(|c| (c, vec![c as u8; 64])).collect();
-        let quote_for = |t: &SimulatedTpm, ticket: u64, counter: u64| {
+        let pinned =
+            appraise_join_quote(&cfg, &[1; 32], b"j", Some(&join_quote(&t, &[1; 32], b"j")))
+                .unwrap()
+                .unwrap();
+        let sars: VecDeque<(u64, Vec<u8>)> = (10..=12).map(|s| (s, vec![s as u8; 300])).collect();
+        let quote_for = |t: &SimulatedTpm, seq: u64, epoch: u64| {
             t.quote(
                 &[0, 1],
-                &reattest_quote_nonce(&SESSION, counter, &[ticket as u8; 64]),
+                &reattest_quote_nonce(&SESSION, epoch, &[seq as u8; 300]),
             )
             .unwrap()
         };
-        let check = |q: &TpmQuote, ticket: u64, counter: u64, pinned: Option<&[u8]>| {
-            appraise_reattest_quote(&cfg, &SESSION, counter, q, ticket, pinned, &tickets, None)
+        let check = |q: &TpmQuote, seq: u64, epoch: u64, p: Option<&PinnedTpm>| {
+            appraise_reattest_quote(&cfg, &SESSION, epoch, q, seq, p, &sars)
         };
 
         let ok = quote_for(&t, 12, 100);
         assert!(check(&ok, 12, 100, Some(&pinned)).is_ok());
-        // Nothing pinned at join: a heartbeat cannot introduce a key.
+        // Nothing pinned at join: a checkpoint cannot introduce a key.
         assert!(check(&ok, 12, 100, None).is_err());
         // Another TPM (or a software key) cannot take over mid-session.
-        let other = quote_for(&tpm(2), 12, 100);
-        assert!(check(&other, 12, 100, Some(&pinned)).is_err());
-        // Seeded by a ticket the VS has not issued (made ahead of time), or by
+        assert!(check(&quote_for(&tpm(2), 12, 100), 12, 100, Some(&pinned)).is_err());
+        // Seeded by a SAR the VS has not issued (made ahead of time), or by
         // one that has aged out of the window.
         assert!(check(&quote_for(&t, 13, 100), 13, 100, Some(&pinned)).is_err());
         assert!(check(&quote_for(&t, 3, 100), 3, 100, Some(&pinned)).is_err());
-        // Bound to its heartbeat counter.
+        // Bound to its epoch.
         assert!(check(&ok, 12, 101, Some(&pinned)).is_err());
+        // Code changed after join (PCR 0 extended again): refused.
+        let mut patched = tpm(1);
+        patched.extend_pcr(0, b"hot patch").unwrap();
+        assert!(check(&quote_for(&patched, 12, 100), 12, 100, Some(&pinned)).is_err());
     }
 }

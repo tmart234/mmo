@@ -1,19 +1,18 @@
 // crates/tools/src/smoke.rs
 //
-// CI-lite / `make ci` smoke test:
+// CI-lite / `make ci` smoke test of the whole FPP prototype:
 //
-// - REQ-VS-001/002 (tickets, receipts)
-// - REQ-GS-001/002/003/004 (verify ticket & sigs, client binding, movement, multi-client)
-// - REQ-CL-001/002 (pinning, persistent keys)
-// - Stage 1.2: TPM continuous attestation (when --enable-tpm is used)
+// - VS: GS admission (challenge + JoinRequest), SAR chain, Checkpoint
+//   verification, stub Verifier (AR) and Broker (SAT) for clients
+// - GS: fpp-session game port, §7.2 admission, InputFrames, InputCommits,
+//   signed Checkpoints, CheckpointHeads, SarUpdates
+// - client: admission, join, play, SAR chain, tier floor of the `verified` queue
+// - TPM: join quote bound to the VS challenge, re-attestation seeded by a SAR
 //
-// 1. Ensure VS dev keys exist (keys/vs_ed25519.*).
-// 2. Spawn VS in the background (listens QUIC on 127.0.0.1:4444).
-// 3. Spawn gs-sim --test-once (optionally with --enable-tpm for TPM testing).
-// 4. Run client-sim --smoke-test in the foreground.
-// 5. Wait for gs-sim to complete.
-// 6. Kill VS.
-// 7. Optionally run TPM-enabled test as second pass.
+// 1. Ensure dev keys exist. 2. Spawn VS. 3. Spawn gs-sim --test-once.
+// 4. Run a client that must be refused the `verified` queue, then
+//    client-sim --smoke-test. 5. Wait for gs-sim, kill VS. 6. Repeat with
+//    the simulated TPM. Any failure fails the run (LENIENT_SMOKE=1 only warns).
 
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
@@ -156,7 +155,7 @@ fn run_smoke_pass(enable_tpm: bool) -> Result<(bool, bool)> {
     // 2. Spawn GS (with or without TPM)
     let gs_bin = bin_path("gs-sim");
     let mut gs_cmd = Command::new(&gs_bin);
-    gs_cmd.arg("--vs").arg("127.0.0.1:4444").arg("--test-once");
+    gs_cmd.args(["--vs", "127.0.0.1:4444", "--test-once", "--test-secs", "12"]);
 
     if enable_tpm {
         gs_cmd.arg("--enable-tpm");
@@ -168,31 +167,28 @@ fn run_smoke_pass(enable_tpm: bool) -> Result<(bool, bool)> {
         .spawn()
         .with_context(|| format!("spawn {:?}", gs_bin))?;
 
-    // Wait for GS to initialize
-    thread::sleep(Duration::from_millis(2000));
+    // Clients retry until the GS has joined and signed its first Checkpoint.
+    thread::sleep(Duration::from_millis(500));
 
-    // 3. Run client
+    // 3. Clients: one that must be refused the `verified` queue (tier floor
+    //    D2; this device has no evidence), then the smoke client.
     let client_bin = bin_path("client-sim");
-    let mut client_child = Command::new(&client_bin)
-        .arg("--gs-addr")
-        .arg("127.0.0.1:50000")
-        .arg("--smoke-test")
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
+    let refused = Command::new(&client_bin)
+        .args(["--queue", "verified", "--expect-refused"])
+        .status()
         .with_context(|| format!("run {:?}", client_bin))?;
-
-    let client_status = client_child.wait().context("wait client-sim")?;
-    if client_status.success() {
-        println!(
-            "[SMOKE] {} pass: client-sim completed successfully.",
-            pass_name
-        );
+    let client_status = Command::new(&client_bin)
+        .arg("--smoke-test")
+        .status()
+        .with_context(|| format!("run {:?}", client_bin))?;
+    let client_ok = client_status.success() && refused.success();
+    if client_ok {
+        println!("[SMOKE] {pass_name} pass: clients completed successfully.");
     } else {
         println!(
-            "[SMOKE] {} pass: client-sim exited nonzero (status={:?})",
-            pass_name,
-            client_status.code()
+            "[SMOKE] {pass_name} pass: client failed (smoke {:?}, verified-queue {:?})",
+            client_status.code(),
+            refused.code()
         );
     }
 
@@ -212,7 +208,7 @@ fn run_smoke_pass(enable_tpm: bool) -> Result<(bool, bool)> {
     let _ = vs_child.kill();
     let _ = vs_child.wait();
 
-    Ok((client_status.success(), gs_status.success()))
+    Ok((client_ok, gs_status.success()))
 }
 
 fn main() -> Result<()> {
@@ -226,7 +222,7 @@ fn main() -> Result<()> {
     match assert_recent_ledger_has_move() {
         Ok(_) => {}
         Err(e) => {
-            if std::env::var("STRICT_SMOKE").is_ok() {
+            if std::env::var("LENIENT_SMOKE").is_err() {
                 anyhow::bail!("ledger check failed: {e:#}");
             } else {
                 eprintln!("[SMOKE] ledger check warning: {e:#}");
@@ -258,7 +254,7 @@ fn main() -> Result<()> {
     );
 
     // 6. Exit policy
-    let strict = std::env::var("STRICT_SMOKE").is_ok();
+    let strict = std::env::var("LENIENT_SMOKE").is_err();
     let all_ok = client_ok && gs_ok && tpm_client_ok && tpm_gs_ok;
 
     if strict && !all_ok {

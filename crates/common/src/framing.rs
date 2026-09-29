@@ -5,10 +5,10 @@
 // Wire format:
 //   [4-byte little-endian length][bincode payload]
 //
-// We use these in both directions on ad-hoc bi-streams:
-//   GS -> VS (Heartbeat, TranscriptDigest)
-//   VS -> GS (JoinAccept, PlayTicket, ProtectedReceipt)
-//   etc.
+// Used on the QUIC control links:
+//   GS <-> VS: ChallengeRequest, AttestChallenge, JoinRequest, JoinAccept,
+//              SarIssue (VS -> GS), CheckpointSubmit (GS -> VS)
+//   client <-> VS: ChallengeRequest, AttestChallenge, ClientAdmission*
 
 use anyhow::{Context, Result};
 use quinn::{RecvStream, SendStream};
@@ -85,13 +85,9 @@ pub async fn send_msg_continue<T: Serialize>(s: &mut SendStream, msg: &T) -> Res
     Ok(())
 }
 
-/// Default cap for one frame: control messages (hellos, tickets, heartbeats,
-/// join requests, receipts, client inputs) are all far smaller than this.
+/// Cap for one frame: every control-link message (requests, tokens, SARs,
+/// Checkpoints with TPM quotes) is far smaller than this.
 pub const MAX_CONTROL_FRAME: usize = 64 * 1024;
-/// GS -> client world snapshots grow with the number of visible players.
-pub const MAX_SNAPSHOT_FRAME: usize = 1024 * 1024;
-/// GS -> VS TranscriptDigest, including the inputs it carries for storage.
-pub const MAX_TRANSCRIPT_FRAME: usize = 4 * 1024 * 1024;
 
 /// Validate a frame's 4-byte little-endian length prefix against `max`,
 /// before anything is allocated for the body.

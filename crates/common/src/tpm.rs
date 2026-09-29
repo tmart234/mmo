@@ -117,15 +117,17 @@ pub fn join_quote_nonce(challenge: &[u8; 32], join_sign_bytes: &[u8]) -> [u8; 32
     h.finalize().into()
 }
 
-/// Qualifying data for a re-attestation quote, seeded by the signature of a
-/// recent VS PlayTicket. Ed25519 signatures cannot be predicted without the
-/// VS key, so the GS cannot produce quotes before the VS asks (F04).
-pub fn reattest_quote_nonce(session_id: &[u8; 16], gs_counter: u64, ticket_sig: &[u8]) -> [u8; 32] {
+/// Qualifying data for a re-attestation quote, seeded by a recent SAR the VS
+/// issued (its exact bytes, signature included). Ed25519 signatures cannot be
+/// predicted without the VS key, so the GS cannot produce quotes before the
+/// VS issues the SAR (F04). `epoch` binds the quote to one Checkpoint.
+pub fn reattest_quote_nonce(session_id: &[u8; 16], epoch: u64, sar: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
-    h.update(b"mmo/tpm/reattest-quote/v1\0");
+    h.update(b"mmo/tpm/reattest-quote/v2\0");
     h.update(session_id);
-    h.update(gs_counter.to_le_bytes());
-    h.update(ticket_sig);
+    h.update(epoch.to_le_bytes());
+    h.update((sar.len() as u64).to_le_bytes());
+    h.update(sar);
     h.finalize().into()
 }
 

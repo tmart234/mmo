@@ -1,18 +1,26 @@
 //! VS (Validation Server)
 //
+//
+// The prototype VS plays the FPP trust-plane roles until P2 splits them into
+// services: GS admission, Server Liveness (SAR chain), Checkpoint intake,
+// and stub Verifier + Broker for clients.
+//
 // Files:
-// - ctx.rs       : shared context + session map + constants
-// - admission.rs : JoinRequest handling and session admission
-// - streams.rs   : ticket loop + inbound bi-stream dispatch
-// - watchdog.rs  : per-session liveness watchdog
-// - enforcer.rs  : physics/logic invariants and revocation
+// - ctx.rs         : shared context, role keys, session map
+// - admission.rs   : control-connection entry (GS join, client admission)
+// - broker.rs      : stub Verifier (AR) and Broker (SAT) for clients
+// - liveness.rs    : SAR chain per game server
+// - checkpoints.rs : Checkpoint verification and evidence storage
+// - attest.rs      : TPM quote appraisal
+// - watchdog.rs    : revoke when Checkpoints stop
 
 mod admission;
 mod attest;
+mod broker;
+mod checkpoints;
 mod ctx;
-mod enforcer;
+mod liveness;
 mod metrics;
-mod streams;
 mod watchdog;
 
 use anyhow::{Context, Result};
@@ -34,7 +42,8 @@ struct Opts {
     #[arg(long, default_value = "127.0.0.1:4444")]
     bind: String,
 
-    /// VS signing keypair (ed25519) used to sign JoinAccept, PlayTicket, and ProtectedReceipt.
+    /// VS seed (ed25519): signs JoinAccepts; the Verifier, Broker and Server
+    /// Liveness role keys are derived from it (dev only, `common::keys`).
     #[arg(long, default_value = "keys/vs_ed25519.pk8")]
     vs_sk: String,
     #[arg(long, default_value = "keys/vs_ed25519.pub")]
@@ -52,13 +61,6 @@ struct Opts {
 async fn main() -> Result<()> {
     let opts = Opts::parse();
 
-    // rustls 0.23+: pick a crypto backend (ring) for this process.
-    {
-        use rustls::crypto::{ring, CryptoProvider};
-        CryptoProvider::install_default(ring::default_provider())
-            .expect("install ring CryptoProvider");
-    }
-
     // Initialize Prometheus metrics
     metrics::register_metrics();
     println!("[VS] Prometheus metrics initialized");
@@ -66,6 +68,11 @@ async fn main() -> Result<()> {
     // Load (or create) VS signing key
     let (vs_sk_raw, _vs_pk_raw) = load_or_make_keys(&opts.vs_sk, &opts.vs_pk)?;
     let ctx = VsCtx::new(Arc::new(vs_sk_raw));
+    ctx.keys
+        .bundle()
+        .save(common::keys::DEFAULT_BUNDLE)
+        .context("write key bundle")?;
+    println!("[VS] role key bundle at {}", common::keys::DEFAULT_BUNDLE);
 
     // Start QUIC listener
     let identity = common::pki::ServerIdentity::load(&opts.tls_cert, &opts.tls_key)?;

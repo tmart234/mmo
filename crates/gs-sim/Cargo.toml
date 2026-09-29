@@ -34,5 +34,11 @@ hex           = { workspace = true }
 clap          = { workspace = true }
 
 common        = { path = "../common" }
+fpp-types     = { path = "../fpp-types" }
+fpp-wire      = { path = "../fpp-wire" }
+fpp-crypto    = { path = "../fpp-crypto" }
+fpp-merkle    = { path = "../fpp-merkle" }
+fpp-tokens    = { path = "../fpp-tokens" }
+fpp-session   = { path = "../fpp-session" }
 
 lru           = "0.18"

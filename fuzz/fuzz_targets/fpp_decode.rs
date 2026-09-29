@@ -15,6 +15,11 @@ fuzz_target!(|data: &[u8]| {
     let _ = InputCommit::from_cbor(data);
     let _ = Checkpoint::from_cbor(data);
     let _ = AdmitPop::from_cbor(data);
+    let _ = fpp_tokens::AttestationResult::from_cbor(data);
+    let _ = fpp_tokens::SessionAdmissionToken::from_cbor(data);
+    let _ = fpp_tokens::ServerAttestationResult::from_cbor(data);
+    let _ = fpp_tokens::control::Control::decode(data);
+    let _ = fpp_wire::InputFrame::decode(data);
 
     let mut keys = KeySet::default();
     for (seed, role) in [(0x51, KeyRole::Session), (0x52, KeyRole::Session), (0x61, KeyRole::GsInstance), (0x71, KeyRole::Log)] {
