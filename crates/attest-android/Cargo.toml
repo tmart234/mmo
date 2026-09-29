@@ -1,0 +1,15 @@
+[package]
+name = "attest-android"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Verifier appraisal of Android Keystore key attestation (KeyMint): chain to Google's roots, revocation, verified boot, app identity"
+
+[dependencies]
+attest-core = { path = "../attest-core" }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+rcgen = { workspace = true }
+fpp-types = { path = "../fpp-types" }

@@ -1,0 +1,17 @@
+[package]
+name = "attest-apple"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Verifier appraisal of Apple App Attest: attestation objects (chain to Apple's root, nonce, App ID, key id) and assertions"
+
+[dependencies]
+attest-core = { path = "../attest-core" }
+fpp-wire = { path = "../fpp-wire" }
+sha2 = { workspace = true }
+aws-lc-rs = { workspace = true }
+
+[dev-dependencies]
+rcgen = { workspace = true }
+fpp-types = { path = "../fpp-types" }

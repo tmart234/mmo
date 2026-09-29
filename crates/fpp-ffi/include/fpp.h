@@ -199,6 +199,61 @@ enum FppStatus fpp_sha256(const uint8_t *data, size_t len, uint8_t *out);
 // `object` valid for `len` bytes; `out` valid for 32 bytes.
 enum FppStatus fpp_object_digest(const uint8_t *object, size_t len, uint8_t *out);
 
+// The challenge a device binds its platform evidence to (roadmap P3):
+// `SHA-256("fpp/1/attest-challenge" || 0x00 || vs_challenge || session_pub)`.
+// Pass it to Android `KeyGenParameterSpec.Builder.setAttestationChallenge`
+// or as the App Attest `clientDataHash`. Evidence made for another admission
+// challenge or another session key does not verify.
+//
+// # Safety
+// `vs_challenge`, `session_pub` and `out` valid for 32 bytes each.
+enum FppStatus fpp_attest_challenge(const uint8_t *vs_challenge,
+                                    const uint8_t *session_pub,
+                                    uint8_t *out);
+
+// The evidence envelope for an Android Keystore key attestation: the
+// attested key's certificate chain, leaf first
+// (`KeyStore.getCertificateChain`, each `Certificate.getEncoded()`), for
+// `ClientAdmissionRequest.evidence`.
+//
+// # Safety
+// `certs` and `lens` valid for `count` entries; each `certs[i]` valid for
+// `lens[i]` bytes. `out_len` valid for a write; `out` NULL or valid for `cap`.
+enum FppStatus fpp_evidence_android_key(const uint8_t *const *certs,
+                                        const size_t *lens,
+                                        size_t count,
+                                        uint8_t *out,
+                                        size_t cap,
+                                        size_t *out_len);
+
+// The evidence envelope for an Apple App Attest attestation object (from
+// `DCAppAttestService.attestKey`, made with `fpp_attest_challenge` as the
+// client data hash). Send it once per app key; later admissions send
+// assertions (`fpp_evidence_apple_assert`).
+//
+// # Safety
+// `attestation` valid for `len` bytes; `out_len` valid for a write; `out`
+// NULL or valid for `cap` bytes.
+enum FppStatus fpp_evidence_apple_attest(const uint8_t *attestation,
+                                         size_t len,
+                                         uint8_t *out,
+                                         size_t cap,
+                                         size_t *out_len);
+
+// The evidence envelope for an Apple App Attest assertion (from
+// `DCAppAttestService.generateAssertion`, with `fpp_attest_challenge` as the
+// client data hash) by the attested key `key_id` (32 bytes, base64-decoded).
+//
+// # Safety
+// `key_id` valid for 32 bytes; `assertion` valid for `len` bytes; `out_len`
+// valid for a write; `out` NULL or valid for `cap` bytes.
+enum FppStatus fpp_evidence_apple_assert(const uint8_t *key_id,
+                                         const uint8_t *assertion,
+                                         size_t len,
+                                         uint8_t *out,
+                                         size_t cap,
+                                         size_t *out_len);
+
 // Generate a fresh key from the OS random number generator.
 //
 // # Safety

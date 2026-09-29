@@ -1,8 +1,9 @@
 // crates/vs/src/broker.rs
-//! Stub Verifier and Broker for clients (roles split out in P2, real
-//! appraisal in P3). The flow and the tokens are the real ones (04 §5.1,
-//! §5.2, §6.1, §6.2); what is stubbed is the appraisal: without platform
-//! evidence a device is tier D0, and this stub accepts no evidence yet.
+//! Verifier and Broker for clients (roles split out in P2). The flow and the
+//! tokens are the real ones (04 §5.1, §5.2, §6.1, §6.2). The Verifier
+//! appraises Android key attestation and Apple App Attest evidence
+//! (`appraisal.rs`); without evidence, or with evidence that fails, a device
+//! is tier D0.
 //!
 //! Queues carry a tier floor (03 §4.4): `open` admits everyone; `verified`
 //! requires D2, so today's clients are refused there and would be placed in
@@ -11,7 +12,7 @@
 use common::crypto::{client_admission_sign_bytes, now_ms};
 use common::proto::{ClientAdmission, ClientAdmissionRequest};
 use ed25519_dalek::{Signature, VerifyingKey};
-use fpp_tokens::{instance_id, AttestationResult, Features, SessionAdmissionToken};
+use fpp_tokens::{instance_id, AttestationResult, SessionAdmissionToken};
 use fpp_types::{BuildId, DeviceTier, Did, MatchId, Reason};
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
@@ -80,8 +81,17 @@ pub fn admit_client(
         return refuse(Reason::ArInvalid);
     }
 
-    // ---- Verifier (stub): no evidence is appraised yet, so tier D0.
-    let tier = DeviceTier::D0Unknown;
+    // ---- Verifier: platform evidence bound to this challenge and session key.
+    let appraised =
+        crate::appraisal::appraise(&ctx.attestation, challenge, &req.session_pub, &req.evidence);
+    let tier = appraised.tier;
+    // A hardware-rooted identity where the platform gives one (dev stand-in
+    // for HMAC(publisher_did_key, hardware_identity), 04 §5); else a
+    // per-key pseudonym.
+    let did = match &appraised.identity {
+        Some(id) => Did(tagged_hash("mmo/dev-did-hw", id)),
+        None => Did(tagged_hash("mmo/dev-did", &req.session_pub)),
+    };
     let now = now_ms() / 1000;
     let ar = AttestationResult {
         iss: VERIFIER_ISS.into(),
@@ -90,14 +100,13 @@ pub fn admit_client(
         cti: random16(),
         cnf: req.session_pub,
         nonce: *challenge,
-        // No hardware identity without evidence: a per-key pseudonym.
-        did: Did(tagged_hash("mmo/dev-did", &req.session_pub)),
+        did,
         tier,
-        features: Features::default(),
+        features: appraised.features,
         client_build: BuildId(req.client_build),
         platform: req.platform.clone(),
         policy_ver: POLICY_VER,
-        warnings: vec!["no-platform-evidence".into()],
+        warnings: appraised.warnings,
     };
 
     // ---- Broker: queue policy, then a match on a live server.

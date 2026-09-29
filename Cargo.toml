@@ -7,6 +7,9 @@ members = [
     "crates/fpp-tokens",
     "crates/fpp-session",
     "crates/fpp-ffi",
+    "crates/attest-core",
+    "crates/attest-android",
+    "crates/attest-apple",
     "crates/common",
     "crates/gs-sim",
     "crates/vs",
@@ -45,8 +48,17 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 serde-big-array = "0.5"
 rcgen = "0.12"
+# Verifier appraisal of platform evidence (attest-*): X.509 parsing, and
+# signature checks with the same aws-lc-rs the TLS stack uses.
+x509-parser = "0.18"
+aws-lc-rs = "1.18"
 thiserror = "2.0"
 dashmap = "6"
 once_cell = "1.19"
 prometheus = "0.14"
 lazy_static = "1.4"
+# gs-sim hashes its own executable at start (sw_hash, finding F06); an
+# unoptimized SHA-256 over a debug binary of ~80 MB took ~5 s and made the
+# smoke test's client give up before the first Checkpoint.
+[profile.dev.package.sha2]
+opt-level = 3

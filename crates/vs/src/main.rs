@@ -8,13 +8,16 @@
 // Files:
 // - ctx.rs         : shared context, role keys, session map
 // - admission.rs   : control-connection entry (GS join, client admission)
-// - broker.rs      : stub Verifier (AR) and Broker (SAT) for clients
+// - broker.rs      : Verifier (AR) and Broker (SAT) for clients
+// - appraisal.rs   : client platform evidence (Android key attestation,
+//                    Apple App Attest) -> device tier
 // - liveness.rs    : SAR chain per game server
 // - checkpoints.rs : Checkpoint verification and evidence storage
 // - attest.rs      : TPM quote appraisal
 // - watchdog.rs    : revoke when Checkpoints stop
 
 mod admission;
+mod appraisal;
 mod attest;
 mod broker;
 mod checkpoints;
@@ -55,6 +58,23 @@ struct Opts {
     /// PKCS#8 private key (DER) for `--tls-cert`.
     #[arg(long, default_value = common::pki::DEFAULT_VS_TLS_KEY)]
     tls_key: String,
+
+    /// Android app allowed to attest: `package:sha256hex` of its signing
+    /// certificate (repeatable). Without one, Android evidence earns D0.
+    #[arg(long = "android-app")]
+    android_apps: Vec<String>,
+    /// Google's attestation status list (JSON from
+    /// https://android.googleapis.com/attestation/status); refresh daily.
+    #[arg(long)]
+    android_status: Option<PathBuf>,
+    /// Apple App ID allowed to attest: `TEAMID.bundle.id` (repeatable).
+    /// Without one, App Attest evidence earns D0.
+    #[arg(long = "apple-app-id")]
+    apple_app_ids: Vec<String>,
+    /// Accept App Attest keys from Apple's development environment. Never in
+    /// production.
+    #[arg(long)]
+    apple_allow_development: bool,
 }
 
 #[tokio::main]
@@ -67,7 +87,32 @@ async fn main() -> Result<()> {
 
     // Load (or create) VS signing key
     let (vs_sk_raw, _vs_pk_raw) = load_or_make_keys(&opts.vs_sk, &opts.vs_pk)?;
-    let ctx = VsCtx::new(Arc::new(vs_sk_raw));
+    let mut ctx = VsCtx::new(Arc::new(vs_sk_raw));
+    let status = opts
+        .android_status
+        .as_ref()
+        .map(fs::read_to_string)
+        .transpose()
+        .context("read --android-status")?;
+    ctx.attestation = Arc::new(appraisal::ClientAttestation::from_options(
+        &opts.android_apps,
+        status.as_deref(),
+        &opts.apple_app_ids,
+        opts.apple_allow_development,
+    )?);
+    println!(
+        "[VS] client evidence: android {}, apple {}",
+        if ctx.attestation.android.is_some() {
+            "on"
+        } else {
+            "off"
+        },
+        if ctx.attestation.apple.is_some() {
+            "on"
+        } else {
+            "off"
+        }
+    );
     ctx.keys
         .bundle()
         .save(common::keys::DEFAULT_BUNDLE)

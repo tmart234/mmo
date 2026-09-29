@@ -19,6 +19,7 @@
 
 use ed25519_dalek::SigningKey;
 use fpp_crypto::{self as crypto, Ed25519Signer, KeyRole, KeySet, VerifyError};
+use fpp_tokens::evidence::{attest_challenge, Evidence, MAX_CHAIN, MAX_EVIDENCE};
 use fpp_types::{BuildId, Digest, GsInstanceId, MatchId};
 use fpp_wire::msg::frame_leaf_data;
 use fpp_wire::{Checkpoint, InputCommit, InputLeaf};
@@ -283,6 +284,131 @@ pub unsafe extern "C" fn fpp_object_digest(
     guard(|| {
         let object = unsafe { input(object, len) }?;
         unsafe { write_fixed(out, &crypto::object_digest(object).0) }
+    })
+}
+
+// ------------------------------------------------------------------ platform evidence
+
+/// The challenge a device binds its platform evidence to (roadmap P3):
+/// `SHA-256("fpp/1/attest-challenge" || 0x00 || vs_challenge || session_pub)`.
+/// Pass it to Android `KeyGenParameterSpec.Builder.setAttestationChallenge`
+/// or as the App Attest `clientDataHash`. Evidence made for another admission
+/// challenge or another session key does not verify.
+///
+/// # Safety
+/// `vs_challenge`, `session_pub` and `out` valid for 32 bytes each.
+#[no_mangle]
+pub unsafe extern "C" fn fpp_attest_challenge(
+    vs_challenge: *const u8,
+    session_pub: *const u8,
+    out: *mut u8,
+) -> FppStatus {
+    guard(|| {
+        let challenge = unsafe { fixed::<32>(vs_challenge) }?;
+        let session = unsafe { fixed::<32>(session_pub) }?;
+        unsafe { write_fixed(out, &attest_challenge(&challenge, &session)) }
+    })
+}
+
+fn write_evidence(evidence: Evidence, out: *mut u8, cap: usize, out_len: *mut usize) -> Res {
+    let bytes = evidence.encode();
+    if bytes.len() > MAX_EVIDENCE {
+        return Err(FppStatus::InvalidArgument);
+    }
+    // SAFETY: forwarded caller contract.
+    unsafe { write_object(&bytes, out, cap, out_len) }
+}
+
+/// The evidence envelope for an Android Keystore key attestation: the
+/// attested key's certificate chain, leaf first
+/// (`KeyStore.getCertificateChain`, each `Certificate.getEncoded()`), for
+/// `ClientAdmissionRequest.evidence`.
+///
+/// # Safety
+/// `certs` and `lens` valid for `count` entries; each `certs[i]` valid for
+/// `lens[i]` bytes. `out_len` valid for a write; `out` NULL or valid for `cap`.
+#[no_mangle]
+pub unsafe extern "C" fn fpp_evidence_android_key(
+    certs: *const *const u8,
+    lens: *const usize,
+    count: usize,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> FppStatus {
+    guard(|| {
+        if count == 0 || count > MAX_CHAIN {
+            return Err(FppStatus::InvalidArgument);
+        }
+        if certs.is_null() || lens.is_null() {
+            return Err(FppStatus::NullPointer);
+        }
+        let mut chain = Vec::with_capacity(count);
+        for i in 0..count {
+            // SAFETY: both arrays are valid for `count` entries.
+            let (ptr, len) = unsafe { (*certs.add(i), *lens.add(i)) };
+            if len == 0 {
+                return Err(FppStatus::InvalidArgument);
+            }
+            chain.push(unsafe { input(ptr, len) }?.to_vec());
+        }
+        write_evidence(Evidence::AndroidKey { chain }, out, cap, out_len)
+    })
+}
+
+/// The evidence envelope for an Apple App Attest attestation object (from
+/// `DCAppAttestService.attestKey`, made with `fpp_attest_challenge` as the
+/// client data hash). Send it once per app key; later admissions send
+/// assertions (`fpp_evidence_apple_assert`).
+///
+/// # Safety
+/// `attestation` valid for `len` bytes; `out_len` valid for a write; `out`
+/// NULL or valid for `cap` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn fpp_evidence_apple_attest(
+    attestation: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> FppStatus {
+    guard(|| {
+        let attestation = unsafe { input(attestation, len) }?.to_vec();
+        if attestation.is_empty() {
+            return Err(FppStatus::InvalidArgument);
+        }
+        write_evidence(Evidence::AppleAppAttest { attestation }, out, cap, out_len)
+    })
+}
+
+/// The evidence envelope for an Apple App Attest assertion (from
+/// `DCAppAttestService.generateAssertion`, with `fpp_attest_challenge` as the
+/// client data hash) by the attested key `key_id` (32 bytes, base64-decoded).
+///
+/// # Safety
+/// `key_id` valid for 32 bytes; `assertion` valid for `len` bytes; `out_len`
+/// valid for a write; `out` NULL or valid for `cap` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn fpp_evidence_apple_assert(
+    key_id: *const u8,
+    assertion: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> FppStatus {
+    guard(|| {
+        let key_id = unsafe { fixed::<32>(key_id) }?.to_vec();
+        let assertion = unsafe { input(assertion, len) }?.to_vec();
+        if assertion.is_empty() {
+            return Err(FppStatus::InvalidArgument);
+        }
+        write_evidence(
+            Evidence::AppleAppAssert { key_id, assertion },
+            out,
+            cap,
+            out_len,
+        )
     })
 }
 
