@@ -1,0 +1,49 @@
+# cargo-deny policy (CI job `dependency-policy`, blocking). Run locally with
+# `cargo deny check`. Every ignore needs a reason and an exit plan.
+
+[graph]
+all-features = false
+
+[advisories]
+version = 2
+yanked = "deny"
+# Flag unmaintained crates we depend on directly; transitive ones (mostly the
+# Bevy reference client's font/GUI stack) are tracked upstream.
+unmaintained = "workspace"
+ignore = [
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.x is unmaintained; wire encoding moves to deterministic CBOR/COSE in fpp-wire (roadmap P1, docs/anticheat/04-protocol.md §2)" },
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml via wayland-scanner: build-time codegen over trusted Wayland protocol XML in the Bevy reference client only; never parses runtime input. Clears with the next Bevy upgrade." },
+    { id = "RUSTSEC-2026-0195", reason = "same as RUSTSEC-2026-0194" },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "BSL-1.0",
+    "0BSD",
+    # Mozilla CA certificate data (webpki roots)
+    "CDLA-Permissive-2.0",
+]
+
+[bans]
+# The Bevy reference client pulls many duplicate versions; not worth failing on.
+multiple-versions = "allow"
+wildcards = "deny"
+# Workspace crates depend on each other by path.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

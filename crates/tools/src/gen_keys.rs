@@ -1,3 +1,4 @@
+use common::pki::DevPki;
 use ed25519_dalek::SigningKey;
 use std::fs::{self, File};
 use std::io::Write;
@@ -17,4 +18,12 @@ fn main() {
         .unwrap();
 
     println!("Generated keys: keys/vs_ed25519.pk8 + .pub");
+
+    // Dev CA + VS/GS TLS certificates; every QUIC link verifies against the CA.
+    DevPki::generate()
+        .and_then(|pki| pki.write_to("keys"))
+        .expect("generate dev PKI");
+    println!(
+        "Generated dev PKI: keys/dev_ca.der, keys/vs_tls.{{der,key.der}}, keys/gs_tls.{{der,key.der}}"
+    );
 }

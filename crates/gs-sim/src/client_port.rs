@@ -9,11 +9,7 @@ use common::{
 };
 use ed25519_dalek::{Signature, VerifyingKey};
 use quinn::{Endpoint, ServerConfig};
-use std::{
-    collections::VecDeque,
-    convert::TryFrom,
-    sync::{Arc, Mutex},
-};
+use std::{convert::TryFrom, sync::Arc};
 use tokio::{
     sync::watch,
     time::{sleep, timeout, Duration},
@@ -23,24 +19,15 @@ use crate::ledger::LedgerEvent;
 use crate::state::{CmdKey, OpResult, PlayerState, Shared, TokenBucket};
 
 const NONCE_WINDOW: u64 = 4; // allow nonce jumps up to +4
-const TICKET_RING_MAX: usize = 32;
 const CLIENT_HELLO_TIMEOUT_SECS: u64 = 10;
 /// Grace period (ms) for ticket expiration to handle clock skew and race conditions.
-/// A ticket that expired within this window is still accepted if it's in the ring.
+/// A ticket that expired within this window is still accepted if it's in the history.
 const TICKET_EXPIRY_GRACE_MS: u64 = 2000;
 
-/// Configure QUIC server for GS client port.
-fn configure_quic_server() -> anyhow::Result<ServerConfig> {
-    // Generate self-signed certificate for local dev/testing
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
-    let cert_der = cert.serialize_der()?;
-    let priv_key = cert.serialize_private_key_der();
-
-    let cert_chain = vec![rustls::pki_types::CertificateDer::from(cert_der)];
-    let key_der = rustls::pki_types::PrivateKeyDer::try_from(priv_key)
-        .map_err(|e| anyhow::anyhow!("Failed to parse private key: {}", e))?;
-
-    let mut server_config = ServerConfig::with_single_cert(cert_chain, key_der)?;
+/// Configure QUIC server for GS client port, presenting a certificate that
+/// clients verify against their pinned CA.
+fn configure_quic_server(identity: &common::pki::ServerIdentity) -> anyhow::Result<ServerConfig> {
+    let mut server_config = common::pki::quic_server_config(identity)?;
 
     // Performance tuning for MMO
     let mut transport_config = quinn::TransportConfig::default();
@@ -69,12 +56,13 @@ fn configure_quic_server() -> anyhow::Result<ServerConfig> {
 ///
 /// When VS revokes us (or we miss tickets), we disconnect everyone.
 pub async fn client_port_task(
+    identity: common::pki::ServerIdentity,
     shared: Shared,
     revoke_rx: watch::Receiver<bool>,
     ticket_rx: watch::Receiver<Option<PlayTicket>>,
 ) -> anyhow::Result<()> {
     // Configure and start QUIC server
-    let server_config = configure_quic_server()?;
+    let server_config = configure_quic_server(&identity)?;
     let endpoint = Endpoint::server(server_config, "127.0.0.1:50000".parse()?)?;
     println!("[GS] QUIC client port listening on 127.0.0.1:50000");
 
@@ -148,7 +136,6 @@ pub async fn client_port_task(
         // The task will accept the bi-stream, not the main loop.
         let shared_for_task = shared.clone();
         let revoke_rx_for_task = revoke_rx.clone();
-        let ticket_rx_for_task = ticket_rx.clone();
 
         tokio::spawn(async move {
             let task_start = std::time::Instant::now();
@@ -157,14 +144,8 @@ pub async fn client_port_task(
                 task_start.elapsed(),
                 peer_addr
             );
-            if let Err(e) = handle_client_connection(
-                conn,
-                peer_addr,
-                shared_for_task,
-                revoke_rx_for_task,
-                ticket_rx_for_task,
-            )
-            .await
+            if let Err(e) =
+                handle_client_connection(conn, peer_addr, shared_for_task, revoke_rx_for_task).await
             {
                 eprintln!("[GS] client {} error: {e:?}", peer_addr);
             }
@@ -179,7 +160,6 @@ async fn handle_client_connection(
     peer_addr: std::net::SocketAddr,
     shared: Shared,
     revoke_rx: watch::Receiver<bool>,
-    ticket_rx: watch::Receiver<Option<PlayTicket>>,
 ) -> anyhow::Result<()> {
     use anyhow::{bail, Context};
 
@@ -274,39 +254,16 @@ async fn handle_client_connection(
         (guard.session_id, guard.vs_pub.to_bytes())
     };
 
-    // Get the current ticket
-    let local_ticket_rx = ticket_rx.clone();
-    let first_ticket: PlayTicket = match local_ticket_rx.borrow().clone() {
-        Some(t) => t,
-        None => bail!("no ticket available"),
+    // Start from the newest verified ticket. Later TicketUpdates continue the
+    // chain from here, one ticket at a time, so the client can verify each.
+    let first_ticket: PlayTicket = {
+        let guard = shared.lock().unwrap();
+        match guard.ticket_history.back() {
+            Some(t) => t.clone(),
+            None => bail!("no ticket available"),
+        }
     };
-
-    // === Ticket ring so we accept recently rolled tickets even when client idles ===
-    let ring: Arc<Mutex<VecDeque<PlayTicket>>> = Arc::new(Mutex::new(VecDeque::new()));
-    let latest_sent_counter: Arc<std::sync::atomic::AtomicU64> =
-        Arc::new(std::sync::atomic::AtomicU64::new(first_ticket.counter));
-    {
-        let mut r = ring.lock().unwrap();
-        r.push_back(first_ticket.clone());
-    }
-    // Watcher that pushes every new ticket into the ring
-    {
-        let mut rx = local_ticket_rx.clone();
-        let ring_for_watcher = ring.clone();
-        tokio::spawn(async move {
-            while rx.changed().await.is_ok() {
-                if let Some(t) = rx.borrow().clone() {
-                    let mut r = ring_for_watcher.lock().unwrap();
-                    if r.back().map(|p| p.counter) != Some(t.counter) {
-                        r.push_back(t);
-                        while r.len() > TICKET_RING_MAX {
-                            r.pop_front();
-                        }
-                    }
-                }
-            }
-        });
-    }
+    let mut last_sent_counter = first_ticket.counter;
 
     // =========================================================================
     // Step 3: Send ServerHello back to client
@@ -393,12 +350,7 @@ async fn handle_client_connection(
             };
             let prev_tip = guard.receipt_tip;
 
-            // === Ticket-ring validation (newest → oldest) ===
-            let ring_snapshot: Vec<PlayTicket> = {
-                let r = ring.lock().unwrap();
-                r.iter().cloned().collect()
-            };
-
+            // === Stapled ticket must be one we recently forwarded (newest → oldest) ===
             let ticket_matches = |pt: &PlayTicket| -> bool {
                 if now_ms_val < pt.not_before_ms
                     || now_ms_val > pt.not_after_ms.saturating_add(TICKET_EXPIRY_GRACE_MS)
@@ -420,17 +372,11 @@ async fn handle_client_connection(
                 true
             };
 
-            let mut used_recent = false;
-            for pt in ring_snapshot.iter().rev() {
-                if ticket_matches(pt) {
-                    used_recent = true;
-                    break;
-                }
-            }
+            let used_recent = guard.ticket_history.iter().rev().any(ticket_matches);
             if !used_recent {
                 eprintln!(
-                    "[GS] ticket mismatch from {peer_addr} (not in recent ring of {} tickets)",
-                    ring_snapshot.len()
+                    "[GS] ticket mismatch from {peer_addr} (not in recent history of {} tickets)",
+                    guard.ticket_history.len()
                 );
                 return Err(());
             }
@@ -678,34 +624,22 @@ async fn handle_client_connection(
             }
         };
 
-        // Check if there's a newer ticket to send to this client
-        let maybe_ticket_update: Option<(GsToClient, u64)> = {
-            use std::sync::atomic::Ordering;
-            let ring_guard = ring.lock().unwrap();
-            if let Some(newest) = ring_guard.back() {
-                let last_sent = latest_sent_counter.load(Ordering::SeqCst);
-                if newest.counter > last_sent {
-                    let new_counter = newest.counter;
-                    let update = GsToClient::TicketUpdate(TicketUpdate {
-                        ticket: newest.clone(),
-                    });
-                    Some((update, new_counter))
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
-
-        // Send ticket update if we have one
-        if let Some((update, new_counter)) = maybe_ticket_update {
-            use std::sync::atomic::Ordering;
+        // Forward every ticket newer than the last one sent, oldest first, so
+        // the client sees an unbroken chain (it rejects gaps and forks).
+        let updates = shared.lock().unwrap().tickets_after(last_sent_counter);
+        let mut update_failed = false;
+        for ticket in updates {
+            let counter = ticket.counter;
+            let update = GsToClient::TicketUpdate(TicketUpdate { ticket });
             if let Err(e) = send_msg_continue(&mut send_stream, &update).await {
                 eprintln!("[GS] send TicketUpdate to {peer_addr} failed: {e:?}");
+                update_failed = true;
                 break;
             }
-            latest_sent_counter.store(new_counter, Ordering::SeqCst);
+            last_sent_counter = counter;
+        }
+        if update_failed {
+            break;
         }
 
         // Respond with an updated WorldSnapshot back to this client

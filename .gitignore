@@ -20,4 +20,14 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 *.log
-*.lock
+
+# Key material is generated locally (cargo run -p tools --bin gen_keys) and
+# never committed. keys/ at the root has its own .gitignore; tests create
+# per-crate keys/ directories.
+crates/*/keys/
+
+# Runtime output of vs/gs-sim (evidence and ledger logs)
+da_log/
+
+# Python bytecode (interop checkers)
+__pycache__/

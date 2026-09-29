@@ -229,3 +229,15 @@ pub fn canonical_serialize<T: Serialize>(t: &T) -> Vec<u8> {
         .serialize(t)
         .expect("canonical serialize")
 }
+
+/// Load a pinned Ed25519 public key (32 raw bytes) from `path`.
+pub fn load_verifying_key(path: impl AsRef<std::path::Path>) -> anyhow::Result<VerifyingKey> {
+    use anyhow::Context;
+    let path = path.as_ref();
+    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+        anyhow::anyhow!("{}: expected 32 bytes, got {}", path.display(), bytes.len())
+    })?;
+    VerifyingKey::from_bytes(&arr)
+        .with_context(|| format!("{}: invalid Ed25519 key", path.display()))
+}

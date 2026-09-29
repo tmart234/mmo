@@ -1,5 +1,14 @@
 # TPM (Trusted Platform Module) Integration Guide
 
+> **Status (2026-09):** this guide describes the prototype. It is out of date in
+> one direction and optimistic in another. The VS *does* call `verify_quote`
+> today, but the check is not a real attestation: the quote's nonce is chosen by
+> the GS, there is no EK certificate chain or AK credential activation, only
+> simulated Ed25519 AKs verify, and `sw_hash` is self-reported (findings F04–F06
+> in [docs/anticheat/07-gap-analysis-and-roadmap.md](docs/anticheat/07-gap-analysis-and-roadmap.md)).
+> The replacement is Verifier-side appraisal of platform evidence
+> ([docs/anticheat/03-architecture.md](docs/anticheat/03-architecture.md) §5.1).
+
 This guide explains how to use TPM attestation in the MMO protocol for hardware-rooted trust.
 
 ## Overview

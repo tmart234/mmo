@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use common::proto::{OpId, PlayTicket};
@@ -11,6 +11,9 @@ use crate::ledger::Ledger;
 /// Maximum number of processed operations to track per player.
 /// Sized to cover ~10 minutes of rapid operations at 10 ops/sec.
 const OP_CACHE_SIZE: usize = 6000;
+
+/// Verified PlayTickets kept for client handlers (~64 s at one ticket per 2 s).
+pub const TICKET_HISTORY_MAX: usize = 32;
 
 #[derive(Hash, Eq, PartialEq, Clone, Copy, Debug)]
 pub enum CmdKey {
@@ -91,9 +94,10 @@ pub struct GsShared {
     // Rolling transcript tip advertised in heartbeats
     pub receipt_tip: [u8; 32],
 
-    // Tickets (supporting rollover grace)
-    pub latest_ticket: Option<PlayTicket>,
-    pub prev_ticket: Option<PlayTicket>,
+    // Verified PlayTickets in chain order, newest last. Client handlers read
+    // this rather than the ticket watch channel (which can skip values), so
+    // every client can be sent every ticket and verify the chain end to end.
+    pub ticket_history: VecDeque<PlayTicket>,
     pub last_ticket_ms: u64,
 
     // World state
@@ -124,8 +128,7 @@ impl GsShared {
             sw_hash,
             receipt_tip: [0u8; 32],
 
-            latest_ticket: None,
-            prev_ticket: None,
+            ticket_history: VecDeque::new(),
             last_ticket_ms: 0,
 
             players: HashMap::new(),
@@ -135,6 +138,24 @@ impl GsShared {
             runtime: None,
             da_buffer: Vec::new(),
         }
+    }
+
+    /// Record a ticket that passed chain verification.
+    pub fn push_ticket(&mut self, ticket: PlayTicket, now_ms: u64) {
+        self.ticket_history.push_back(ticket);
+        while self.ticket_history.len() > TICKET_HISTORY_MAX {
+            self.ticket_history.pop_front();
+        }
+        self.last_ticket_ms = now_ms;
+    }
+
+    /// Tickets newer than `counter`, oldest first.
+    pub fn tickets_after(&self, counter: u64) -> Vec<PlayTicket> {
+        self.ticket_history
+            .iter()
+            .filter(|t| t.counter > counter)
+            .cloned()
+            .collect()
     }
 
     /// Get or initialize the player runtime (lazy init).

@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-/// Network robustness configuration for VS (Verification Server).
+/// Network robustness configuration for VS (Validation Server).
 #[derive(Debug, Clone)]
 pub struct VsConfig {
     /// Maximum time skew allowed for JoinRequest timestamp (default: 30s for cross-region).
@@ -20,6 +20,10 @@ pub struct VsConfig {
 
     /// Grace period for out-of-order heartbeat vs transcript (default: 5s).
     pub heartbeat_grace_period_ms: u64,
+
+    /// Deadline for a new connection to finish the QUIC handshake and deliver
+    /// its JoinRequest (default: 10s). Idle connections are dropped after it.
+    pub admission_timeout_ms: u64,
 
     /// Priority 3 (TOFU/TPM fix): allowlist of approved GS binary hashes (sw_hash).
     /// Each entry is a sha256 digest of an approved GS build.
@@ -44,6 +48,7 @@ impl Default for VsConfig {
             heartbeat_timeout_ms: 30_000, // 30s (was 10s)
             physics_check_timeout_ms: 10_000,
             heartbeat_grace_period_ms: 5_000,
+            admission_timeout_ms: 10_000,
             sw_hash_allowlist: Vec::new(),
             required_pcr_baselines: std::collections::BTreeMap::new(),
         }

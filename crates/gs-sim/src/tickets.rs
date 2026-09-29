@@ -125,11 +125,9 @@ pub async fn ticket_listener(
                 let now = now_ms();
                 {
                     let mut guard = shared.lock().unwrap();
-                    // move current to prev, then set latest
-                    guard.prev_ticket = guard.latest_ticket.take();
-                    guard.latest_ticket = Some(pt.clone());
-                    guard.last_ticket_ms = now;
-                    // once revoked=true we don't flip it back here
+                    // Before notifying watchers, so the history is never behind
+                    // the channel. Once revoked=true we don't flip it back here.
+                    guard.push_ticket(pt.clone(), now);
                 }
                 let _ = ticket_tx.send(Some(pt.clone()));
                 println!("[GS] ticket #{} (time_ok=true)", pt.counter);

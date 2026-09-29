@@ -13,6 +13,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: No private key material in git
+        run: |
+          if git ls-files | grep -E '\.(pk8|pem)$|\.key\.der$|(^|/)keys/[^/]+$' | grep -v '/\.gitignore$'; then
+            echo "::error::private key material is tracked by git (generate it with gen_keys instead)"
+            exit 1
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -33,7 +40,45 @@ jobs:
         env:
           STRICT_SMOKE: "1"
 
-      - name: Security audit
+      # The Halo: CE port (first reference title) is 32-bit x86: keep the C SDK
+      # building and conforming for that ABI.
+      - name: C SDK conformance on i686 (Halo ABI)
         run: |
-          cargo install cargo-audit --locked || true
-          cargo audit || true
+          sudo apt-get update -q && sudo apt-get install -y -q gcc-multilib
+          rustup target add i686-unknown-linux-gnu
+          make ffi-c-test-i686
+
+  # Advisories (RustSec, same database as cargo-audit), licenses, bans and
+  # sources, per deny.toml. Blocking.
+  dependency-policy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  # Short fuzzing pass over every decoder and verifier of untrusted input.
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      # The prebuilt cargo-fuzz is a musl binary and would default to building
+      # for musl, where AddressSanitizer is unavailable; target gnu explicitly.
+      - name: Seed the FPP corpus with the golden vectors
+        run: |
+          python3 - <<'PY'
+          import json, pathlib
+          out = pathlib.Path("fuzz/corpus/fpp_decode"); out.mkdir(parents=True, exist_ok=True)
+          for o in json.load(open("interop/vectors/fpp1.json"))["objects"]:
+              (out / o["name"].replace("/", "_")).write_bytes(bytes.fromhex(o["cose"]))
+          PY
+      - name: Fuzz (60 s per target)
+        run: |
+          for target in wire_decode verify_untrusted fpp_decode; do
+            cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$target" -- -max_total_time=60 -rss_limit_mb=2048
+          done
