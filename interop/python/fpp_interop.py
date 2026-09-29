@@ -43,6 +43,7 @@ HYBRID_REQUIRED = {"publisher_root", "build_signing", "policy_signing", "log"}
 TYPES = {
     "input-commit": ("fpp/1/input-commit", "application/fpp-input-commit+cbor"),
     "checkpoint": ("fpp/1/checkpoint", "application/fpp-checkpoint+cbor"),
+    "admit-pop": ("fpp/1/admit-pop", "application/fpp-admit-pop+cbor"),
 }
 
 
@@ -356,7 +357,15 @@ def parse_checkpoint(m):
     return c
 
 
-PARSERS = {"input-commit": parse_input_commit, "checkpoint": parse_checkpoint}
+def parse_admit_pop(m):
+    _require(isinstance(m, dict), "AdmitPop is not a map")
+    channel, binding = m.get("channel"), m.get("binding")
+    _require(isinstance(channel, str) and 1 <= len(channel.encode()) <= 32, "channel")
+    _require(isinstance(binding, bytes) and 32 <= len(binding) <= 64, "binding")
+    return {"channel": channel, "binding": binding.hex()}
+
+
+PARSERS = {"input-commit": parse_input_commit, "checkpoint": parse_checkpoint, "admit-pop": parse_admit_pop}
 
 
 def verify(cose, kind, keys):
@@ -459,6 +468,11 @@ def run(path):
         r.check(hashlib.sha256(cose).hexdigest() == o["digest"], f"{name}: object digest")
         derive = o["derive"]
         r.check(key["name"] == derive["signer"], f"{name}: signer")
+        if o["type"] == "admit-pop":
+            binding = derive["host_static"] + derive["joiner_static"]
+            r.check(payload["channel"] == "fpp-p2p/noise-ik" and payload["binding"] == binding,
+                    f"{name}: binding is host static key || joiner static key")
+            continue
         prev = derive["prev_object"]
         expected_prev = hashlib.sha256(bytes.fromhex(by_object[prev]["cose"])).hexdigest() if prev else "00" * 32
         r.check(payload["prev"] == expected_prev, f"{name}: prev chain")

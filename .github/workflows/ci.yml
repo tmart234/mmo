@@ -79,6 +79,6 @@ jobs:
           PY
       - name: Fuzz (60 s per target)
         run: |
-          for target in wire_decode verify_untrusted fpp_decode; do
+          for target in wire_decode verify_untrusted fpp_decode p2p_recv; do
             cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$target" -- -max_total_time=60 -rss_limit_mb=2048
           done

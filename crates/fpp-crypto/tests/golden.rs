@@ -12,7 +12,7 @@ use fpp_types::{ctx, BuildId, Digest, GsInstanceId, MatchId, FPP_VERSION};
 use fpp_wire::cbor::{self, Value};
 use fpp_wire::cose::{alg, ProtectedHeader, Sign1};
 use fpp_wire::msg::frame_leaf_data;
-use fpp_wire::{Checkpoint, InputCommit, InputLeaf, Payload};
+use fpp_wire::{AdmitPop, Checkpoint, InputCommit, InputLeaf, Payload};
 use serde_json::{json, Value as Json};
 use sha2::{Digest as _, Sha256};
 use std::path::PathBuf;
@@ -82,6 +82,10 @@ fn commit_json(c: &InputCommit) -> Json {
         "first_tick": c.first_tick, "last_tick": c.last_tick, "n": c.n,
         "frames_root": h(c.frames_root.0), "prev": h(c.prev.0),
     })
+}
+
+fn admit_pop_json(p: &AdmitPop) -> Json {
+    json!({"channel": p.channel, "binding": h(&p.binding)})
 }
 
 fn checkpoint_json(c: &Checkpoint) -> Json {
@@ -321,6 +325,21 @@ fn build() -> Json {
         d1,
     );
 
+    // ---- AdmitPop: slot 0's session key bound to a player-hosted Noise IK channel.
+    let (host_static, joiner_static) = ([0x81u8; 32], [0x82u8; 32]);
+    let pop = AdmitPop {
+        channel: AdmitPop::NOISE_IK.into(),
+        binding: [host_static, joiner_static].concat(),
+    };
+    let pop_cose = sign(&k("session-slot0").signer, &pop);
+    valid(
+        "admit-pop/slot0-noise-ik",
+        "admit-pop",
+        &pop_cose,
+        admit_pop_json(&pop),
+        json!({"signer": "session-slot0", "host_static": h(host_static), "joiner_static": h(joiner_static)}),
+    );
+
     // ---- Negative vectors: each must be rejected with this category.
     let mut reject = |name: &str, kind: &str, cose: Vec<u8>, category: &str| {
         objects.push(json!({"name": name, "type": kind, "expect": "reject", "category": category, "cose": h(cose)}));
@@ -448,6 +467,23 @@ fn build() -> Json {
         "schema",
     );
 
+    reject(
+        "reject/admit-pop-signed-by-gs-key",
+        "admit-pop",
+        sign(gs, &pop),
+        "role",
+    );
+    let short = AdmitPop {
+        channel: AdmitPop::NOISE_IK.into(),
+        binding: vec![0x81; 16],
+    };
+    reject(
+        "reject/admit-pop-short-binding",
+        "admit-pop",
+        sign(s0, &short),
+        "schema",
+    );
+
     let protected = header_for(gs, ctx::CHECKPOINT, Checkpoint::CONTENT_TYPE).to_value();
     let unprot = Value::Map(vec![(Value::int(4), Value::bytes(vec![0; 16]))]);
     reject(
@@ -547,14 +583,16 @@ fn check_with_rust(v: &Json) {
     for o in v["objects"].as_array().unwrap() {
         let name = o["name"].as_str().unwrap();
         let cose = hex::decode(o["cose"].as_str().unwrap()).unwrap();
-        let result = match o["type"].as_str().unwrap() {
-            "input-commit" => {
-                verify::<InputCommit>(&cose, &keyset).map(|x| (commit_json(&x.payload), x.digest))
-            }
-            "checkpoint" => verify::<Checkpoint>(&cose, &keyset)
-                .map(|x| (checkpoint_json(&x.payload), x.digest)),
-            other => panic!("type {other}"),
-        };
+        let result =
+            match o["type"].as_str().unwrap() {
+                "input-commit" => verify::<InputCommit>(&cose, &keyset)
+                    .map(|x| (commit_json(&x.payload), x.digest)),
+                "checkpoint" => verify::<Checkpoint>(&cose, &keyset)
+                    .map(|x| (checkpoint_json(&x.payload), x.digest)),
+                "admit-pop" => verify::<AdmitPop>(&cose, &keyset)
+                    .map(|x| (admit_pop_json(&x.payload), x.digest)),
+                other => panic!("type {other}"),
+            };
         match o["expect"].as_str().unwrap() {
             "valid" => {
                 let (payload, digest) = result.unwrap_or_else(|e| panic!("{name}: {e}"));

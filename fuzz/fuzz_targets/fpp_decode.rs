@@ -3,7 +3,7 @@
 
 use ed25519_dalek::SigningKey;
 use fpp_crypto::{verify, Ed25519Signer, KeyRole, KeySet};
-use fpp_wire::{cbor, cose::Sign1, Checkpoint, InputCommit, Payload};
+use fpp_wire::{cbor, cose::Sign1, AdmitPop, Checkpoint, InputCommit, Payload};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -14,6 +14,7 @@ fuzz_target!(|data: &[u8]| {
     let _ = Sign1::decode(data);
     let _ = InputCommit::from_cbor(data);
     let _ = Checkpoint::from_cbor(data);
+    let _ = AdmitPop::from_cbor(data);
 
     let mut keys = KeySet::default();
     for (seed, role) in [(0x51, KeyRole::Session), (0x52, KeyRole::Session), (0x61, KeyRole::GsInstance), (0x71, KeyRole::Log)] {
@@ -21,4 +22,5 @@ fuzz_target!(|data: &[u8]| {
     }
     let _ = verify::<InputCommit>(data, &keys);
     let _ = verify::<Checkpoint>(data, &keys);
+    let _ = verify::<AdmitPop>(data, &keys);
 });

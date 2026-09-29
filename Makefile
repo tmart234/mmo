@@ -13,7 +13,7 @@ endif
 
 # -------- Headless package set (what CI builds/tests) --------
 # Keep GUI crates (e.g., client-bevy) out of CI to avoid winit display issues.
-HEADLESS_PKGS := fpp-types fpp-wire fpp-crypto fpp-merkle fpp-ffi common client-core gs-core gs-sim vs tools
+HEADLESS_PKGS := fpp-types fpp-wire fpp-crypto fpp-merkle fpp-session fpp-ffi common client-core gs-core gs-sim vs tools
 PKG_FLAGS := $(foreach p,$(HEADLESS_PKGS),-p $(p))
 
 # -------- Phonies --------
@@ -77,7 +77,8 @@ interop:
 
 # C SDK conformance: compile a C program against only include/fpp.h and the
 # static library, run it, and check that what it signs is byte-identical to the
-# golden vectors and passes the independent verifier. The i686 variant is the
+# golden vectors and passes the independent verifier. Then the P2P session
+# test (M2): join, traffic, and the H03/H04 attacks, all through the C ABI. The i686 variant is the
 # ABI of the Halo: CE port (32-bit x86); it needs gcc-multilib and
 # `rustup target add i686-unknown-linux-gnu`.
 FFI_LIBS := -lgcc_s -lutil -lrt -lpthread -lm -ldl -lc
@@ -87,6 +88,9 @@ ffi-c-test:
 		crates/fpp-ffi/tests/c/conformance.c target/debug/libfpp.a $(FFI_LIBS) -o target/fpp-conformance
 	./target/fpp-conformance > target/fpp-conformance.jsonl
 	python3 interop/python/check_c_sdk.py target/fpp-conformance.jsonl
+	cc -std=c99 -Wall -Wextra -Werror -pedantic -Icrates/fpp-ffi/include \
+		crates/fpp-ffi/tests/c/p2p.c target/debug/libfpp.a $(FFI_LIBS) -o target/fpp-p2p
+	./target/fpp-p2p
 
 ffi-c-test-i686:
 	cargo build -p fpp-ffi --target i686-unknown-linux-gnu
@@ -95,6 +99,10 @@ ffi-c-test-i686:
 		-o target/fpp-conformance-i686
 	./target/fpp-conformance-i686 > target/fpp-conformance-i686.jsonl
 	python3 interop/python/check_c_sdk.py target/fpp-conformance-i686.jsonl
+	cc -m32 -std=c99 -Wall -Wextra -Werror -pedantic -Icrates/fpp-ffi/include \
+		crates/fpp-ffi/tests/c/p2p.c target/i686-unknown-linux-gnu/debug/libfpp.a $(FFI_LIBS) \
+		-o target/fpp-p2p-i686
+	./target/fpp-p2p-i686
 
 # Quick local sanity: just the smoke harness
 sim-positive:

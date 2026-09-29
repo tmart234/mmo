@@ -44,6 +44,7 @@ pub mod ctx {
 pub mod content_type {
     pub const INPUT_COMMIT: &str = "application/fpp-input-commit+cbor";
     pub const CHECKPOINT: &str = "application/fpp-checkpoint+cbor";
+    pub const ADMIT_POP: &str = "application/fpp-admit-pop+cbor";
 }
 
 macro_rules! fixed_id {
@@ -177,6 +178,8 @@ pub enum Reason {
     InputEquivocation = 10,
     PolicyKick = 11,
     ServerDraining = 12,
+    /// The host has no free player slot.
+    ServerFull = 13,
 }
 
 #[cfg(test)]
