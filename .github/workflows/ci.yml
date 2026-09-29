@@ -61,8 +61,16 @@ jobs:
           tool: cargo-fuzz
       # The prebuilt cargo-fuzz is a musl binary and would default to building
       # for musl, where AddressSanitizer is unavailable; target gnu explicitly.
+      - name: Seed the FPP corpus with the golden vectors
+        run: |
+          python3 - <<'PY'
+          import json, pathlib
+          out = pathlib.Path("fuzz/corpus/fpp_decode"); out.mkdir(parents=True, exist_ok=True)
+          for o in json.load(open("interop/vectors/fpp1.json"))["objects"]:
+              (out / o["name"].replace("/", "_")).write_bytes(bytes.fromhex(o["cose"]))
+          PY
       - name: Fuzz (60 s per target)
         run: |
-          for target in wire_decode verify_untrusted; do
+          for target in wire_decode verify_untrusted fpp_decode; do
             cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$target" -- -max_total_time=60 -rss_limit_mb=2048
           done

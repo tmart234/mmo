@@ -23,11 +23,21 @@ the commitments over it, and everything around it.
 ## 2. Encoding and signatures
 
 - **Encoding.** Deterministic CBOR (RFC 8949 §4.2.1, core deterministic
-  encoding). Receivers MUST reject non-deterministic encodings of signed payloads
-  (duplicate keys, non-minimal integers, indefinite lengths).
-- **Signed objects** are `COSE_Sign1` (RFC 9052). Objects signed by long-lived
-  roots use `COSE_Sign` with **two** signatures (Ed25519 and ML-DSA-65), and
-  both MUST verify.
+  encoding), restricted to one subset: unsigned and negative integers, byte
+  strings, UTF-8 text, arrays, maps whose keys are integers or text, `false`,
+  `true` and `null`. Floats, tags, `undefined`, other simple values and
+  indefinite lengths are not used. Receivers MUST reject anything outside the
+  deterministic encoding of that subset: non-minimal heads, unsorted or
+  duplicate map keys, invalid UTF-8, trailing bytes, and nesting deeper than 16.
+  Equivalently, bytes are accepted only if decoding and re-encoding them
+  reproduces them exactly. Declared lengths MUST be checked against the
+  remaining input before allocating.
+- **Signed objects** are untagged `COSE_Sign1` (RFC 9052):
+  `[protected: bstr, unprotected: {}, payload: bstr, signature: bstr]`. The
+  unprotected header MUST be an empty map, the payload MUST be attached, and
+  `external_aad` is empty. Objects signed by long-lived roots use `COSE_Sign`
+  with **two** signatures (Ed25519 and ML-DSA-65), and both MUST verify; a
+  single-signature COSE_Sign1 from such a key MUST be rejected.
 - **Protected header** MUST contain:
   - `alg` (1)
   - `kid` (4): SHA-256 of the signer's COSE_Key, truncated to 16 bytes
@@ -35,6 +45,9 @@ the commitments over it, and everything around it.
   - `fpp-ctx` (label **−65537**, private use): the domain-separation string, e.g.
     `"fpp/1/checkpoint"`
   - `fpp-v` (label **−65538**): protocol version, `1`
+
+  and nothing else: `crit` (2) and any other header parameter MUST be rejected
+  in v1.
 - **Key purpose binding.** Every key is registered with an allowlist of `fpp-ctx`
   values (§4). A verifier MUST reject a signature whose `fpp-ctx` is not in the
   signer key's allowlist. That makes cross-protocol signature reuse impossible,
@@ -44,7 +57,36 @@ the commitments over it, and everything around it.
   (RFC 8747).
 - **Merkle trees** use RFC 9162 §2.1 hashing: `leaf = SHA-256(0x00 ‖ d)`,
   `node = SHA-256(0x01 ‖ l ‖ r)`. The Merkle Tree Hash of an empty list is
-  `SHA-256("")`.
+  `SHA-256("")`. RFC 9162 inclusion proofs do not authenticate the tree size,
+  so every signed Merkle root MUST be signed together with its leaf count.
+- **Object digest.** The digest of a signed object is SHA-256 over its exact
+  COSE_Sign1 bytes. It is what `prev` chains and Merkle leaves referencing
+  signed objects use. Deterministic encoding plus deterministic Ed25519 make
+  it stable.
+
+### 2.1 Verification order and rejection categories (normative)
+
+A verifier processes a signed object in this order and rejects at the first
+failure. The category names are shared by all implementations and by the
+interop vectors (`interop/vectors/fpp1.json`).
+
+| Step | Check | Category |
+|------|-------|----------|
+| 1 | Bytes are deterministic CBOR of the allowed subset | `encoding` |
+| 2 | COSE_Sign1 shape; protected header decodes (deterministically, else `encoding`) with exactly the required parameters | `header` |
+| 3 | `fpp-v` equals the expected version | `version` |
+| 4 | `fpp-ctx` and content type equal those of the expected object type | `ctx` |
+| 5 | `kid` resolves to a known key | `kid` |
+| 6 | The key's role allows `fpp-ctx`, and the role does not require hybrid signatures | `role` |
+| 7 | `alg` equals the key's algorithm | `alg` |
+| 8 | Signature verifies over `Sig_structure = ["Signature1", protected, h'', payload]` | `signature` |
+| 9 | Payload is deterministic CBOR (else `encoding`) and matches its schema, including invariants such as `first_tick ≤ last_tick` | `schema` |
+
+The payload is parsed only after the signature verifies. Unknown payload
+fields are ignored (§12).
+
+Reference implementations: `crates/fpp-wire` + `crates/fpp-crypto` (Rust)
+and `interop/python/fpp_interop.py` (independent, standard library only).
 
 ## 3. Cryptographic suites
 
@@ -97,6 +139,7 @@ is ≥ 2 × max token TTL.
 | `gs_instance_id` | 32 B | `SHA-256(COSE_Key(instance_pub))` |
 | `build_id` | 32 B | `SHA-256(build manifest payload)` |
 | `policy_ver` | uint | Monotonic per title |
+| `tick` | uint32 | Simulation step. A match lasts fewer than 2³² ticks; long-lived MMO zones rotate `match_id` before wrapping. |
 | `epoch` | uint32 | `floor(tick / ticks_per_epoch)` |
 
 ## 6. Tokens
@@ -291,7 +334,8 @@ InputCommit = {                      ; COSE_Sign1 payload, fpp-ctx "fpp/1/input-
   "frames_root" => bstr .size 32,    ; MTH over leaves, ascending tick
   "prev" => bstr .size 32,           ; SHA-256 of previous InputCommit (zeros at epoch 0)
 }
-FrameLeaf = h'00' ‖ u32le(tick) ‖ payload      ; RFC 9162 leaf input
+; Leaf data for frames_root is u32le(tick) ‖ payload; the Merkle leaf
+; hash prepends 0x00 as usual (RFC 9162).
 ```
 
 The GS recomputes `frames_root` over the frames it received. If ticks are
@@ -347,19 +391,27 @@ Checkpoint = {                        ; COSE_Sign1, GS instance key, fpp-ctx "fp
   "epoch" => uint,
   "ticks" => [uint, uint],            ; inclusive range
   "prev" => bstr .size 32,            ; SHA-256 of previous Checkpoint (zeros at epoch 0)
-  "inputs_root" => bstr .size 32,     ; MTH over InputLeaf, ascending slot
+  "inputs_root" => bstr .size 32,     ; MTH over InputLeaf encodings, ascending slot
+  "inputs_n"    => uint,              ; leaf count of inputs_root
   "events_root" => bstr .size 32,     ; MTH over authoritative events, in sim order
+  "events_n"    => uint,
   "state_root"  => bstr .size 32,     ; digest of canonical audit-projection state at ticks[1]
   "rng_root"    => bstr .size 32,     ; MTH over VRF proofs issued this epoch
+  "rng_n"       => uint,
   "roster_root" => bstr .size 32,     ; MTH over (slot, sat_cti, did) admitted
+  "roster_n"    => uint,
 }
 InputLeaf = {
   "slot" => uint,
   "commit" => bstr / null,            ; SHA-256 of the client's signed InputCommit, null if absent
-  "applied" => bstr,                  ; bitset over ticks: frame applied in time
+  "applied" => bstr,                  ; bit i (LSB-first per byte) = frame for tick ticks[0]+i applied in time
 }
 ```
 
+- `inputs_root` leaf data is the deterministic CBOR encoding of each
+  `InputLeaf`. Every root carries its leaf count (`*_n`), because an
+  inclusion proof shown to a third party (an appeal, an audit) must not be
+  able to claim a different tree size.
 - `events_root` leaves are title-defined CBOR events tagged with a registered
   event type (movement resolved, hit confirmed, item granted, and so on).
   Economy events include the Economy Ledger idempotency key (ECO-01).

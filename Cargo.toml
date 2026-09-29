@@ -1,5 +1,9 @@
 [workspace]
 members = [
+    "crates/fpp-types",
+    "crates/fpp-wire",
+    "crates/fpp-crypto",
+    "crates/fpp-merkle",
     "crates/common",
     "crates/gs-sim",
     "crates/vs",

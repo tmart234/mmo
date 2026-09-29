@@ -114,7 +114,24 @@ since verified TLS leaves a proxy nothing to do but drop packets:
   `crates/vs/src/admission.rs` tests);
 - `cargo +nightly fuzz run wire_decode` / `verify_untrusted` run in CI.
 
-### P1 — Protocol core v1 (4–6 weeks)
+### P1 — Protocol core v1 (4–6 weeks) — in progress
+**Slice 1 ✅ (foundation):** `fpp-types`; `fpp-wire` (strict deterministic
+CBOR codec, COSE_Sign1 container, `InputCommit` / `InputLeaf` / `Checkpoint`);
+`fpp-crypto` (key roles with context allowlists, `kid`, sign/verify in the
+normative order of 04 §2.1); `fpp-merkle` (RFC 9162 trees with inclusion and
+consistency proofs, checked against the CT reference tree). Golden vectors in
+`interop/vectors/fpp1.json` (5 valid chained objects, 16 negative ones) are
+verified both by the Rust test and by an independent standard-library Python
+implementation (`interop/python/fpp_interop.py`, run by `make ci`). Fuzz
+target `fpp_decode` asserts that every accepted encoding is canonical.
+Found while building: RFC 9162 proofs do not authenticate tree size, so
+Checkpoint roots now carry leaf counts.
+**Remaining slices:** tokens (AR / SAT / SAR with `cnf` and TLS-exporter PoP),
+ALPN + Hello/Admit handshake, aws-lc-rs with X25519MLKEM768, datagram input
+frames, and replacing Heartbeat/TranscriptDigest in `vs`/`gs-sim` with
+Checkpoints and InputCommits.
+
+Planned scope:
 `fpp-types`, `fpp-wire`, `fpp-crypto`, `fpp-merkle`, `fpp-tokens`. COSE + CBOR
 with domain separation. SAT/SAR/AR types with PoP and TLS-exporter binding.
 ALPN versioning. Switch rustls/quinn to aws-lc-rs with X25519MLKEM768 preferred.

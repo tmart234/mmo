@@ -13,11 +13,11 @@ endif
 
 # -------- Headless package set (what CI builds/tests) --------
 # Keep GUI crates (e.g., client-bevy) out of CI to avoid winit display issues.
-HEADLESS_PKGS := common client-core gs-core gs-sim vs tools
+HEADLESS_PKGS := fpp-types fpp-wire fpp-crypto fpp-merkle common client-core gs-core gs-sim vs tools
 PKG_FLAGS := $(foreach p,$(HEADLESS_PKGS),-p $(p))
 
 # -------- Phonies --------
-.PHONY: help ci check build-headless test-headless test-stage \
+.PHONY: help ci check build-headless test-headless test-stage interop \
         sim-positive clean-build clean-lock-build \
         check-all build-all test-all
 
@@ -29,6 +29,7 @@ help:
 	@echo "  build-headless     - build headless crates (-p $(HEADLESS_PKGS))"
 	@echo "  test-headless      - cargo test for headless crates"
 	@echo "  test-stage         - test headless crates + run smoke (VS <-> GS <-> client)"
+	@echo "  interop            - check FPP golden vectors with the independent Python verifier"
 	@echo "  sim-positive       - just run the smoke harness (gen_keys + smoke)"
 	@echo "  clean-build        - cargo clean + fmt + build (workspace, all targets)"
 	@echo "  clean-lock-build   - destructive: clean + remove Cargo.lock + fmt + build (workspace)"
@@ -45,6 +46,8 @@ ci:
 	cargo build --all-targets $(PKG_FLAGS)
 	@echo "Run tests + smoke..."
 	$(MAKE) test-stage
+	@echo "Interop: independent Python verifier on the FPP golden vectors..."
+	$(MAKE) interop
 	@echo "CI-lite completed ✅"
 
 # -------- Local convenience (headless) --------
@@ -63,6 +66,11 @@ test-stage: test-headless
 	@echo "Running smoke test (\`vs\` + \`gs-sim --test-once\` + \`client-sim --smoke-test\`)..."
 	cargo run -p tools --bin gen_keys
 	cargo run -p tools --bin smoke
+
+# FPP v1 golden vectors, checked by the independent Python implementation.
+# (The Rust side is checked by crates/fpp-crypto/tests/golden.rs.)
+interop:
+	python3 interop/python/fpp_interop.py
 
 # Quick local sanity: just the smoke harness
 sim-positive:
