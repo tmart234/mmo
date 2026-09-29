@@ -12,6 +12,7 @@ fpp-wire = { path = "../fpp-wire" }
 fpp-crypto = { path = "../fpp-crypto" }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
+sha2 = { workspace = true }
 # Noise Protocol Framework. Pure Rust (RustCrypto primitives), so it builds for
 # i686, Android, iOS and wasm alike; no ring, no C.
 snow = { version = "0.10", default-features = false, features = ["use-chacha20poly1305", "use-sha2", "use-curve25519", "use-getrandom"] }

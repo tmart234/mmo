@@ -1,7 +1,7 @@
 //! A joining player's endpoint: one session to the host.
 
 use crate::hello::{HostHello, JoinHello};
-use crate::packet::{self, Packet};
+use crate::packet::{self, Packet, COOKIE_LEN};
 use crate::session::{kind, Frame, Session};
 use crate::{random_u32, Error, StaticKeypair, Transmit, NOISE_PARAMS, PROLOGUE};
 use fpp_crypto::Ed25519Signer;
@@ -29,6 +29,10 @@ pub enum JoinerEvent {
         hello: Vec<u8>,
     },
     Data {
+        payload: Vec<u8>,
+    },
+    /// A message on the reliable channel, delivered once and in order.
+    Message {
         payload: Vec<u8>,
     },
     /// The host's address changed after it answered a path challenge.
@@ -60,6 +64,9 @@ pub struct Joiner<A> {
     state: State<A>,
     tx: VecDeque<Transmit<A>>,
     events: VecDeque<JoinerEvent>,
+    now_ms: u64,
+    /// Cookie from a host under load, sent with every later handshake attempt.
+    cookie: Option<[u8; COOKIE_LEN]>,
 }
 
 impl<A: Clone + Eq> Joiner<A> {
@@ -88,6 +95,8 @@ impl<A: Clone + Eq> Joiner<A> {
             state: State::Closed,
             tx: VecDeque::new(),
             events: VecDeque::new(),
+            now_ms: 0,
+            cookie: None,
         };
         j.start()?;
         Ok(j)
@@ -109,7 +118,7 @@ impl<A: Clone + Eq> Joiner<A> {
         let index = random_u32() | 1;
         self.tx.push_back(Transmit {
             to: self.host_addr.clone(),
-            packet: packet::init(index, &msg1),
+            packet: packet::init(index, &msg1, self.cookie.as_ref()),
         });
         self.state = State::Handshaking {
             hs: Box::new(hs),
@@ -144,6 +153,17 @@ impl<A: Clone + Eq> Joiner<A> {
                 counter,
                 sealed,
             } => self.on_data(from, receiver, counter, sealed),
+            Packet::Cookie { receiver, cookie } => {
+                // Only while handshaking, and only for our current attempt;
+                // then retry at once with the cookie attached.
+                match self.state {
+                    State::Handshaking { index, .. } if index == receiver => {
+                        self.cookie = Some(cookie);
+                        self.start()
+                    }
+                    _ => Err(Error::State),
+                }
+            }
             Packet::Init { .. } => Err(Error::State),
         }
     }
@@ -202,8 +222,12 @@ impl<A: Clone + Eq> Joiner<A> {
             return Err(Error::UnknownSession);
         }
         let (k, body) = session.open(counter, sealed)?;
-        match session.handle(&from, k, body, &mut self.tx)? {
+        match session.handle(&from, k, body, self.now_ms, &mut self.tx)? {
             Frame::App(payload) => self.events.push_back(JoinerEvent::Data { payload }),
+            Frame::Messages(msgs) => self.events.extend(
+                msgs.into_iter()
+                    .map(|payload| JoinerEvent::Message { payload }),
+            ),
             Frame::Nothing => {}
             Frame::Migrated => self.events.push_back(JoinerEvent::HostMigrated),
             Frame::Closed(reason) => {
@@ -227,6 +251,32 @@ impl<A: Clone + Eq> Joiner<A> {
         let r = self
             .session()
             .and_then(|s| s.send(kind::APP, payload, &mut tx));
+        self.tx = tx;
+        r
+    }
+
+    /// Advance time: send a pending ack and due retransmissions. Call once
+    /// per game tick with a monotonic clock in ms.
+    pub fn tick(&mut self, now_ms: u64) -> Result<(), Error> {
+        self.now_ms = self.now_ms.max(now_ms);
+        let now = self.now_ms;
+        let mut tx = std::mem::take(&mut self.tx);
+        let r = match &mut self.state {
+            State::Connected { session, .. } => session.tick(now, &mut tx),
+            _ => Ok(()),
+        };
+        self.tx = tx;
+        r
+    }
+
+    /// Queue a message on the reliable ordered channel (at most
+    /// [`crate::MAX_MESSAGE`] bytes). It is resent from `tick` until acked.
+    pub fn send_reliable(&mut self, payload: &[u8]) -> Result<(), Error> {
+        let now = self.now_ms;
+        let mut tx = std::mem::take(&mut self.tx);
+        let r = self
+            .session()
+            .and_then(|s| s.send_reliable(payload, now, &mut tx));
         self.tx = tx;
         r
     }

@@ -229,6 +229,12 @@ continue the chain on every `SarUpdate`. A gap, fork or expiry means disconnect
 
 ### 7.1 Connection
 
+Transport per plane is decided in [ADR-002](09-adr-002-transport.md): native
+clients carry game data over `fpp-session` (§7.7, encrypted UDP) for both
+player-hosted and dedicated servers; this QUIC profile serves browsers
+(WebTransport) and the control plane. On QUIC, game data uses DATAGRAM frames
+only, never a reliable stream.
+
 - ALPN `fpp/1`. The client MUST validate the GS certificate chain (publisher
   game-server CA) **and** the SAR binding (§6.3). No "insecure" mode exists in
   release builds.
@@ -423,7 +429,27 @@ Init = 0x01 ‖ sender_index:u32 ‖ noise_msg1
 Resp = 0x02 ‖ sender_index:u32 ‖ receiver_index:u32 ‖ noise_msg2
 Data = 0x03 ‖ receiver_index:u32 ‖ counter:u64 ‖ AEAD(kind:u8 ‖ body)
 kind: 0 app · 1 keepalive (empty) · 2 path challenge (8 B) · 3 path response (8 B) · 4 close (u16 reason)
+      5 reliable (seq:u32 ‖ message) · 6 ack (next_expected:u32 ‖ bitmap:u64)
+Cookie     = 0x04 ‖ receiver_index:u32 ‖ cookie:16
+InitCookie = 0x05 ‖ cookie:16 ‖ sender_index:u32 ‖ noise_msg1
 ```
+
+- **Selective reliability.** `app` datagrams are unreliable and latest-wins
+  (per-tick state, `InputFrame`s with redundancy). `reliable` messages
+  (InputCommits, CheckpointHeads, title events that must arrive) are delivered
+  once and in order: the receiver buffers up to 64 early messages and sends one
+  `ack` per tick (cumulative plus a selective bitmap of the next 64); the
+  sender retransmits after an RTO of 2 × smoothed RTT (60 ms – 2 s, doubling
+  per retry; retransmissions give no RTT sample) and refuses new messages
+  while 64 are unacknowledged. Messages ≤ 1418 bytes. Endpoints are
+  clock-free except for `tick(now_ms)`, called once per game tick.
+- **Join cookies.** When half the pending-join budget is in use, the host
+  answers `Init` with `Cookie` instead of doing any DH work:
+  `cookie = SHA-256("fpp/1/p2p-cookie\0" ‖ secret ‖ minute ‖ len(addr) ‖ addr)[..16]`,
+  valid for the current and previous minute. The joiner repeats the handshake
+  as `InitCookie`. The 21-byte reply is smaller than any `Init`, so the host
+  cannot be used for amplification, and a spoofed flood costs it one hash per
+  packet. A cookie from another address or an older period is refused.
 
 - **Replay.** The counter is the AEAD nonce. Receivers keep a 2048-packet
   sliding window and mark a counter only after it authenticates. Senders stop
@@ -437,10 +463,10 @@ kind: 0 app · 1 keepalive (empty) · 2 path challenge (8 B) · 3 path response 
 - **Close** carries a §11 reason code (e.g. `TIER_INSUFFICIENT`, `SERVER_FULL`).
 
 **Known limits.** Transport is X25519 only; hybrid ML-KEM (§3, FPP-T1) waits
-for a standardized PQ Noise variant. No stateless cookie: CPU cost of
-message 1 floods is bounded only by the pending cap and the game's per-source
-rate limiting. The host is still the omnipotent authority of a player-hosted
-match (08, H09); this profile secures the transport and binds evidence keys,
+for a standardized PQ Noise variant. Join cookies bound the DH work of
+spoofed floods; a flood from real addresses still needs the game's per-source
+rate limiting. No send pacing yet (the game's tick rate bounds it). The host
+is still the omnipotent authority of a player-hosted match (08, H09); this profile secures the transport and binds evidence keys,
 and accountability comes from InputCommits, Checkpoints and replay.
 
 ## 8. Evidence plane

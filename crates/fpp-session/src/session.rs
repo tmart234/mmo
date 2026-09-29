@@ -3,6 +3,7 @@
 //! address, that it holds the session keys).
 
 use crate::packet::data_header;
+use crate::reliable::{self, Reliable};
 use crate::replay::ReplayWindow;
 use crate::{Error, Transmit, MAX_PACKET, MAX_PAYLOAD, REJECT_AFTER};
 use snow::StatelessTransportState;
@@ -20,6 +21,10 @@ pub(crate) mod kind {
     pub const PATH_RESPONSE: u8 = 3;
     /// u16le reason code (fpp_types::Reason); the session ends.
     pub const CLOSE: u8 = 4;
+    /// seq:u32le ‖ payload, on the reliable ordered channel.
+    pub const RELIABLE: u8 = 5;
+    /// next_expected:u32le ‖ bitmap:u64le for the reliable channel.
+    pub const ACK: u8 = 6;
 }
 
 /// Send one challenge per this many authenticated packets from an unproven
@@ -29,6 +34,8 @@ const CHALLENGE_EVERY: u32 = 8;
 /// What an authenticated packet carried, for the endpoint to report.
 pub(crate) enum Frame {
     App(Vec<u8>),
+    /// Reliable messages now deliverable, in order (possibly none).
+    Messages(Vec<Vec<u8>>),
     Nothing,
     Migrated,
     Closed(u16),
@@ -48,6 +55,7 @@ pub(crate) struct Session<A> {
     /// Validated address of the peer: the only place we send to.
     pub remote: A,
     probe: Option<Probe<A>>,
+    reliable: Reliable,
 }
 
 impl<A: Clone + Eq> Session<A> {
@@ -59,6 +67,7 @@ impl<A: Clone + Eq> Session<A> {
             replay: ReplayWindow::default(),
             remote,
             probe: None,
+            reliable: Reliable::default(),
         }
     }
 
@@ -100,6 +109,36 @@ impl<A: Clone + Eq> Session<A> {
         Ok(())
     }
 
+    /// Queue a message on the reliable ordered channel (at most
+    /// [`crate::MAX_MESSAGE`] bytes). `Congested` when [`reliable::WINDOW`]
+    /// messages are still unacknowledged.
+    pub fn send_reliable(
+        &mut self,
+        payload: &[u8],
+        now_ms: u64,
+        tx: &mut VecDeque<Transmit<A>>,
+    ) -> Result<(), Error> {
+        if payload.len() > crate::MAX_MESSAGE {
+            return Err(Error::TooLarge);
+        }
+        if !self.reliable.can_send() {
+            return Err(Error::Congested);
+        }
+        let body = self.reliable.push(payload, now_ms);
+        self.send(kind::RELIABLE, &body, tx)
+    }
+
+    /// Send a pending ack and any retransmissions that are due.
+    pub fn tick(&mut self, now_ms: u64, tx: &mut VecDeque<Transmit<A>>) -> Result<(), Error> {
+        if let Some(ack) = self.reliable.ack_body() {
+            self.send(kind::ACK, &ack, tx)?;
+        }
+        for body in self.reliable.due(now_ms) {
+            self.send(kind::RELIABLE, &body, tx)?;
+        }
+        Ok(())
+    }
+
     /// Authenticate and decrypt; the counter is marked seen only on success.
     pub fn open(&mut self, counter: u64, sealed: &[u8]) -> Result<(u8, Vec<u8>), Error> {
         if counter >= REJECT_AFTER || !self.replay.check(counter) {
@@ -123,6 +162,7 @@ impl<A: Clone + Eq> Session<A> {
         from: &A,
         kind: u8,
         body: Vec<u8>,
+        now_ms: u64,
         tx: &mut VecDeque<Transmit<A>>,
     ) -> Result<Frame, Error> {
         if kind == kind::PATH_RESPONSE {
@@ -156,6 +196,14 @@ impl<A: Clone + Eq> Session<A> {
                     to: from.clone(),
                     packet,
                 });
+                Ok(Frame::Nothing)
+            }
+            kind::RELIABLE => {
+                let (seq, payload) = reliable::split(&body).ok_or(Error::Malformed)?;
+                Ok(Frame::Messages(self.reliable.on_message(seq, payload)))
+            }
+            kind::ACK if body.len() == reliable::ACK_LEN => {
+                self.reliable.on_ack(&body, now_ms);
                 Ok(Frame::Nothing)
             }
             kind::CLOSE if body.len() == 2 => {

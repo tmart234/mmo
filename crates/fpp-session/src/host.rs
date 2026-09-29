@@ -1,7 +1,7 @@
 //! The hosting player's endpoint: answers joins and keeps one session per peer.
 
 use crate::hello::{HostHello, JoinHello};
-use crate::packet::{self, Packet};
+use crate::packet::{self, Packet, COOKIE_LEN};
 use crate::session::{kind, Frame, Session};
 use crate::{random_u32, Error, StaticKeypair, Transmit, NOISE_PARAMS, PROLOGUE};
 use fpp_crypto::{KeyRole, KeySet};
@@ -59,6 +59,11 @@ pub enum HostEvent {
         peer: u32,
         payload: Vec<u8>,
     },
+    /// A message on the reliable channel, delivered once and in order.
+    Message {
+        peer: u32,
+        payload: Vec<u8>,
+    },
     /// The peer's address changed after it answered a path challenge.
     PeerMigrated {
         peer: u32,
@@ -94,9 +99,16 @@ pub struct Host<A> {
     next_peer: u32,
     tx: VecDeque<Transmit<A>>,
     events: VecDeque<HostEvent>,
+    /// Time from the last `tick`.
+    now_ms: u64,
+    /// Keys join cookies; never leaves the host.
+    cookie_secret: [u8; 32],
 }
 
-impl<A: Clone + Eq> Host<A> {
+/// A cookie is valid in the minute it was made and the next one.
+const COOKIE_PERIOD_MS: u64 = 60_000;
+
+impl<A: Clone + Eq + AsRef<[u8]>> Host<A> {
     pub fn new(cfg: HostConfig) -> Self {
         Self {
             cfg,
@@ -106,6 +118,12 @@ impl<A: Clone + Eq> Host<A> {
             next_peer: 1,
             tx: VecDeque::new(),
             events: VecDeque::new(),
+            now_ms: 0,
+            cookie_secret: {
+                let mut k = [0u8; 32];
+                rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut k);
+                k
+            },
         }
     }
 
@@ -117,14 +135,89 @@ impl<A: Clone + Eq> Host<A> {
     /// nothing changed.
     pub fn recv(&mut self, from: A, datagram: &[u8]) -> Result<(), Error> {
         match packet::parse(datagram)? {
-            Packet::Init { sender, noise } => self.on_init(from, sender, noise),
+            Packet::Init {
+                sender,
+                noise,
+                cookie,
+            } => {
+                if self.under_load() {
+                    match cookie {
+                        Some(c) if self.cookie_valid(&from, &c) => {}
+                        Some(_) => return Err(Error::Cookie),
+                        None => {
+                            // One hash, no DH: a spoofed flood costs us almost
+                            // nothing, and the reply is smaller than the request.
+                            let c = self.cookie_for(&from, self.now_ms / COOKIE_PERIOD_MS);
+                            self.tx.push_back(Transmit {
+                                to: from,
+                                packet: packet::cookie(sender, &c),
+                            });
+                            return Ok(());
+                        }
+                    }
+                }
+                self.on_init(from, sender, noise)
+            }
             Packet::Data {
                 receiver,
                 counter,
                 sealed,
             } => self.on_data(from, receiver, counter, sealed),
-            Packet::Resp { .. } => Err(Error::State),
+            Packet::Resp { .. } | Packet::Cookie { .. } => Err(Error::State),
         }
+    }
+
+    /// Half the pending-join budget in use: require cookies.
+    fn under_load(&self) -> bool {
+        self.pending_order.len() * 2 >= self.cfg.max_pending
+    }
+
+    fn cookie_for(&self, addr: &A, period: u64) -> [u8; COOKIE_LEN] {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"fpp/1/p2p-cookie\0");
+        h.update(self.cookie_secret);
+        h.update(period.to_le_bytes());
+        h.update((addr.as_ref().len() as u32).to_le_bytes());
+        h.update(addr.as_ref());
+        // Truncated keyed hash: without the full digest there is no length
+        // extension, and the secret never leaves the host.
+        h.finalize()[..COOKIE_LEN].try_into().expect("16 bytes")
+    }
+
+    fn cookie_valid(&self, addr: &A, cookie: &[u8; COOKIE_LEN]) -> bool {
+        let period = self.now_ms / COOKIE_PERIOD_MS;
+        [Some(period), period.checked_sub(1)]
+            .into_iter()
+            .flatten()
+            .any(|p| bool::from(self.cookie_for(addr, p).ct_eq(cookie)))
+    }
+
+    /// Advance time: send pending acks and due retransmissions on every
+    /// session. Call once per game tick with a monotonic clock in ms.
+    pub fn tick(&mut self, now_ms: u64) -> Result<(), Error> {
+        self.now_ms = self.now_ms.max(now_ms);
+        let mut tx = std::mem::take(&mut self.tx);
+        let mut r = Ok(());
+        for slot in self.slots.values_mut().filter(|s| s.peer.is_some()) {
+            if let Err(e) = slot.session.tick(self.now_ms, &mut tx) {
+                r = Err(e);
+            }
+        }
+        self.tx = tx;
+        r
+    }
+
+    /// Queue a message on the peer's reliable ordered channel (at most
+    /// [`crate::MAX_MESSAGE`] bytes). It is resent from `tick` until acked.
+    pub fn send_reliable(&mut self, peer: u32, payload: &[u8]) -> Result<(), Error> {
+        let now = self.now_ms;
+        let mut tx = std::mem::take(&mut self.tx);
+        let r = self
+            .session(peer)
+            .and_then(|s| s.send_reliable(payload, now, &mut tx));
+        self.tx = tx;
+        r
     }
 
     fn on_init(&mut self, from: A, sender: u32, noise: &[u8]) -> Result<(), Error> {
@@ -228,8 +321,15 @@ impl<A: Clone + Eq> Host<A> {
         }
         let slot = self.slots.get_mut(&index).expect("confirmed slot");
         let peer = slot.peer.expect("confirmed");
-        match slot.session.handle(&from, k, body, &mut self.tx)? {
+        match slot
+            .session
+            .handle(&from, k, body, self.now_ms, &mut self.tx)?
+        {
             Frame::App(payload) => self.events.push_back(HostEvent::Data { peer, payload }),
+            Frame::Messages(msgs) => self.events.extend(
+                msgs.into_iter()
+                    .map(|payload| HostEvent::Message { peer, payload }),
+            ),
             Frame::Nothing => {}
             Frame::Migrated => self.events.push_back(HostEvent::PeerMigrated { peer }),
             Frame::Closed(reason) => {

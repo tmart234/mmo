@@ -17,6 +17,9 @@
 // Largest payload for `fpp_p2p_host_send` / `fpp_p2p_joiner_send`.
 #define FPP_P2P_MAX_PAYLOAD 1422
 
+// Largest message for `fpp_p2p_*_send_reliable`.
+#define FPP_P2P_MAX_MESSAGE 1418
+
 // Largest address blob.
 #define FPP_P2P_MAX_ADDRESS 128
 
@@ -73,6 +76,10 @@ typedef enum FppStatus {
   FPP_STATUS_P2P_TOO_LARGE = 40,
   // No such peer.
   FPP_STATUS_P2P_UNKNOWN_PEER = 41,
+  // Reliable channel full (64 unacknowledged messages); retry after a tick.
+  FPP_STATUS_P2P_CONGESTED = 42,
+  // Host under load and the join's cookie is missing or wrong (dropped).
+  FPP_STATUS_P2P_COOKIE = 43,
   // A bug in the SDK (a caught panic). Please report it.
   FPP_STATUS_INTERNAL = 99,
 } FppStatus;
@@ -95,6 +102,9 @@ typedef enum FppP2pEventKind {
   FPP_P2P_EVENT_KIND_HOST_MIGRATED = 6,
   // Joiner: the host closed the session with `reason`.
   FPP_P2P_EVENT_KIND_CLOSED = 7,
+  // Host (`peer` set) or joiner: a reliable-channel message, delivered
+  // once and in order; data = payload.
+  FPP_P2P_EVENT_KIND_MESSAGE = 8,
 } FppP2pEventKind;
 
 // Accumulates a host's commitment for one match epoch (04-protocol.md §8.1).
@@ -415,6 +425,26 @@ enum FppStatus fpp_p2p_host_send(struct FppP2pHost *host,
                                  const uint8_t *payload,
                                  size_t len);
 
+// Queue a message on `peer`'s reliable ordered channel (≤
+// `FPP_P2P_MAX_MESSAGE` bytes): InputCommits, Checkpoint heads, events that
+// must arrive. It is resent from `fpp_p2p_host_tick` until acknowledged.
+// Per-tick game state belongs in `fpp_p2p_host_send` (unreliable).
+//
+// # Safety
+// `host` a live handle; `payload` valid for `len` bytes.
+enum FppStatus fpp_p2p_host_send_reliable(struct FppP2pHost *host,
+                                          uint32_t peer,
+                                          const uint8_t *payload,
+                                          size_t len);
+
+// Advance time (a monotonic clock in ms): queues acks and due
+// retransmissions for every peer and ages join cookies. Call once per game
+// tick, then drain `fpp_p2p_host_poll_transmit`.
+//
+// # Safety
+// `host` a live handle.
+enum FppStatus fpp_p2p_host_tick(struct FppP2pHost *host, uint64_t now_ms);
+
 // Queue an empty keepalive for `peer` (when idle, to hold NAT bindings open).
 //
 // # Safety
@@ -504,6 +534,21 @@ enum FppStatus fpp_p2p_joiner_recv(struct FppP2pJoiner *joiner,
 // # Safety
 // `joiner` a live handle; `payload` valid for `len` bytes.
 enum FppStatus fpp_p2p_joiner_send(struct FppP2pJoiner *joiner, const uint8_t *payload, size_t len);
+
+// Queue a message on the reliable ordered channel (≤ `FPP_P2P_MAX_MESSAGE`).
+//
+// # Safety
+// `joiner` a live handle; `payload` valid for `len` bytes.
+enum FppStatus fpp_p2p_joiner_send_reliable(struct FppP2pJoiner *joiner,
+                                            const uint8_t *payload,
+                                            size_t len);
+
+// Advance time (monotonic ms): queues an ack and due retransmissions.
+// Call once per game tick.
+//
+// # Safety
+// `joiner` a live handle.
+enum FppStatus fpp_p2p_joiner_tick(struct FppP2pJoiner *joiner, uint64_t now_ms);
 
 // Queue an empty keepalive.
 //

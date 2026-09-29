@@ -18,6 +18,12 @@
 //! - **Path validation.** A peer's address changes only after it answers an
 //!   encrypted challenge sent to the new address, so neither replayed nor
 //!   spoofed packets can redirect a player's traffic.
+//! - **Selective reliability.** Datagrams are unreliable and latest-wins by
+//!   default; a small reliable ordered channel ([`reliable`]) carries what
+//!   must arrive (InputCommits, Checkpoint heads, title events).
+//! - **Join floods.** Under load the host answers a join with a cookie bound
+//!   to the joiner's address instead of doing the handshake's DH work, so
+//!   spoofed floods cost it one hash each.
 //! - **Device trust carried, not decided.** A joiner may attach an
 //!   Attestation Result; the host sees it in [`HostEvent::PeerJoined`] and can
 //!   place the player in a lobby of matching trust or disconnect it.
@@ -34,6 +40,7 @@ mod hello;
 mod host;
 mod joiner;
 mod packet;
+pub mod reliable;
 pub mod replay;
 mod session;
 
@@ -55,6 +62,8 @@ pub const MAX_PACKET: usize = 1452;
 pub const DATA_OVERHEAD: usize = 1 + 4 + 8 + 1 + 16;
 /// Largest application payload per datagram.
 pub const MAX_PAYLOAD: usize = MAX_PACKET - DATA_OVERHEAD;
+/// Largest message on the reliable channel (4 bytes go to its sequence number).
+pub const MAX_MESSAGE: usize = MAX_PAYLOAD - 4;
 /// Largest Attestation Result a joiner may attach.
 pub const MAX_ATTESTATION: usize = 512;
 /// Largest title-defined hello (either direction).
@@ -129,6 +138,12 @@ pub enum Error {
     TooLarge,
     /// No such peer.
     UnknownPeer,
+    /// The reliable channel has `reliable::WINDOW` unacknowledged messages;
+    /// try again after the next `tick`.
+    Congested,
+    /// The host is under load and the join carried no valid cookie; the
+    /// joiner retries with the cookie it was sent.
+    Cookie,
 }
 
 impl core::fmt::Display for Error {

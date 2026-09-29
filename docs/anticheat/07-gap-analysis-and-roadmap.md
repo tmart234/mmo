@@ -129,10 +129,13 @@ Found while building: RFC 9162 proofs do not authenticate tree size, so
 Checkpoint roots now carry leaf counts.
 **Player-hosted session ✅ (milestone M2):** `fpp-session` (Noise IK,
 replay window, path validation, AdmitPop session-key binding, AR slot) and the
-`fpp_p2p_*` C ABI; spec in 04 §7.7.
+`fpp_p2p_*` C ABI; spec in 04 §7.7. Per ADR-002 it is also the native data
+plane for dedicated servers; it gained a reliable ordered channel and join
+cookies.
 **Remaining slices:** tokens (AR / SAT / SAR with `cnf` and TLS-exporter PoP),
-ALPN + Hello/Admit handshake, aws-lc-rs with X25519MLKEM768, datagram input
-frames, and replacing Heartbeat/TranscriptDigest in `vs`/`gs-sim` with
+ALPN + Hello/Admit handshake, aws-lc-rs with X25519MLKEM768 (control plane
+and browsers), SAT-provisioned server keys for `fpp-session` on dedicated
+servers, moving `client-core`/`gs-sim` game traffic onto `fpp-session`, and replacing Heartbeat/TranscriptDigest in `vs`/`gs-sim` with
 Checkpoints and InputCommits.
 
 Planned scope:

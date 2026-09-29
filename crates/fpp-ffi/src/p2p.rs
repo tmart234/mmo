@@ -18,6 +18,8 @@ use fpp_session::{
 pub const FPP_P2P_MAX_PACKET: usize = 1452;
 /// Largest payload for `fpp_p2p_host_send` / `fpp_p2p_joiner_send`.
 pub const FPP_P2P_MAX_PAYLOAD: usize = 1422;
+/// Largest message for `fpp_p2p_*_send_reliable`.
+pub const FPP_P2P_MAX_MESSAGE: usize = 1418;
 /// Largest address blob.
 pub const FPP_P2P_MAX_ADDRESS: usize = 128;
 /// Largest Attestation Result a joiner may attach.
@@ -27,6 +29,7 @@ pub const FPP_P2P_MAX_HELLO: usize = 256;
 
 const _: () = assert!(FPP_P2P_MAX_PACKET == fpp_session::MAX_PACKET);
 const _: () = assert!(FPP_P2P_MAX_PAYLOAD == fpp_session::MAX_PAYLOAD);
+const _: () = assert!(FPP_P2P_MAX_MESSAGE == fpp_session::MAX_MESSAGE);
 const _: () = assert!(FPP_P2P_MAX_ADDRESS == fpp_session::MAX_ADDRESS);
 const _: () = assert!(FPP_P2P_MAX_ATTESTATION == fpp_session::MAX_ATTESTATION);
 const _: () = assert!(FPP_P2P_MAX_HELLO == fpp_session::MAX_HELLO);
@@ -47,6 +50,8 @@ impl From<Error> for FppStatus {
             Error::Exhausted => FppStatus::P2pExhausted,
             Error::TooLarge => FppStatus::P2pTooLarge,
             Error::UnknownPeer => FppStatus::P2pUnknownPeer,
+            Error::Congested => FppStatus::P2pCongested,
+            Error::Cookie => FppStatus::P2pCookie,
         }
     }
 }
@@ -71,6 +76,9 @@ pub enum FppP2pEventKind {
     HostMigrated = 6,
     /// Joiner: the host closed the session with `reason`.
     Closed = 7,
+    /// Host (`peer` set) or joiner: a reliable-channel message, delivered
+    /// once and in order; data = payload.
+    Message = 8,
 }
 
 /// One event. Variable-size fields go into the caller's data buffer; the
@@ -131,6 +139,11 @@ fn host_event(e: &HostEvent) -> (FppP2pEvent, Vec<u8>) {
             ev.peer = *peer;
             (ev, payload.clone())
         }
+        HostEvent::Message { peer, payload } => {
+            let mut ev = FppP2pEvent::new(FppP2pEventKind::Message);
+            ev.peer = *peer;
+            (ev, payload.clone())
+        }
         HostEvent::PeerMigrated { peer } => {
             let mut ev = FppP2pEvent::new(FppP2pEventKind::PeerMigrated);
             ev.peer = *peer;
@@ -159,6 +172,9 @@ fn joiner_event(e: &JoinerEvent) -> (FppP2pEvent, Vec<u8>) {
             (ev, hello.clone())
         }
         JoinerEvent::Data { payload } => (FppP2pEvent::new(FppP2pEventKind::Data), payload.clone()),
+        JoinerEvent::Message { payload } => {
+            (FppP2pEvent::new(FppP2pEventKind::Message), payload.clone())
+        }
         JoinerEvent::HostMigrated => (FppP2pEvent::new(FppP2pEventKind::HostMigrated), Vec::new()),
         JoinerEvent::Closed { reason } => {
             let mut ev = FppP2pEvent::new(FppP2pEventKind::Closed);
@@ -392,6 +408,38 @@ pub unsafe extern "C" fn fpp_p2p_host_send(
     })
 }
 
+/// Queue a message on `peer`'s reliable ordered channel (≤
+/// `FPP_P2P_MAX_MESSAGE` bytes): InputCommits, Checkpoint heads, events that
+/// must arrive. It is resent from `fpp_p2p_host_tick` until acknowledged.
+/// Per-tick game state belongs in `fpp_p2p_host_send` (unreliable).
+///
+/// # Safety
+/// `host` a live handle; `payload` valid for `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn fpp_p2p_host_send_reliable(
+    host: *mut FppP2pHost,
+    peer: u32,
+    payload: *const u8,
+    len: usize,
+) -> FppStatus {
+    guard(|| {
+        let h = unsafe { handle_mut(host) }?;
+        let payload = unsafe { input(payload, len) }?;
+        Ok(h.inner.send_reliable(peer, payload)?)
+    })
+}
+
+/// Advance time (a monotonic clock in ms): queues acks and due
+/// retransmissions for every peer and ages join cookies. Call once per game
+/// tick, then drain `fpp_p2p_host_poll_transmit`.
+///
+/// # Safety
+/// `host` a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn fpp_p2p_host_tick(host: *mut FppP2pHost, now_ms: u64) -> FppStatus {
+    guard(|| Ok(unsafe { handle_mut(host) }?.inner.tick(now_ms)?))
+}
+
 /// Queue an empty keepalive for `peer` (when idle, to hold NAT bindings open).
 ///
 /// # Safety
@@ -576,6 +624,33 @@ pub unsafe extern "C" fn fpp_p2p_joiner_send(
         let payload = unsafe { input(payload, len) }?;
         Ok(j.inner.send(payload)?)
     })
+}
+
+/// Queue a message on the reliable ordered channel (≤ `FPP_P2P_MAX_MESSAGE`).
+///
+/// # Safety
+/// `joiner` a live handle; `payload` valid for `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn fpp_p2p_joiner_send_reliable(
+    joiner: *mut FppP2pJoiner,
+    payload: *const u8,
+    len: usize,
+) -> FppStatus {
+    guard(|| {
+        let j = unsafe { handle_mut(joiner) }?;
+        let payload = unsafe { input(payload, len) }?;
+        Ok(j.inner.send_reliable(payload)?)
+    })
+}
+
+/// Advance time (monotonic ms): queues an ack and due retransmissions.
+/// Call once per game tick.
+///
+/// # Safety
+/// `joiner` a live handle.
+#[no_mangle]
+pub unsafe extern "C" fn fpp_p2p_joiner_tick(joiner: *mut FppP2pJoiner, now_ms: u64) -> FppStatus {
+    guard(|| Ok(unsafe { handle_mut(joiner) }?.inner.tick(now_ms)?))
 }
 
 /// Queue an empty keepalive.

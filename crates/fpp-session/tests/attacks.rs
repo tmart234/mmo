@@ -383,6 +383,9 @@ fn limits_keep_every_packet_under_the_mtu() {
     cfg.attestation = vec![2; MAX_ATTESTATION];
     cfg.hello = vec![3; MAX_HELLO];
     let mut j = Joiner::new(cfg, &signer(0x51), HOST).unwrap();
+    // The largest join must leave room for the 16-byte cookie a loaded host asks for.
+    let init = j.peek_transmit().unwrap().packet.len();
+    assert!(init + 16 <= MAX_PACKET, "largest join is {init} bytes");
     let seen = pump(&mut host, &mut j, ALICE);
     assert!(j.is_connected());
     assert!(seen.iter().all(|t| t.packet.len() <= MAX_PACKET));

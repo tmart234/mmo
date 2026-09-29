@@ -204,8 +204,9 @@ What the glue does with the SDK (distributed netcode, player-hosted):
 | Host start | Once per match | `fpp_p2p_keypair_generate` (or a saved key + `fpp_p2p_public_key`); put the public key and a random invite secret in the invite; `fpp_p2p_host_new` |
 | Client join | Once per match | `fpp_signer_generate` (session key); `fpp_p2p_joiner_new` with the invite's host key and secret, the session key, and the device's AR if it has one. The host learns the session key from `FPP_P2P_EVENT_KIND_PEER_JOINED` |
 | Both, socket I/O | Every datagram | `fpp_p2p_*_recv` on each received datagram; `fpp_p2p_*_send` for game packets; drain `fpp_p2p_*_poll_transmit` into `sendto` and `fpp_p2p_*_poll_event`; joiner calls `fpp_p2p_joiner_retry` every ~500 ms until connected |
+| Both, game tick | Every tick | `fpp_p2p_*_tick(now_ms)` (acks and retransmissions for the reliable channel), then drain transmits |
 | Client, `network_distributed_tick()` | Every tick | `fpp_input_commit_add_frame(tick, bytes)` with the tick's action update, own-position report and hit reports |
-| Client, epoch end | Every `ticks_per_epoch` | `fpp_input_commit_sign`; send reliably; keep `fpp_object_digest` as the next `prev` |
+| Client, epoch end | Every `ticks_per_epoch` | `fpp_input_commit_sign`; send with `fpp_p2p_joiner_send_reliable`; keep `fpp_object_digest` as the next `prev` |
 | Host, per slot | Every tick | Its own builder over the frames it *received*; at epoch end `fpp_verify_input_commit` (player's key) and compare `frames_root` with `fpp_input_commit_frames_root`; a mismatch is a Signal |
 | Host, epoch end | Every epoch | `fpp_checkpoint_begin`; `add_input` per slot (commit digest, applied bitset); `add_event` for damage, deaths, pickups and scores it decided; `add_roster`; `fpp_checkpoint_sign` with the host instance key; send the digest to every client |
 | Everyone | Match end | Write the evidence bundle (frames, commits, checkpoints) to disk; clients `fpp_verify_checkpoint` the host's objects. Any player can later prove what the host did (H09). |

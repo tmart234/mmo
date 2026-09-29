@@ -78,6 +78,10 @@ pub enum FppStatus {
     P2pTooLarge = 40,
     /// No such peer.
     P2pUnknownPeer = 41,
+    /// Reliable channel full (64 unacknowledged messages); retry after a tick.
+    P2pCongested = 42,
+    /// Host under load and the join's cookie is missing or wrong (dropped).
+    P2pCookie = 43,
     /// A bug in the SDK (a caught panic). Please report it.
     Internal = 99,
 }
@@ -245,6 +249,8 @@ pub extern "C" fn fpp_status_str(status: c_int) -> *const c_char {
         39 => b"p2p: packet counter exhausted\0",
         40 => b"p2p: too large\0",
         41 => b"p2p: unknown peer\0",
+        42 => b"p2p: reliable channel congested\0",
+        43 => b"p2p: join cookie invalid\0",
         99 => b"internal SDK error\0",
         _ => b"unknown status\0",
     };

@@ -161,6 +161,23 @@ int main(void) {
     CHECK_STATUS(fpp_p2p_joiner_poll_event(alice, &ev, data, sizeof data), FPP_STATUS_OK);
     CHECK(ev.kind == FPP_P2P_EVENT_KIND_DATA && ev.data_len == 5);
 
+    /* Reliable channel: an InputCommit-sized message arrives once, via tick-driven acks. */
+    {
+        uint8_t commit[312];
+        memset(commit, 0xC0, sizeof commit);
+        CHECK_STATUS(fpp_p2p_joiner_send_reliable(alice, commit, sizeof commit), FPP_STATUS_OK);
+        pump(host, alice, ALICE_ADDR, sizeof ALICE_ADDR);
+        CHECK_STATUS(fpp_p2p_host_poll_event(host, &ev, data, sizeof data), FPP_STATUS_OK);
+        CHECK(ev.kind == FPP_P2P_EVENT_KIND_MESSAGE && ev.peer == alice_peer &&
+              ev.data_len == sizeof commit && memcmp(data, commit, sizeof commit) == 0);
+        CHECK_STATUS(fpp_p2p_host_tick(host, 33), FPP_STATUS_OK); /* sends the ack */
+        CHECK_STATUS(fpp_p2p_joiner_tick(alice, 33), FPP_STATUS_OK);
+        pump(host, alice, ALICE_ADDR, sizeof ALICE_ADDR);
+        CHECK_STATUS(fpp_p2p_joiner_tick(alice, 5000), FPP_STATUS_OK); /* acked: nothing to resend */
+        pump(host, alice, ALICE_ADDR, sizeof ALICE_ADDR);
+        CHECK_STATUS(fpp_p2p_host_poll_event(host, &ev, data, sizeof data), FPP_STATUS_EMPTY);
+    }
+
     /* H03: nothing Alice's session carried opens under Mallory's session,
      * and the plaintext never appears on the wire. */
     for (i = 0; i < wire_n; i++) {
