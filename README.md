@@ -1,54 +1,44 @@
 # mmo
 
 ## High-level Idea
-Client <-> GS <-> VS
+Client <-> GS <-> VS, speaking the Fair-Play Protocol (FPP v1).
 
-- **VS (Validation Server)** – Root of truth. Hands out short-lived proofs that a given Game Server is legit. Audits the Game Server’s behavior and can revoke it in seconds.
-- **GS (Game Server)** – Runs the actual simulation / match. Talks to VS to stay “blessed.” Talks to clients.
-- **Client** – Only talks to GS, but refuses to trust GS unless GS can prove VS is still blessing it.
+- **VS** – the trust plane (split into services in roadmap P2). It admits
+  game servers, keeps each one "blessed" with a short-lived, hash-chained
+  **Server Attestation Result (SAR)**, verifies one signed **Checkpoint** per
+  epoch from each, and revokes by simply stopping SARs. For clients it acts
+  as (stub) **Verifier** and **Broker**: it issues an **Attestation Result
+  (AR)** with a device trust tier and a **Session Admission Token (SAT)** for
+  a match, both bound to the client's session key.
+- **GS** – runs the match. Clients join over **fpp-session** (Noise over UDP,
+  ADR-002): the GS shows its current SAR, checks `Admit{SAT, AR}`, applies
+  clients' *intent* (never positions), and signs a Checkpoint per epoch.
+- **Client** – refuses to play unless the GS's SAR chain certifies the exact
+  key it connected to, and stops the moment that chain lapses. It commits to
+  its inputs every epoch with a signed **InputCommit**.
 
 Flow:
-1. **JoinRequest**: GS → VS, signed by GS long-term key; binds:
-   - `gs_id`, ephemeral session public key, `sw_hash` (binary hash), time + nonce.
-2. **JoinAccept**: VS → GS, returns `session_id` and signs it (pinning VS identity).
-3. **PlayTickets**: VS → GS issues short-lived, hash-chained tickets `{counter, nb/na, prev_ticket_hash}`.
-4. **Client inputs**: Client → GS includes:
-   - current `PlayTicket` (VS sig), `client_nonce` (monotone), `client_sig` over canonical bytes.
-5. **GS verifies** ticket freshness & chain, client sig/nonce, clamps movement, updates world, and advances a rolling **receipt_tip**.
-6. **Heartbeats**: GS → VS with `{session_id, gs_counter, gs_time_ms, receipt_tip, sw_hash}` signed by GS *ephemeral* session key.
-7. **ProtectedReceipt**: VS returns a short signature over `{session_id, gs_counter, receipt_tip}` to notarize the transcript so far.
-8. **Revocation**: If VS stops blessing (stops tickets / rejects heartbeat) → clients are kicked via ticket starvation + revoke broadcast.
+1. **GS join** (QUIC control link, TLS 1.3 with X25519MLKEM768): VS challenge →
+   `JoinRequest` signed by the GS long-term key, binding its instance key,
+   game-port key and address (plus a TPM quote over the challenge) →
+   `JoinAccept`.
+2. **Liveness**: VS → GS a new SAR every 2 s (`exp = iat + 10 s`); GS → VS a
+   signed Checkpoint every epoch. No Checkpoint, a bad one, or a failed TPM
+   re-attestation revokes the GS: SARs stop.
+3. **Client admission** (QUIC control link): VS challenge → session-key proof →
+   AR (tier D0 until platform evidence is appraised, P3) + SAT for the match,
+   refused where the queue's tier floor is higher (e.g. `verified`).
+4. **Join the GS** (fpp-session): Noise IK to the GS key the Broker named →
+   `SarUpdate` → client checks it → `Admit{SAT, AR}` → `Admitted{slot}`.
+5. **Play**: InputFrames (unreliable, redundant) per tick; InputCommit per
+   epoch and SarUpdate / CheckpointHead messages on the reliable channel.
+6. **Revocation**: when SARs stop, the GS kicks everyone and clients drop
+   within 3 issue intervals, on their own.
 
-Goal: anti-cheat + anti-rogue-host + audit trail, built into the protocol.
-
-> **Production design:** see [`docs/anticheat/`](docs/anticheat/README.md) for the
-> threat model, requirements, architecture, protocol spec (FPP v1), ontology
-> review, language decision (ADR-001) and roadmap that supersede the prototype
-> design below.
+> **Design and spec:** [`docs/anticheat/`](docs/anticheat/README.md): threat
+> model, requirements, architecture, protocol spec (FPP v1), ADRs and roadmap.
 
 ---
-
-## Crypto (so far)
-Continuous attestation (GS→VS heartbeats):
-- VS verifies a per-session ephemeral key and pins the GS sw_hash observed at join. Heartbeats carry:
-  - session_id, gs_counter (strictly monotonic), gs_time_ms, receipt_tip (rolling digest), sw_hash, sig_gs.
-  - VS enforces: valid signature, monotonic counter, pinned sw_hash. On mismatch → revoke.
-
-Transcript notarization (VS receipts):
-- GS periodically sends TranscriptDigest { session_id, gs_counter, receipt_tip, positions }.
-- VS returns ProtectedReceipt (signed) echoing { session_id, gs_counter, receipt_tip }.
-- This creates a signed audit trail so GS can’t later deny what it claimed happened at counter N.
-
-Short-lived tickets (VS→GS→Client):
-- PlayTicket includes { session_id, client_binding (placeholder=0s for now), counter, not_before_ms, not_after_ms, prev_ticket_hash } and VS signature.
-- Tickets are rotated ~every 2s with a hash chain (prev_ticket_hash) to prevent reordering. Clients/GS check freshness windows.
-
-Ephemeral session keys:
-- Each GS session uses a fresh ephemeral keypair bound inside JoinRequest. VS uses it to verify heartbeats for that session only.
-
-World/physics enforcement (on VS):
-- VS measures movement between notarized snapshots (time from heartbeat, positions from digest) and revokes on speed violations.
-
 
 ### Quick Start
 
@@ -71,7 +61,8 @@ cargo +nightly fuzz run wire_decode -- -max_total_time=60
 cargo +nightly fuzz run verify_untrusted -- -max_total_time=60
 ```
 
-Every QUIC link verifies certificates: clients and game servers pin
-`keys/dev_ca.der`, the GS pins the VS signing key `keys/vs_ed25519.pub`, and
-clients drop a GS as soon as its VS ticket chain breaks or expires. Nothing in
-`keys/` is committed.
+Every QUIC control link verifies certificates against `keys/dev_ca.der` and
+negotiates X25519MLKEM768. Game servers pin `keys/vs_ed25519.pub` for
+JoinAccept; everyone trusts the role keys in `keys/fpp_key_bundle.json`
+(Verifier, Broker, Server Liveness). Clients drop a GS as soon as its SAR
+chain breaks or goes stale. Nothing in `keys/` is committed.

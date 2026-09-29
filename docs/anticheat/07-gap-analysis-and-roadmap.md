@@ -23,16 +23,16 @@ because several **chain together**.
 | F07 | Medium | Unbounded allocation from a peer-controlled length prefix on the VS bi-stream path (bypasses the 16 MiB cap in `framing::recv_msg`). An admitted GS can force up to 4 GiB allocations per stream. | `crates/vs/src/streams.rs:110` | ✅ Fixed (P0): `framing::recv_msg_max`, 64 KiB default cap, explicit caps for snapshots (1 MiB) and transcripts (4 MiB) |
 | F08 | Medium | No timeout on accepting or reading the `JoinRequest`: idle connections hold VS tasks indefinitely (slowloris). | `crates/vs/src/admission.rs:30-34` | ✅ Fixed (P0): `admission_timeout_ms` deadline + QUIC Retry address validation |
 | F09 | Medium | Process-global `Mutex<Enforcer>` shared by all sessions, with `lock().unwrap()`. It serializes all sessions, and one panic poisons every session. | `crates/vs/src/enforcer.rs:300` | Per-session state; remove from VS (P2) |
-| F10 | Medium | `PlayTicket.client_binding` is always zero, so a ticket is a bearer credential usable by any client. | `crates/vs/src/streams.rs:47,58` | PoP-bound SAT (P1) |
-| F11 | Medium | No domain separation in signatures. `JoinAccept` signs the raw 16-byte `session_id` with the same key that signs tickets and receipts. | `crates/vs/src/admission.rs:143` | COSE + `fpp-ctx` allowlists (P1) |
-| F12 | Medium | Protocol version mismatch is logged but the session proceeds. | `crates/gs-sim/src/client_port.rs:258` | Reject; ALPN versioning (P1) |
-| F13 | Medium | The VS "physics" check uses GS-claimed positions and GS-claimed time, sampled every ~2 s. It does not constrain a rogue GS and is bypassed by teleport-and-return. | `crates/vs/src/enforcer.rs` | GS validators + deterministic Replay Auditor (P2/P4) |
+| F10 | Medium | `PlayTicket.client_binding` is always zero, so a ticket is a bearer credential usable by any client. | `crates/vs/src/streams.rs:47,58` | ✅ Fixed (P1): PlayTickets are gone; admission uses a SAT bound to the session key (`cnf`), proven in the handshake; a stolen SAT is rejected (`client-core/tests/session_attacks.rs`) |
+| F11 | Medium | No domain separation in signatures. `JoinAccept` signs the raw 16-byte `session_id` with the same key that signs tickets and receipts. | `crates/vs/src/admission.rs:143` | ✅ Fixed (P1) for every FPP object: tokens, Checkpoints, InputCommits and AdmitPops are COSE with `fpp-ctx` and per-role keys (Verifier, Broker, Liveness keys are distinct). The prototype's `JoinAccept` still signs the raw session id with the VS seed key, which signs nothing else now |
+| F12 | Medium | Protocol version mismatch is logged but the session proceeds. | `crates/gs-sim/src/client_port.rs:258` | ✅ Fixed (P1): control links reject an unknown `ChallengeRequest.version`; fpp-session binds its version in the Noise prologue and handshake payloads; tokens carry `fpp-v` |
+| F13 | Medium | The VS "physics" check uses GS-claimed positions and GS-claimed time, sampled every ~2 s. It does not constrain a rogue GS and is bypassed by teleport-and-return. | `crates/vs/src/enforcer.rs` | ✅ Removed from the trust plane (P1): the VS no longer sees positions; the GS clamps intent (AUTH-01) and signs per-epoch Checkpoints over applied inputs and state for the Replay Auditor (P4) |
 | F14 | Low | Evidence ("DA log") is written to local files in the working directory: no integrity, durability or replication. | `crates/vs/src/streams.rs:401-420` | Evidence Store (P2) |
 | F15 | Low | Private key material is committed (`crates/client-core/keys/client_ed25519.pk8`, presumably a test key). `.pk8` files hold raw 32-byte seeds, not PKCS#8. | repo | ✅ Fixed (P0): keys untracked, `crates/*/keys/` ignored, CI guard fails on tracked key files |
 | F16 | Low | `cargo audit \|\| true`: advisories never fail CI. | `.github/workflows/ci.yml:39` | ✅ Fixed (P0): cargo-deny (advisories, licenses, bans, sources) is a blocking CI job; see F20 |
 | F17 | Low | `.gitignore` ignores `*.lock` while `Cargo.lock` is tracked. Lockfiles for binaries must be tracked for reproducible builds. | `.gitignore:23` | ✅ Fixed (P0) |
 | F18 | Info | Revocation state lives in three places. | `vs/src/ctx.rs:22`, `vs/src/enforcer.rs:33`, `gs-sim/src/state.rs:103` | Single subject-state model (P2) |
-| F19 | Info | GS client port is hard-coded to `127.0.0.1:50000`. | `crates/gs-sim/src/client_port.rs:78` | Config (P1) |
+| F19 | Info | GS client port is hard-coded to `127.0.0.1:50000`. | `crates/gs-sim/src/client_port.rs:78` | ✅ Fixed (P1): `--game-addr`, advertised to the VS in the signed JoinRequest and to clients by the Broker |
 | F21 | **Critical** | `verify_quote` checked a quote's signature with the attestation key *carried in the quote*. Anyone could sign a "quote" for any PCR values, including the configured baselines, with a key they made up; PCR baselines gave no assurance. | `crates/common/src/tpm.rs` `verify_quote` | ✅ Mitigated: `VsConfig.trusted_ak_keys` (enrolled AKs); in dev mode the join AK is pinned for the session and re-attestation must use it; `require_tpm_quote`. Full fix: EK-certified AKs in the Verifier (P3) |
 | F20 | **High** | Vulnerable dependencies, hidden by the non-blocking audit (F16): quinn-proto remote DoS and memory exhaustion (RUSTSEC-2026-0037, -0185), rustls accepting TLS 1.3 handshake messages across encryption levels (RUSTSEC-2026-0285), rustls-webpki name-constraint and CRL flaws, aws-lc-sys X.509/PKCS7 bypasses, unsound `lru` used directly by gs-sim, protobuf recursion crash via prometheus 0.13, plus bytes, time and anyhow issues. | `Cargo.lock`, `crates/gs-sim/Cargo.toml`, `Cargo.toml` | ✅ Fixed (P0): lockfile updates, lru 0.18, prometheus 0.14; remaining ignores documented in `deny.toml` (bincode, until P1 replaces it) |
 
@@ -115,7 +115,7 @@ since verified TLS leaves a proxy nothing to do but drop packets:
   `crates/vs/src/admission.rs` tests);
 - `cargo +nightly fuzz run wire_decode` / `verify_untrusted` run in CI.
 
-### P1 — Protocol core v1 (4–6 weeks) — in progress
+### P1 — Protocol core v1 ✅ done
 **Slice 1 ✅ (foundation):** `fpp-types`; `fpp-wire` (strict deterministic
 CBOR codec, COSE_Sign1 container, `InputCommit` / `InputLeaf` / `Checkpoint`);
 `fpp-crypto` (key roles with context allowlists, `kid`, sign/verify in the
@@ -132,11 +132,24 @@ replay window, path validation, AdmitPop session-key binding, AR slot) and the
 `fpp_p2p_*` C ABI; spec in 04 §7.7. Per ADR-002 it is also the native data
 plane for dedicated servers; it gained a reliable ordered channel and join
 cookies.
-**Remaining slices:** tokens (AR / SAT / SAR with `cnf` and TLS-exporter PoP),
-ALPN + Hello/Admit handshake, aws-lc-rs with X25519MLKEM768 (control plane
-and browsers), SAT-provisioned server keys for `fpp-session` on dedicated
-servers, moving `client-core`/`gs-sim` game traffic onto `fpp-session`, and replacing Heartbeat/TranscriptDigest in `vs`/`gs-sim` with
-Checkpoints and InputCommits.
+**Tokens and admission ✅:** `fpp-tokens`: AR, SAT and SAR (04 §6) with
+`cnf` binding, lifetimes and the SAR chain (`SarChain`), the §7.2 admission
+checks (`admission::admit`), the control messages shared by both transports,
+and the TLS-exporter Admit PoP for QUIC (`control::quic_pop`). Golden vectors
+for all three tokens pass the Python verifier.
+**Prototype on FPP ✅:** the VS issues SARs instead of PlayTickets, verifies
+one signed Checkpoint per epoch instead of Heartbeat + TranscriptDigest
+(chain, instance key, match), and acts as stub Verifier + Broker (AR, SAT,
+queue tier floors); the GS serves its match over `fpp-session` with
+InputFrames, InputCommits, CheckpointHeads and SarUpdates; the client admits
+through the VS and stops when the SAR chain lapses. The P0 attack tests moved
+to the new flow (`client-core/tests/session_attacks.rs`, `fpp-tokens`
+tests). The VS physics check is gone (F13).
+**Transport ✅:** QUIC control links use aws-lc-rs with `X25519MLKEM768`
+preferred (FPP-T1); native game data uses `fpp-session` (ADR-002).
+**Moved out of P1 by ADR-002:** a QUIC/WebTransport *game* server for browser
+clients. Its messages, admission checks and PoP binding are implemented and
+tested in `fpp-tokens`; the server itself belongs with the browser client.
 
 Planned scope:
 `fpp-types`, `fpp-wire`, `fpp-crypto`, `fpp-merkle`, `fpp-tokens`. COSE + CBOR

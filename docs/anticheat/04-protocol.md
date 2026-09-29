@@ -214,16 +214,23 @@ ServerAttestationResult = {
   -65643 => tstr,           ; region
   -65644 => uint,           ; seq: strictly increasing per instance
   -65645 => bstr .size 32,  ; prev: SHA-256 of previous SAR payload (chain)
-  -65646 => COSE_Key,       ; vrf_pub
+  ? -65646 => COSE_Key,     ; vrf_pub (once the server uses FPP-VRF1, P4)
+  ? -65647 => bstr .size 32, ; noise_static: X25519 key of the fpp-session endpoint
 }
 server_class = &( community: 0, partner: 1, first_party: 2, first_party_cvm: 3 )
+; At least one transport binding (-65640 or -65647) is required, and
+; sub == SHA-256(COSE_Key(cnf)).
 ```
 
 Clients MUST check: signature chains to the region key bundle; `exp` in the
 future (±60 s skew); `tls_spki_sha256` equals the SPKI of the connection's TLS
 leaf; `server_class` is allowed by the SAT's queue policy; and `seq`/`prev`
 continue the chain on every `SarUpdate`. A gap, fork or expiry means disconnect
-(`SAR_LAPSED`).
+(`SAR_LAPSED`). Because `exp` is checked with ±60 s skew, clients and servers
+also measure liveness on their own clock: no valid `SarUpdate` for 3 issue
+intervals (prototype: 6 s at one SAR per 2 s, `exp = iat + 10`) is a lapse.
+This, not `exp`, bounds revocation latency. Implemented as
+`fpp_tokens::SarChain`.
 
 ## 7. Session plane
 
@@ -278,12 +285,14 @@ Admit = [ 3, {
   "pop" => COSE_Sign1,               ; by session key, fpp-ctx "fpp/1/admit-pop"
 } ]
 
-AdmitPoP = {                         ; payload of "pop"
-  "exporter" => bstr .size 32,       ; TLS-Exporter("EXPORTER-fpp-admit", "", 32)
-  "hs_hash"  => bstr .size 32,       ; SHA-256(Hello bytes ‖ HelloAck bytes)
-  "server_nonce" => bstr .size 32,
-  "sat_cti" => bstr .size 16,
+AdmitPop = {                         ; payload of "pop" (one object type for both transports)
+  "channel" => tstr,                 ; "fpp/quic-tls" here; "fpp-p2p/noise-ik" on fpp-session (§7.7)
+  "binding" => bstr .size (32..64),
 }
+; fpp/quic-tls: binding = TLS-Exporter("EXPORTER-fpp-admit", "", 32)
+;   ‖ SHA-256("fpp/1/quic-admit\0" ‖ u64le(len) ‖ Hello bytes ‖ u64le(len)
+;             ‖ HelloAck bytes ‖ server_nonce ‖ sat_cti)
+; (fpp_tokens::control::quic_pop)
 
 Admitted = [ 4, { "slot" => uint, "start_tick" => uint } ]
 Reject   = [ 5, { "code" => reason, ? "retry_after_s" => uint } ]
@@ -306,6 +315,20 @@ Bye  = [ 11, {} ]
 4. Revocation cache: `sat.cti`, `did`, `acct`, `build_id` not revoked.
 
 Failure yields `Reject{code}` and the connection closes. Codes are listed in §11.
+Implemented by `fpp_tokens::admission::admit` (both transports) with the
+revocation cache fed by the revocation feed (P2); a SAT's `cti` is also
+revoked locally once admitted, so it cannot be used twice in one match.
+
+**On fpp-session (native clients, ADR-002)** the same messages travel on the
+reliable channel after the Noise handshake, which already proved the session
+key (AdmitPop, §7.7) and authenticated the server's static key. The server
+sends `SarUpdate` first; the client checks the SAR (signature, chain, `exp`,
+**`noise_static` equals the key it dialled**, `sub` equals `sat.aud`) and only
+then sends `Admit{sat, ar}` (empty `pop`); the server answers `Admitted` or
+`Reject`. Hello/HelloAck are unnecessary there: the Noise prologue carries
+the version. Two additional control messages carry evidence on that channel:
+`CheckpointHead = [12, {match_id, epoch, digest}]` (§7.6) and
+`InputCommit = [13, {commit: COSE_Sign1}]` (§7.4).
 
 ### 7.3 Input frames (DATAGRAM)
 
