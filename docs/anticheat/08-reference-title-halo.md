@@ -139,3 +139,39 @@ H0–H2 need nothing from `mmo` and give immediate, visible wins. H3 is where
 the framework first runs inside a real game. It depends on the roadmap's P0
 fixes and P1 protocol core, which is the right order anyway: the prototype
 protocol should not be embedded in a game before F01–F03 are fixed.
+
+## 6. Build check (2026-09-29)
+
+Stage H0's build half was verified in a clean Ubuntu 24.04 container, from
+`bnunu/halo-ce-universal` at `3ba97dd`:
+
+| Step | Result |
+|------|--------|
+| Toolchain | Ubuntu clang 18.1.3 (no PGO: the committed profiles need clang ≥ 22), `gcc-multilib`, `libc6-dev-i386` |
+| SDL3 | Ubuntu 24.04 ships no 32-bit SDL3, so SDL `release-3.2.x` was built for `i686-linux-gnu` (console-only: `-DSDL_UNIX_CONSOLE_BUILD=ON`) and installed to `/usr/lib/i386-linux-gnu` |
+| `python configure.py --portable --pgo=off && ninja linux` | 643 build steps in ≈ 70 s; `build/linux/halo` is an ELF 32-bit i386 executable |
+| `pytest tools/test_linux_port.py` | 11 passed. These cover build tooling (XDK header generation, link checks), not gameplay. |
+| Launch without game data | Starts, runs its renderer without a window (no video device in this SDL build), reports `no maps/ folder found`, and exits cleanly |
+
+To go further you need your own Xbox disc image (the game extracts `maps/`
+from it) and a machine with a display, or a full SDL3 build with video. For
+two-machine tests, `debug.network_test` and `debug.test_input` drive scripted
+bots without menus.
+
+Reproduce (Ubuntu 24.04):
+
+```bash
+sudo apt-get update && sudo apt-get install -y gcc-multilib libc6-dev-i386 cmake ninja-build clang lld
+git clone --depth 1 --branch release-3.2.x https://github.com/libsdl-org/SDL
+cmake -S SDL -B SDL/build-i686 -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_C_COMPILER_TARGET=i686-linux-gnu -DCMAKE_C_FLAGS=-m32 \
+  -DSDL_TESTS=OFF -DSDL_STATIC=OFF -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBDIR=lib/i386-linux-gnu
+# (drop -DSDL_UNIX_CONSOLE_BUILD for a desktop with X11/Wayland 32-bit dev packages)
+ninja -C SDL/build-i686 && sudo ninja -C SDL/build-i686 install
+git clone --depth 1 https://github.com/bnunu/halo-ce-universal && cd halo-ce-universal
+python3 configure.py --portable --pgo=off && ninja linux
+LD_LIBRARY_PATH=/usr/lib/i386-linux-gnu build/linux/halo
+```
+
+On a desktop, the port's own route is simpler: Arch Linux's `lib32-sdl3`
+package (what its CI uses), or the prebuilt releases linked from its README.
