@@ -14,6 +14,7 @@ keeping its best ideas.
 | 05 | [Ontology review and proposal](05-ontology.md) | *Is the ontology good?* What to keep, what is wrong, the replacement vocabulary |
 | 06 | [ADR-001: Language](06-adr-001-language.md) | *Rust or C/C++?* |
 | 07 | [Gap analysis and roadmap](07-gap-analysis-and-roadmap.md) | Security findings in current code, coverage, phased plan |
+| 08 | [Reference title: Halo: CE](08-reference-title-halo.md) | Using the Halo decompilation port as the first real game: netcode security review, FPP hook points, staged plan |
 
 ## Executive summary
 

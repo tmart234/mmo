@@ -173,8 +173,12 @@ gantt
 
 1. **Genre focus for v1.** Competitive shooter (ESP/aim dominant), MMO
    (bots/economy dominant), or both? This sets the order of P4's detectors.
+   *If the Halo: CE port becomes the reference title
+   ([08](08-reference-title-halo.md)), the answer is shooter-first.*
 2. **Hosting model.** Will there be partner, community or edge hosts? If not,
    P5 can be deferred and first-party servers stay at S-FirstParty.
+   *With Halo, games are player-hosted, so rogue-host accountability (P5's
+   evidence and replay parts) moves up, ahead of confidential VMs.*
 3. **Kernel component appetite.** Are we willing to ship a driver for any
    title, given platform direction and liability? The design works without one.
 4. **Platforms at launch.** Consoles need NDA SDK access early (E4).
