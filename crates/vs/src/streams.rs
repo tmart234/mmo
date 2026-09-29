@@ -1,7 +1,7 @@
 // crates/vs/src/streams.rs
 use common::{
     crypto::{heartbeat_sign_bytes, now_ms, sha256, sign, verify},
-    framing::{recv_msg, send_msg},
+    framing::{recv_msg, recv_msg_max, send_msg, MAX_TRANSCRIPT_FRAME},
     proto::{Heartbeat, PlayTicket, ProtectedReceipt, TranscriptDigest},
     tpm::verify_quote,
 };
@@ -102,21 +102,12 @@ pub fn spawn_bistream_dispatch(conn: &Connection, ctx: VsCtx, session_id: [u8; 1
                 }
             };
 
-            let mut len_buf = [0u8; 4];
-            if let Err(e) = recv.read_exact(&mut len_buf).await {
-                eprintln!("[VS] stream read len failed: {e:?}");
-                continue;
-            }
-            let mut buf = vec![0u8; u32::from_le_bytes(len_buf) as usize];
-            if let Err(e) = recv.read_exact(&mut buf).await {
-                eprintln!("[VS] stream read body failed: {e:?}");
-                continue;
-            }
-
-            let td = match bincode::deserialize::<TranscriptDigest>(&buf) {
+            // Length is capped before allocation: an admitted GS must not be able
+            // to make the VS allocate gigabytes by sending a large prefix.
+            let td = match recv_msg_max::<TranscriptDigest>(&mut recv, MAX_TRANSCRIPT_FRAME).await {
                 Ok(td) => td,
-                Err(_) => {
-                    eprintln!("[VS] unrecognised message on bi-stream (expected TranscriptDigest)");
+                Err(e) => {
+                    eprintln!("[VS] bad TranscriptDigest on bi-stream: {e:#}");
                     continue;
                 }
             };

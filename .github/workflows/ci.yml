@@ -13,6 +13,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: No private key material in git
+        run: |
+          if git ls-files | grep -E '\.(pk8|pem)$|\.key\.der$|(^|/)keys/[^/]+$' | grep -v '/\.gitignore$'; then
+            echo "::error::private key material is tracked by git (generate it with gen_keys instead)"
+            exit 1
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -33,7 +40,27 @@ jobs:
         env:
           STRICT_SMOKE: "1"
 
-      - name: Security audit
+  # Advisories (RustSec, same database as cargo-audit), licenses, bans and
+  # sources, per deny.toml. Blocking.
+  dependency-policy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  # Short fuzzing pass over every decoder and verifier of untrusted input.
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Fuzz (60 s per target)
         run: |
-          cargo install cargo-audit --locked || true
-          cargo audit || true
+          for target in wire_decode verify_untrusted; do
+            cargo +nightly fuzz run "$target" -- -max_total_time=60 -rss_limit_mb=2048
+          done

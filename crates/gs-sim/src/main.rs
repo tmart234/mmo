@@ -2,7 +2,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use common::{
-    crypto::{file_sha256, join_request_sign_bytes, now_ms, sign, verify},
+    crypto::{file_sha256, join_request_sign_bytes, now_ms, sign},
     framing::{recv_msg, send_msg},
     proto::{JoinAccept, JoinRequest, PlayTicket, Sig},
     tpm::{SimulatedTpm, TpmProvider},
@@ -19,6 +19,7 @@ use std::{
 use tokio::sync::{watch, Mutex as TokioMutex};
 use tokio::time::sleep;
 
+mod admission;
 mod client_port;
 mod heartbeat;
 mod ledger;
@@ -57,6 +58,21 @@ struct Opts {
     /// - Periodically re-attest every ~60 seconds in heartbeats
     #[arg(long)]
     enable_tpm: bool,
+
+    /// Pinned VS signing key. JoinAccept and PlayTickets must be signed by it.
+    #[arg(long, default_value = "keys/vs_ed25519.pub")]
+    vs_pk: String,
+
+    /// CA certificate (DER) the VS's TLS certificate must chain to.
+    #[arg(long, default_value = common::pki::DEFAULT_CA_CERT)]
+    ca_cert: String,
+
+    /// TLS certificate (DER) presented on the client port; must chain to the CA clients pin.
+    #[arg(long, default_value = common::pki::DEFAULT_GS_TLS_CERT)]
+    tls_cert: String,
+    /// PKCS#8 private key (DER) for `--tls-cert`.
+    #[arg(long, default_value = common::pki::DEFAULT_GS_TLS_KEY)]
+    tls_key: String,
 }
 
 #[tokio::main]
@@ -74,6 +90,14 @@ async fn main() -> Result<()> {
     // 1. Load/generate GS long-term keypair.
     //
     let (gs_sk_long, gs_pk_long) = load_or_make_keys(&opts.gs_sk, &opts.gs_pk)?;
+
+    //
+    // 1b. Trust roots: the pinned VS signing key, the CA for TLS, and our own
+    //     client-port certificate. Loaded up front so a misconfigured GS fails fast.
+    //
+    let pinned_vs = common::crypto::load_verifying_key(&opts.vs_pk)?;
+    let ca_der = common::pki::load_ca(&opts.ca_cert)?;
+    let client_port_identity = common::pki::ServerIdentity::load(&opts.tls_cert, &opts.tls_key)?;
 
     //
     // 2. Create per-session ephemeral signing key (this run).
@@ -121,7 +145,11 @@ async fn main() -> Result<()> {
     //
     let (endpoint, server_addr) = make_endpoint_and_addr(&opts.vs)?;
     let conn: Connection = endpoint
-        .connect_with(make_client_cfg_insecure()?, server_addr, "vs.dev")?
+        .connect_with(
+            common::pki::quic_client_config(&ca_der)?,
+            server_addr,
+            common::pki::VS_SERVER_NAME,
+        )?
         .await?;
     println!("[GS] connected to VS at {server_addr}");
 
@@ -168,20 +196,10 @@ async fn main() -> Result<()> {
     let ja: JoinAccept = recv_msg(&mut jrecv).await?;
 
     //
-    // 6. Verify VS identity + session_id signature in JoinAccept.
+    // 6. Verify JoinAccept against the pinned VS key (never the key it carries).
     //
-    let vs_vk = VerifyingKey::from_bytes(&ja.vs_pub).context("bad vs_pub from JoinAccept")?;
-
-    let sig_vs_arr: [u8; 64] = ja
-        .sig_vs
-        .clone()
-        .try_into()
-        .map_err(|_| anyhow!("VS sig length != 64"))?;
-
-    let sig_ok = verify(&vs_vk, &ja.session_id, &sig_vs_arr);
-    if !sig_ok {
-        bail!("VS signature invalid on JoinAccept");
-    }
+    admission::verify_join_accept(&pinned_vs, &ja)?;
+    let vs_vk = pinned_vs;
 
     println!(
         "[GS] joined. session_id={}.. (vs sig OK, len={})",
@@ -273,6 +291,7 @@ async fn main() -> Result<()> {
     // c) client_port_task:
     //    TCP listener accepting local client-sim connections.
     let client_port_task_handle = tokio::spawn(client_port_task(
+        client_port_identity,
         shared.clone(),
         revoke_rx.clone(),
         ticket_rx.clone(),
@@ -342,70 +361,6 @@ fn load_or_make_keys(sk_path: &str, pk_path: &str) -> Result<(SigningKey, Verify
         );
         Ok((sk, pk))
     }
-}
-
-/// Dev-only QUIC client config that skips cert verification.
-fn make_client_cfg_insecure() -> Result<quinn::ClientConfig> {
-    use rustls::{
-        client::{
-            danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-            ClientConfig as RustlsClientConfig,
-        },
-        pki_types::{CertificateDer, ServerName, UnixTime},
-        DigitallySignedStruct, SignatureScheme,
-    };
-
-    #[derive(Debug)]
-    struct NoVerify;
-
-    impl ServerCertVerifier for NoVerify {
-        fn verify_server_cert(
-            &self,
-            _end_entity: &CertificateDer<'_>,
-            _intermediates: &[CertificateDer<'_>],
-            _server_name: &ServerName<'_>,
-            _ocsp_response: &[u8],
-            _now: UnixTime,
-        ) -> std::result::Result<ServerCertVerified, rustls::Error> {
-            Ok(ServerCertVerified::assertion())
-        }
-
-        fn verify_tls12_signature(
-            &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
-        ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-            Ok(HandshakeSignatureValid::assertion())
-        }
-
-        fn verify_tls13_signature(
-            &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
-        ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-            Ok(HandshakeSignatureValid::assertion())
-        }
-
-        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            vec![
-                SignatureScheme::ECDSA_NISTP256_SHA256,
-                SignatureScheme::ED25519,
-                SignatureScheme::RSA_PSS_SHA256,
-            ]
-        }
-    }
-
-    let tls_cfg = RustlsClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerify))
-        .with_no_client_auth();
-
-    let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls_cfg))
-        .map_err(|e| anyhow!("QuicClientConfig::try_from: {e:?}"))?;
-
-    Ok(quinn::ClientConfig::new(Arc::new(quic_crypto)))
 }
 
 /// Create a Quinn client Endpoint bound to an ephemeral UDP port.

@@ -49,6 +49,10 @@ fn ensure_vs_keys() -> Result<()> {
     let skp = PathBuf::from("keys/vs_ed25519.pk8");
     let pkp = PathBuf::from("keys/vs_ed25519.pub");
 
+    if common::pki::ensure_dev_pki("keys").context("dev PKI")? {
+        println!("[SMOKE] generated dev PKI under keys/");
+    }
+
     if skp.exists() && pkp.exists() {
         return Ok(());
     }

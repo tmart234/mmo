@@ -53,5 +53,21 @@ World/physics enforcement (on VS):
 ### Quick Start
 
 ```bash
+# generate dev keys: VS signing key + a dev CA with VS/GS TLS certificates (keys/)
+cargo run -p tools --bin gen_keys
+
 # run full CI-lite (fmt, clippy, tests, smoke)
 make ci
+
+# dependency policy (advisories, licenses, sources), as in CI
+cargo deny check
+
+# fuzz the wire decoders and verifiers (nightly + cargo-fuzz)
+cargo +nightly fuzz run wire_decode -- -max_total_time=60
+cargo +nightly fuzz run verify_untrusted -- -max_total_time=60
+```
+
+Every QUIC link verifies certificates: clients and game servers pin
+`keys/dev_ca.der`, the GS pins the VS signing key `keys/vs_ed25519.pub`, and
+clients drop a GS as soon as its VS ticket chain breaks or expires. Nothing in
+`keys/` is committed.

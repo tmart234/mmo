@@ -2,6 +2,8 @@
 name = "gs-sim"
 version = "0.1.0"
 edition.workspace = true
+license.workspace = true
+publish.workspace = true
 
 [lib]
 name = "gs_sim"
@@ -19,7 +21,6 @@ tokio         = { workspace = true }
 futures       = { workspace = true }
 quinn         = { workspace = true }
 rustls        = { workspace = true }
-rcgen         = { workspace = true }
 
 serde         = { workspace = true }
 serde_json    = { workspace = true }
@@ -34,4 +35,4 @@ clap          = { workspace = true }
 
 common        = { path = "../common" }
 
-lru           = "0.12"
+lru           = "0.18"

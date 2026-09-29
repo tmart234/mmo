@@ -5,7 +5,9 @@ use quinn::Connection;
 use rand::{rngs::OsRng, RngCore};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::Notify;
+use tokio::time::timeout;
 
 use crate::ctx::{Session, VsCtx};
 use crate::enforcer::enforcer;
@@ -21,17 +23,24 @@ use common::{
 
 /// Admit one GS (authenticate JoinRequest) then spawn loops for that session.
 pub async fn admit_and_run(connecting: quinn::Incoming, ctx: VsCtx) -> Result<()> {
-    // QUIC handshake
-    let conn: Connection = connecting.await.context("handshake accept")?;
-    println!("[VS] new conn from {}", conn.remote_address());
+    // QUIC handshake + JoinRequest under one deadline, so a peer that connects
+    // and then goes quiet cannot hold a VS task and connection forever.
+    let deadline = Duration::from_millis(ctx.config.admission_timeout_ms);
+    let (conn, mut vs_send, jr) = timeout(deadline, async {
+        let conn: Connection = connecting.await.context("handshake accept")?;
+        println!("[VS] new conn from {}", conn.remote_address());
 
-    // First bi-stream: receive JoinRequest
-    let (mut vs_send, mut vs_recv) = conn
-        .accept_bi()
-        .await
-        .context("accept_bi for JoinRequest")?;
+        // First bi-stream: receive JoinRequest
+        let (vs_send, mut vs_recv) = conn
+            .accept_bi()
+            .await
+            .context("accept_bi for JoinRequest")?;
 
-    let jr: JoinRequest = recv_msg(&mut vs_recv).await.context("recv JoinRequest")?;
+        let jr: JoinRequest = recv_msg(&mut vs_recv).await.context("recv JoinRequest")?;
+        Ok::<_, anyhow::Error>((conn, vs_send, jr))
+    })
+    .await
+    .map_err(|_| anyhow!("admission timed out after {} ms", deadline.as_millis()))??;
     println!(
         "[VS] got JoinRequest from gs_id={} (ephemeral pub ..{:02x}{:02x})",
         jr.gs_id, jr.ephemeral_pub[0], jr.ephemeral_pub[1]
@@ -157,4 +166,54 @@ pub async fn admit_and_run(connecting: quinn::Incoming, ctx: VsCtx) -> Result<()
     spawn_uni_heartbeat_listener(&conn, ctx.clone(), session_id); // <-- add this
     spawn_watchdog(&conn, ctx, session_id);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::{config::VsConfig, pki};
+    use ed25519_dalek::SigningKey;
+
+    /// F08: a peer that completes the QUIC handshake but never sends a
+    /// JoinRequest is dropped at the admission deadline.
+    #[tokio::test]
+    async fn idle_peer_is_dropped_at_admission_deadline() {
+        let dev = pki::DevPki::generate().unwrap();
+        let server = quinn::Endpoint::server(
+            pki::quic_server_config(&dev.vs).unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let addr = server.local_addr().unwrap();
+
+        let client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let connecting = client
+            .connect_with(
+                pki::quic_client_config(&dev.ca_cert_der).unwrap(),
+                addr,
+                pki::VS_SERVER_NAME,
+            )
+            .unwrap();
+
+        let incoming = server.accept().await.unwrap();
+        let config = VsConfig {
+            admission_timeout_ms: 200,
+            ..VsConfig::default()
+        };
+        let ctx = VsCtx::new_with_config(Arc::new(SigningKey::from_bytes(&[3; 32])), config);
+
+        // The client completes the handshake, then stays connected and silent.
+        let client_task = tokio::spawn(async move {
+            let conn = connecting.await.unwrap();
+            conn.closed().await;
+        });
+        let started = std::time::Instant::now();
+        let err = admit_and_run(incoming, ctx).await.unwrap_err();
+        client_task.abort();
+        assert!(
+            format!("{err:#}").contains("admission timed out"),
+            "{err:#}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
 }

@@ -2,14 +2,15 @@ pub use anyhow::{anyhow, bail, Context, Result};
 
 use common::{
     crypto::{client_input_sign_bytes, now_ms},
-    framing::{recv_msg, send_msg_continue},
+    framing::{recv_msg, recv_msg_max, send_msg_continue, MAX_SNAPSHOT_FRAME},
     proto::{
         ClientCmd, ClientHello, ClientInput, ClientToGs, GsToClient, PlayTicket, ServerHello,
         WorldSnapshot,
     },
+    tickets::TicketChain,
 };
 
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use quinn::{ClientConfig, Endpoint, RecvStream, SendStream};
 use rand::rngs::OsRng;
 use std::{fs, path::Path, sync::Arc};
@@ -20,22 +21,40 @@ pub struct Session {
     pub recv_stream: RecvStream,
     pub session_id: [u8; 16],
     pub vs_pub: [u8; 32],
-    pub ticket: PlayTicket,
+    /// VS ticket chain proving the GS is still blessed; checked on every send.
+    pub tickets: TicketChain,
     pub client_pub: [u8; 32],
     pub client_sk: SigningKey,
 }
 
-/// Configure QUIC client with insecure cert verification for localhost dev.
-fn configure_quic_client() -> Result<ClientConfig> {
-    // For localhost dev, we skip cert verification
-    let crypto = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
-        .with_no_client_auth();
+impl Session {
+    /// The ticket currently stapled to inputs.
+    pub fn ticket(&self) -> &PlayTicket {
+        self.tickets.current()
+    }
+}
 
-    let mut client_config = ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
-    ));
+/// What the client trusts: the VS signing key and the CA for GS certificates.
+#[derive(Clone)]
+pub struct ClientTrust {
+    pub vs_pub: VerifyingKey,
+    pub ca_der: Vec<u8>,
+}
+
+impl ClientTrust {
+    /// Load `keys/vs_ed25519.pub` and `keys/dev_ca.der`.
+    pub fn load_default() -> Result<Self> {
+        Ok(Self {
+            vs_pub: VerifyingKey::from_bytes(&load_pinned_vs_pub()?)
+                .context("pinned VS key invalid")?,
+            ca_der: common::pki::load_ca(common::pki::DEFAULT_CA_CERT)?,
+        })
+    }
+}
+
+/// QUIC client config that only accepts GS certificates chaining to the pinned CA.
+fn configure_quic_client(ca_der: &[u8]) -> Result<ClientConfig> {
+    let mut client_config = common::pki::quic_client_config(ca_der)?;
 
     // Performance tuning
     let mut transport_config = quinn::TransportConfig::default();
@@ -44,49 +63,6 @@ fn configure_quic_client() -> Result<ClientConfig> {
 
     client_config.transport_config(Arc::new(transport_config));
     Ok(client_config)
-}
-
-/// Skip server certificate verification for localhost development.
-#[derive(Debug)]
-struct SkipServerVerification;
-
-impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ED25519,
-        ]
-    }
 }
 
 // ---------- key / trust roots ----------
@@ -160,13 +136,25 @@ pub fn load_or_create_client_keys() -> Result<(SigningKey, [u8; 32])> {
 
 /// One-shot connect + handshake. Kept for callers that don't want retry logic.
 pub async fn connect_and_handshake(gs_addr: &str) -> Result<Session> {
-    attempt_connect_and_handshake(gs_addr, Duration::from_secs(10)).await
+    let trust = ClientTrust::load_default()?;
+    attempt_connect_and_handshake(gs_addr, &trust, Duration::from_secs(10)).await
+}
+
+/// Connect + handshake with retry/backoff, trusting the default keys on disk.
+pub async fn connect_and_handshake_with_retry(
+    gs_addr: &str,
+    max_attempts: usize,
+    initial_backoff: Duration,
+) -> Result<Session> {
+    let trust = ClientTrust::load_default()?;
+    connect_and_handshake_with_trust(gs_addr, &trust, max_attempts, initial_backoff).await
 }
 
 /// Connect + handshake with retry/backoff. Retries only *transient* failures
 /// (connect errors, Hello timeout, EOF) — *not* trust or signature failures.
-pub async fn connect_and_handshake_with_retry(
+pub async fn connect_and_handshake_with_trust(
     gs_addr: &str,
+    trust: &ClientTrust,
     max_attempts: usize,
     initial_backoff: Duration,
 ) -> Result<Session> {
@@ -174,12 +162,14 @@ pub async fn connect_and_handshake_with_retry(
     let mut attempt = 1usize;
 
     loop {
-        match attempt_connect_and_handshake(gs_addr, Duration::from_secs(10)).await {
+        match attempt_connect_and_handshake(gs_addr, trust, Duration::from_secs(10)).await {
             Ok(sess) => return Ok(sess),
             Err(e) => {
-                // Fatal classes (do not retry): VS pinning mismatch or bad ticket signature/body.
+                // Fatal classes (do not retry): untrusted GS certificate, VS pinning
+                // mismatch, or bad ticket signature/body.
                 let msg = format!("{e:#}");
-                let fatal = msg.contains("untrusted VS pubkey")
+                let fatal = msg.contains("invalid peer certificate")
+                    || msg.contains("untrusted VS pubkey")
                     || msg.contains("signature on PlayTicket did not verify")
                     || msg.contains("ticket client_binding mismatch")
                     || msg.contains("ServerHello session mismatch");
@@ -208,25 +198,31 @@ pub async fn connect_and_handshake_with_retry(
     }
 }
 
+/// Dial a GS client port over QUIC, verifying its certificate against `ca_der`.
+pub async fn dial_gs(gs_addr: &str, ca_der: &[u8]) -> Result<quinn::Connection> {
+    let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
+    endpoint.set_default_client_config(configure_quic_client(ca_der)?);
+    endpoint
+        .connect(gs_addr.parse()?, common::pki::GS_SERVER_NAME)?
+        .await
+        .with_context(|| format!("QUIC connect to {}", gs_addr))
+}
+
 /// Internal: a single attempt to connect + receive `ServerHello` with a timeout.
 /// Uses a short deadline so the caller can decide on retry policy.
-async fn attempt_connect_and_handshake(gs_addr: &str, hello_timeout: Duration) -> Result<Session> {
-    // 0) roots + identity
-    let pinned_vs_pub = load_pinned_vs_pub()?;
+async fn attempt_connect_and_handshake(
+    gs_addr: &str,
+    trust: &ClientTrust,
+    hello_timeout: Duration,
+) -> Result<Session> {
+    // 0) identity
+    let pinned_vs_pub = trust.vs_pub.to_bytes();
     let (client_sk, client_pub) = load_or_create_client_keys()?;
 
-    // 1) configure QUIC client
-    let client_config = configure_quic_client()?;
-    let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
-    endpoint.set_default_client_config(client_config);
-
-    // 2) connect to GS
+    // 1-2) connect to GS; TLS verifies its certificate chains to the pinned CA
     let t0 = std::time::Instant::now();
     println!("[CLIENT] {:?} connecting to {}...", t0.elapsed(), gs_addr);
-    let conn = endpoint
-        .connect(gs_addr.parse()?, "localhost")?
-        .await
-        .with_context(|| format!("QUIC connect to {}", gs_addr))?;
+    let conn = dial_gs(gs_addr, &trust.ca_der).await?;
     let conn_id = conn.stable_id();
     println!(
         "[CLIENT] {:?} QUIC connected to {} (conn_id={})",
@@ -303,46 +299,15 @@ async fn attempt_connect_and_handshake(gs_addr: &str, hello_timeout: Duration) -
         );
     }
 
-    // 6) enforce ticket client binding (if bound)
-    if ticket.client_binding != [0u8; 32] && ticket.client_binding != client_pub {
-        bail!("ticket client_binding mismatch: this ticket isn't for our client_pub");
-    }
-
-    // 7) session_id must match
-    if ticket.session_id != sh.session_id {
-        bail!("ServerHello session mismatch between GS and ticket");
-    }
-
-    // 8) verify VS signature on ticket
-    // VS signed: (session_id, client_binding, counter, not_before_ms, not_after_ms, prev_ticket_hash)
-    let body_tuple = (
-        ticket.session_id,
-        ticket.client_binding,
-        ticket.counter,
-        ticket.not_before_ms,
-        ticket.not_after_ms,
-        ticket.prev_ticket_hash,
-    );
-    let body_bytes =
-        bincode::serialize(&body_tuple).context("serialize PlayTicket body for verify")?;
-    let vs_vk = VerifyingKey::from_bytes(&sh.vs_pub).context("vs_pub in ServerHello invalid")?;
-    let sig_vs = Signature::from_bytes(&ticket.sig_vs);
-    if vs_vk.verify_strict(&body_bytes, &sig_vs).is_err() {
-        bail!("VS signature on PlayTicket did not verify");
-    }
-
-    // optional freshness check for logs/UX where used
-    let _fresh_now = {
-        let now = now_ms();
-        ticket.not_before_ms.saturating_sub(500) <= now
-            && now <= ticket.not_after_ms.saturating_add(500)
-    };
+    // 6-8) session match, client binding, VS signature and freshness;
+    //      later TicketUpdates must extend this chain (TicketChain::advance)
+    let tickets = TicketChain::start(trust.vs_pub, sh.session_id, client_pub, ticket, now_ms())?;
 
     println!(
         "[CLIENT] {:?} handshake complete, session={}, ticket_ctr={}",
         t0.elapsed(),
         hex::encode(&sh.session_id[..4]),
-        ticket.counter
+        tickets.current().counter
     );
 
     Ok(Session {
@@ -350,7 +315,7 @@ async fn attempt_connect_and_handshake(gs_addr: &str, hello_timeout: Duration) -
         recv_stream,
         session_id: sh.session_id,
         vs_pub: sh.vs_pub,
-        ticket,
+        tickets,
         client_pub,
         client_sk,
     })
@@ -360,20 +325,24 @@ async fn attempt_connect_and_handshake(gs_addr: &str, hello_timeout: Duration) -
 
 /// Sign and send a single input for this session.
 pub async fn send_input(sess: &mut Session, nonce: u64, cmd: ClientCmd) -> Result<()> {
+    // Refuse to keep playing on a GS the VS no longer blesses.
+    sess.tickets.ensure_fresh(now_ms())?;
+    let ticket = sess.ticket();
+
     // Canonical bytes; must match GS verification.
     let sign_bytes = client_input_sign_bytes(
         &sess.session_id, // <-- [u8;16]
-        sess.ticket.counter,
-        &sess.ticket.sig_vs,
+        ticket.counter,
+        &ticket.sig_vs,
         nonce,
         &cmd,
     );
     let sig = sess.client_sk.sign(&sign_bytes);
 
     let ci = ClientInput {
-        session_id: sess.session_id,         // <-- [u8;16]
-        ticket_counter: sess.ticket.counter, // u64
-        ticket_sig_vs: sess.ticket.sig_vs,   // [u8;64]
+        session_id: sess.session_id, // <-- [u8;16]
+        ticket_counter: ticket.counter,
+        ticket_sig_vs: ticket.sig_vs,
         client_nonce: nonce,
         cmd,
         client_pub: sess.client_pub, // [u8;32]
@@ -390,7 +359,7 @@ pub async fn send_input(sess: &mut Session, nonce: u64, cmd: ClientCmd) -> Resul
 /// Also handles TicketUpdate messages and updates the session's ticket.
 pub async fn recv_world(sess: &mut Session) -> Result<WorldSnapshot> {
     loop {
-        let msg: GsToClient = recv_msg(&mut sess.recv_stream)
+        let msg: GsToClient = recv_msg_max(&mut sess.recv_stream, MAX_SNAPSHOT_FRAME)
             .await
             .context("recv GsToClient")?;
 
@@ -399,8 +368,11 @@ pub async fn recv_world(sess: &mut Session) -> Result<WorldSnapshot> {
                 return Ok(ws);
             }
             GsToClient::TicketUpdate(tu) => {
-                // Update our stapled ticket for future inputs
-                sess.ticket = tu.ticket;
+                // Must be VS-signed and extend our chain; otherwise the GS is
+                // feeding us tickets the VS did not issue for this session.
+                sess.tickets
+                    .advance(tu.ticket, now_ms())
+                    .context("rejected TicketUpdate from GS")?;
             }
             GsToClient::ServerHello(_) => {
                 // Unexpected at this point, but just ignore

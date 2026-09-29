@@ -25,7 +25,7 @@
 //!                   ▼ Attestation Quote
 //!
 //! ┌──────────────────────────────────────────┐
-//! │   Verification Server (VS)               │
+//! │   Validation Server (VS)                 │
 //! │  ┌────────────────────────────────────┐  │
 //! │  │   verify_quote()                   │  │
 //! │  │  - Check signature                 │  │

@@ -1,0 +1,178 @@
+//! Certificates and verified TLS configuration for every QUIC link.
+//!
+//! Every connection in the workspace (client -> GS, GS -> VS) verifies the
+//! server's certificate chain against a pinned CA. There is no
+//! "skip verification" path. For local development, `DevPki::generate()`
+//! makes a CA plus server certificates for the VS (`vs.dev`) and the GS
+//! client port (`localhost`), and `gen_keys` writes them under `keys/`.
+//! In production the CA is the publisher's game-server CA
+//! (docs/anticheat/04-protocol.md §7.1).
+
+use anyhow::{anyhow, Context, Result};
+use rcgen::{
+    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
+    ExtendedKeyUsagePurpose, IsCa, KeyUsagePurpose, SanType,
+};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use std::{fs, path::Path, sync::Arc};
+
+/// TLS server name the GS uses when dialing the VS.
+pub const VS_SERVER_NAME: &str = "vs.dev";
+/// TLS server name clients use when dialing a GS client port.
+pub const GS_SERVER_NAME: &str = "localhost";
+
+pub const DEFAULT_CA_CERT: &str = "keys/dev_ca.der";
+pub const DEFAULT_VS_TLS_CERT: &str = "keys/vs_tls.der";
+pub const DEFAULT_VS_TLS_KEY: &str = "keys/vs_tls.key.der";
+pub const DEFAULT_GS_TLS_CERT: &str = "keys/gs_tls.der";
+pub const DEFAULT_GS_TLS_KEY: &str = "keys/gs_tls.key.der";
+
+/// A server certificate (DER) and its PKCS#8 private key (DER).
+#[derive(Clone)]
+pub struct ServerIdentity {
+    pub cert_der: Vec<u8>,
+    pub key_der: Vec<u8>,
+}
+
+impl ServerIdentity {
+    pub fn load(cert_path: impl AsRef<Path>, key_path: impl AsRef<Path>) -> Result<Self> {
+        let (cert_path, key_path) = (cert_path.as_ref(), key_path.as_ref());
+        Ok(Self {
+            cert_der: fs::read(cert_path).with_context(|| missing_hint(cert_path))?,
+            key_der: fs::read(key_path).with_context(|| missing_hint(key_path))?,
+        })
+    }
+}
+
+/// Development PKI: one CA and the two server identities it signs.
+pub struct DevPki {
+    pub ca_cert_der: Vec<u8>,
+    pub vs: ServerIdentity,
+    pub gs: ServerIdentity,
+}
+
+impl DevPki {
+    pub fn generate() -> Result<Self> {
+        let mut ca_params = CertificateParams::default();
+        ca_params.distinguished_name = distinguished_name("mmo dev CA");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let ca = Certificate::from_params(ca_params).context("generate dev CA")?;
+
+        Ok(Self {
+            ca_cert_der: ca.serialize_der().context("serialize dev CA")?,
+            vs: server_identity(&ca, VS_SERVER_NAME, false)?,
+            gs: server_identity(&ca, GS_SERVER_NAME, true)?,
+        })
+    }
+
+    /// Write the CA certificate and both server identities into `dir`
+    /// using the default file names. The CA private key is not written.
+    pub fn write_to(&self, dir: impl AsRef<Path>) -> Result<()> {
+        let dir = dir.as_ref();
+        fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        let file = |default: &str| dir.join(Path::new(default).file_name().expect("file name"));
+        fs::write(file(DEFAULT_CA_CERT), &self.ca_cert_der)?;
+        fs::write(file(DEFAULT_VS_TLS_CERT), &self.vs.cert_der)?;
+        fs::write(file(DEFAULT_VS_TLS_KEY), &self.vs.key_der)?;
+        fs::write(file(DEFAULT_GS_TLS_CERT), &self.gs.cert_der)?;
+        fs::write(file(DEFAULT_GS_TLS_KEY), &self.gs.key_der)?;
+        Ok(())
+    }
+}
+
+/// Generate and write a dev PKI into `dir` unless its files already exist.
+/// Returns whether new files were written.
+pub fn ensure_dev_pki(dir: impl AsRef<Path>) -> Result<bool> {
+    let dir = dir.as_ref();
+    let present = [
+        DEFAULT_CA_CERT,
+        DEFAULT_VS_TLS_CERT,
+        DEFAULT_VS_TLS_KEY,
+        DEFAULT_GS_TLS_CERT,
+        DEFAULT_GS_TLS_KEY,
+    ]
+    .iter()
+    .all(|f| {
+        dir.join(Path::new(f).file_name().expect("file name"))
+            .exists()
+    });
+    if present {
+        return Ok(false);
+    }
+    DevPki::generate()?.write_to(dir)?;
+    Ok(true)
+}
+
+fn distinguished_name(common_name: &str) -> DistinguishedName {
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, common_name);
+    dn
+}
+
+fn server_identity(ca: &Certificate, name: &str, loopback_ip: bool) -> Result<ServerIdentity> {
+    let mut params = CertificateParams::new(vec![name.to_string()]);
+    if loopback_ip {
+        params
+            .subject_alt_names
+            .push(SanType::IpAddress(std::net::Ipv4Addr::LOCALHOST.into()));
+    }
+    params.distinguished_name = distinguished_name(name);
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let cert = Certificate::from_params(params).with_context(|| format!("generate {name}"))?;
+    Ok(ServerIdentity {
+        cert_der: cert
+            .serialize_der_with_signer(ca)
+            .with_context(|| format!("sign {name}"))?,
+        key_der: cert.serialize_private_key_der(),
+    })
+}
+
+fn missing_hint(path: &Path) -> String {
+    format!(
+        "read {} (generate dev certificates with `cargo run -p tools --bin gen_keys`)",
+        path.display()
+    )
+}
+
+fn provider() -> Arc<rustls::crypto::CryptoProvider> {
+    Arc::new(rustls::crypto::ring::default_provider())
+}
+
+/// Read a CA certificate (DER) to pin as the trust root.
+pub fn load_ca(path: impl AsRef<Path>) -> Result<Vec<u8>> {
+    let path = path.as_ref();
+    fs::read(path).with_context(|| missing_hint(path))
+}
+
+/// QUIC server config presenting `identity`.
+pub fn quic_server_config(identity: &ServerIdentity) -> Result<quinn::ServerConfig> {
+    let chain = vec![CertificateDer::from(identity.cert_der.clone())];
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.key_der.clone()));
+    let tls = rustls::ServerConfig::builder_with_provider(provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .context("TLS 1.3 server config")?
+        .with_no_client_auth()
+        .with_single_cert(chain, key)
+        .context("server certificate")?;
+    let quic = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
+        .map_err(|e| anyhow!("QUIC server config: {e}"))?;
+    Ok(quinn::ServerConfig::with_crypto(Arc::new(quic)))
+}
+
+/// QUIC client config that accepts only servers whose chain ends at `ca_der`.
+pub fn quic_client_config(ca_der: &[u8]) -> Result<quinn::ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(ca_der.to_vec()))
+        .context("add pinned CA to root store")?;
+    let tls = rustls::ClientConfig::builder_with_provider(provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .context("TLS 1.3 client config")?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
+        .map_err(|e| anyhow!("QUIC client config: {e}"))?;
+    Ok(quinn::ClientConfig::new(Arc::new(quic)))
+}

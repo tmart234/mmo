@@ -20,7 +20,6 @@ use ctx::VsCtx;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use quinn::Endpoint;
 use rand::rngs::OsRng;
-use rcgen::generate_simple_self_signed;
 use std::{
     fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -39,6 +38,13 @@ struct Opts {
     vs_sk: String,
     #[arg(long, default_value = "keys/vs_ed25519.pub")]
     vs_pk: String,
+
+    /// TLS certificate (DER) presented to game servers; must chain to the CA they pin.
+    #[arg(long, default_value = common::pki::DEFAULT_VS_TLS_CERT)]
+    tls_cert: String,
+    /// PKCS#8 private key (DER) for `--tls-cert`.
+    #[arg(long, default_value = common::pki::DEFAULT_VS_TLS_KEY)]
+    tls_key: String,
 }
 
 #[tokio::main]
@@ -61,7 +67,8 @@ async fn main() -> Result<()> {
     let ctx = VsCtx::new(Arc::new(vs_sk_raw));
 
     // Start QUIC listener
-    let (endpoint, _local_addr) = make_endpoint(&opts.bind)?;
+    let identity = common::pki::ServerIdentity::load(&opts.tls_cert, &opts.tls_key)?;
+    let (endpoint, _local_addr) = make_endpoint(&opts.bind, &identity)?;
     println!("[VS] listening on {}", opts.bind);
     println!("[VS] Metrics available via metrics::gather_metrics()");
 
@@ -70,6 +77,15 @@ async fn main() -> Result<()> {
         let Some(incoming) = incoming_opt else {
             break;
         };
+
+        // QUIC address validation: a peer must prove it receives traffic at its
+        // source address (Retry round trip) before we spend per-connection work.
+        if !incoming.remote_address_validated() {
+            if let Err(e) = incoming.retry() {
+                eprintln!("[VS] retry failed: {e}");
+            }
+            continue;
+        }
 
         let ctx_clone = ctx.clone();
         tokio::spawn(async move {
@@ -82,23 +98,13 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Build QUIC Endpoint bound to `bind` (e.g. "127.0.0.1:4444"),
-/// with a fresh self-signed cert for "vs.dev" (dev mode).
-fn make_endpoint(bind: &str) -> Result<(Endpoint, SocketAddr)> {
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-
-    // Self-signed cert for this VS process (dev only).
-    let cert = generate_simple_self_signed(vec!["vs.dev".into()]).context("self-signed cert")?;
-    let cert_der = CertificateDer::from(cert.serialize_der().context("cert der")?);
-
-    // rcgen gives us a PKCS#8 private key as Vec<u8>.
-    // rustls 0.23 represents keys using PrivateKeyDer<'static>.
-    let key_der_vec = cert.serialize_private_key_der();
-    let priv_key: PrivateKeyDer<'static> = PrivatePkcs8KeyDer::from(key_der_vec).into();
-
-    // Build Quinn server config from that cert/key.
-    let server_cfg = quinn::ServerConfig::with_single_cert(vec![cert_der], priv_key)
-        .context("with_single_cert")?;
+/// Build QUIC Endpoint bound to `bind` (e.g. "127.0.0.1:4444") presenting
+/// the VS certificate, which game servers verify against their pinned CA.
+fn make_endpoint(
+    bind: &str,
+    identity: &common::pki::ServerIdentity,
+) -> Result<(Endpoint, SocketAddr)> {
+    let server_cfg = common::pki::quic_server_config(identity)?;
 
     // Parse requested bind addr like "127.0.0.1:4444".
     let req_addr: SocketAddr = bind

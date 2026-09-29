@@ -85,27 +85,56 @@ pub async fn send_msg_continue<T: Serialize>(s: &mut SendStream, msg: &T) -> Res
     Ok(())
 }
 
-/// Receive exactly one framed message from a QUIC RecvStream.
+/// Default cap for one frame: control messages (hellos, tickets, heartbeats,
+/// join requests, receipts, client inputs) are all far smaller than this.
+pub const MAX_CONTROL_FRAME: usize = 64 * 1024;
+/// GS -> client world snapshots grow with the number of visible players.
+pub const MAX_SNAPSHOT_FRAME: usize = 1024 * 1024;
+/// GS -> VS TranscriptDigest, including the inputs it carries for storage.
+pub const MAX_TRANSCRIPT_FRAME: usize = 4 * 1024 * 1024;
+
+/// Validate a frame's 4-byte little-endian length prefix against `max`,
+/// before anything is allocated for the body.
+pub fn frame_len(prefix: [u8; 4], max: usize) -> Result<usize> {
+    let len = u32::from_le_bytes(prefix) as usize;
+    if len > max {
+        anyhow::bail!("frame too large: {len} bytes (max {max})");
+    }
+    Ok(len)
+}
+
+/// Decode one complete frame (`[u32 LE len][bincode payload]`) from `buf`.
+pub fn decode_frame<T: DeserializeOwned>(buf: &[u8], max: usize) -> Result<T> {
+    let prefix: [u8; 4] = buf
+        .get(..4)
+        .and_then(|p| p.try_into().ok())
+        .context("frame shorter than its length prefix")?;
+    let len = frame_len(prefix, max)?;
+    let body = buf
+        .get(4..4 + len)
+        .context("frame shorter than its declared length")?;
+    bincode::deserialize(body).context("bincode decode frame")
+}
+
+/// Receive exactly one framed message of at most `MAX_CONTROL_FRAME` bytes.
 ///
 /// Blocks until the full frame is read.
 pub async fn recv_msg<T: DeserializeOwned>(r: &mut RecvStream) -> Result<T> {
-    // read 4-byte little-endian length prefix
+    recv_msg_max(r, MAX_CONTROL_FRAME).await
+}
+
+/// Receive exactly one framed message of at most `max` bytes. The length is
+/// checked before the body buffer is allocated.
+pub async fn recv_msg_max<T: DeserializeOwned>(r: &mut RecvStream, max: usize) -> Result<T> {
     let mut len_bytes = [0u8; 4];
     r.read_exact(&mut len_bytes)
         .await
         .context("read length prefix")?;
-    let len = u32::from_le_bytes(len_bytes) as usize;
+    let len = frame_len(len_bytes, max)?;
 
-    // Sanity check: reject absurdly large messages (> 16 MB)
-    if len > 16 * 1024 * 1024 {
-        anyhow::bail!("message too large: {} bytes (max 16MB)", len);
-    }
-
-    // read body of that length
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf).await.context("read body payload")?;
 
-    // bincode decode
     let msg: T = bincode::deserialize(&buf).context("bincode decode recv_msg")?;
     Ok(msg)
 }

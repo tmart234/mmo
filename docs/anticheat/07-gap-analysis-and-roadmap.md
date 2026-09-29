@@ -14,25 +14,26 @@ because several **chain together**.
 
 | ID | Sev | Finding | Location | Fix (phase) |
 |----|-----|---------|----------|-------------|
-| F01 | **Critical** | TLS certificate verification disabled on client→GS and GS→VS. A network or local proxy can read and alter unsigned traffic (snapshots) and impersonate either server. | `crates/client-core/src/lib.rs:33,51`; `crates/gs-sim/src/main.rs:359,401-402` | Real CA + pinning; compile out insecure verifiers (P0) |
-| F02 | **Critical** | The GS does not pin the VS key: it verifies `JoinAccept` with the `vs_pub` *contained in the same message*, then trusts tickets signed by that key. Combined with F01, any MITM or fake VS can "bless" a GS. | `crates/gs-sim/src/main.rs:173,181` | Pin VS key bundle on GS (P0) |
-| F03 | **High** | The client verifies the VS signature and freshness only on the first ticket. `TicketUpdate`s are accepted unverified and freshness is computed but ignored. **F01 + F02 + F03 = revocation bypass**: after the handshake a revoked GS (or a MITM feeding it tickets) keeps clients playing. | `crates/client-core/src/lib.rs:335,401-403` | Verify every update, chain and expiry; disconnect on lapse (P0) |
+| F01 | **Critical** | TLS certificate verification disabled on client→GS and GS→VS. A network or local proxy can read and alter unsigned traffic (snapshots) and impersonate either server. | `crates/client-core/src/lib.rs:33,51`; `crates/gs-sim/src/main.rs:359,401-402` | ✅ Fixed (P0): dev CA + CA-signed VS/GS certificates (`common::pki`); insecure verifiers removed |
+| F02 | **Critical** | The GS does not pin the VS key: it verifies `JoinAccept` with the `vs_pub` *contained in the same message*, then trusts tickets signed by that key. Combined with F01, any MITM or fake VS can "bless" a GS. | `crates/gs-sim/src/main.rs:173,181` | ✅ Fixed (P0): GS pins `keys/vs_ed25519.pub` (`gs_sim::admission::verify_join_accept`) |
+| F03 | **High** | The client verifies the VS signature and freshness only on the first ticket. `TicketUpdate`s are accepted unverified and freshness is computed but ignored. **F01 + F02 + F03 = revocation bypass**: after the handshake a revoked GS (or a MITM feeding it tickets) keeps clients playing. | `crates/client-core/src/lib.rs:335,401-403` | ✅ Fixed (P0): `common::tickets::TicketChain` verifies every update (signature, session, chain, expiry); GS forwards every ticket in order |
 | F04 | **High** | TPM quote freshness is attester-controlled. The VS checks the quote against its *own* nonce, whose first 16 bytes equal the GS-chosen `JoinRequest.nonce`, and join nonces are not tracked. A captured quote can be replayed forever. | `crates/vs/src/admission.rs:94,115` | Verifier-issued single-use nonces (P1) |
 | F05 | **High** | Hardware TPM path is non-functional or incorrect: `extend_pcr` ignores its index (always slot 0); `verify_quote` rejects non-Ed25519 AKs and does not parse `TPMS_ATTEST`, so real quotes can never verify; no EK chain or AK credential activation. The docs (`TPM_GUIDE.md`) and the code disagree on what is implemented. | `crates/common/src/tpm.rs:155,284,438,504,518` | Replace with Verifier-side appraisal (P3) |
 | F06 | **High** | `sw_hash` is self-reported (the binary hashes itself), and PCR 0 is extended with an app hash. The allowlist and "attestation" provide no assurance against a modified GS. | `crates/gs-sim/src/main.rs:88,99` | Measured launch / CVM + Build Registry (P3/P5) |
-| F07 | Medium | Unbounded allocation from a peer-controlled length prefix on the VS bi-stream path (bypasses the 16 MiB cap in `framing::recv_msg`). An admitted GS can force up to 4 GiB allocations per stream. | `crates/vs/src/streams.rs:110` | Use capped decoder everywhere (P0) |
-| F08 | Medium | No timeout on accepting or reading the `JoinRequest`: idle connections hold VS tasks indefinitely (slowloris). | `crates/vs/src/admission.rs:30-34` | Handshake deadlines, QUIC address validation (P0) |
+| F07 | Medium | Unbounded allocation from a peer-controlled length prefix on the VS bi-stream path (bypasses the 16 MiB cap in `framing::recv_msg`). An admitted GS can force up to 4 GiB allocations per stream. | `crates/vs/src/streams.rs:110` | ✅ Fixed (P0): `framing::recv_msg_max`, 64 KiB default cap, explicit caps for snapshots (1 MiB) and transcripts (4 MiB) |
+| F08 | Medium | No timeout on accepting or reading the `JoinRequest`: idle connections hold VS tasks indefinitely (slowloris). | `crates/vs/src/admission.rs:30-34` | ✅ Fixed (P0): `admission_timeout_ms` deadline + QUIC Retry address validation |
 | F09 | Medium | Process-global `Mutex<Enforcer>` shared by all sessions, with `lock().unwrap()`. It serializes all sessions, and one panic poisons every session. | `crates/vs/src/enforcer.rs:300` | Per-session state; remove from VS (P2) |
 | F10 | Medium | `PlayTicket.client_binding` is always zero, so a ticket is a bearer credential usable by any client. | `crates/vs/src/streams.rs:47,58` | PoP-bound SAT (P1) |
 | F11 | Medium | No domain separation in signatures. `JoinAccept` signs the raw 16-byte `session_id` with the same key that signs tickets and receipts. | `crates/vs/src/admission.rs:143` | COSE + `fpp-ctx` allowlists (P1) |
 | F12 | Medium | Protocol version mismatch is logged but the session proceeds. | `crates/gs-sim/src/client_port.rs:258` | Reject; ALPN versioning (P1) |
 | F13 | Medium | The VS "physics" check uses GS-claimed positions and GS-claimed time, sampled every ~2 s. It does not constrain a rogue GS and is bypassed by teleport-and-return. | `crates/vs/src/enforcer.rs` | GS validators + deterministic Replay Auditor (P2/P4) |
 | F14 | Low | Evidence ("DA log") is written to local files in the working directory: no integrity, durability or replication. | `crates/vs/src/streams.rs:401-420` | Evidence Store (P2) |
-| F15 | Low | Private key material is committed (`crates/client-core/keys/client_ed25519.pk8`, presumably a test key). `.pk8` files hold raw 32-byte seeds, not PKCS#8. | repo | Remove, add secret scanning (P0) |
-| F16 | Low | `cargo audit \|\| true`: advisories never fail CI. | `.github/workflows/ci.yml:39` | Make failing; add `cargo-deny` (P0) |
-| F17 | Low | `.gitignore` ignores `*.lock` while `Cargo.lock` is tracked. Lockfiles for binaries must be tracked for reproducible builds. | `.gitignore:23` | Remove the pattern (P0) |
+| F15 | Low | Private key material is committed (`crates/client-core/keys/client_ed25519.pk8`, presumably a test key). `.pk8` files hold raw 32-byte seeds, not PKCS#8. | repo | ✅ Fixed (P0): keys untracked, `crates/*/keys/` ignored, CI guard fails on tracked key files |
+| F16 | Low | `cargo audit \|\| true`: advisories never fail CI. | `.github/workflows/ci.yml:39` | ✅ Fixed (P0): cargo-deny (advisories, licenses, bans, sources) is a blocking CI job; see F20 |
+| F17 | Low | `.gitignore` ignores `*.lock` while `Cargo.lock` is tracked. Lockfiles for binaries must be tracked for reproducible builds. | `.gitignore:23` | ✅ Fixed (P0) |
 | F18 | Info | Revocation state lives in three places. | `vs/src/ctx.rs:22`, `vs/src/enforcer.rs:33`, `gs-sim/src/state.rs:103` | Single subject-state model (P2) |
 | F19 | Info | GS client port is hard-coded to `127.0.0.1:50000`. | `crates/gs-sim/src/client_port.rs:78` | Config (P1) |
+| F20 | **High** | Vulnerable dependencies, hidden by the non-blocking audit (F16): quinn-proto remote DoS and memory exhaustion (RUSTSEC-2026-0037, -0185), rustls accepting TLS 1.3 handshake messages across encryption levels (RUSTSEC-2026-0285), rustls-webpki name-constraint and CRL flaws, aws-lc-sys X.509/PKCS7 bypasses, unsound `lru` used directly by gs-sim, protobuf recursion crash via prometheus 0.13, plus bytes, time and anyhow issues. | `Cargo.lock`, `crates/gs-sim/Cargo.toml`, `Cargo.toml` | ✅ Fixed (P0): lockfile updates, lru 0.18, prometheus 0.14; remaining ignores documented in `deny.toml` (bincode, until P1 replaces it) |
 
 ## 2. Requirements coverage
 
@@ -94,11 +95,24 @@ Existing crates migrate: `common` → `fpp-*`, `gs-sim` + `gs-core` →
 
 Each phase ends with an exit criterion that is testable in CI or by a game day.
 
-### P0 — Hygiene and correctness (1–2 weeks)
-Fix F01–F03, F07, F08, F15–F17. Unify VS naming. Make `cargo audit` and
-`cargo-deny` blocking. Add fuzz targets for existing decoders.
-**Exit:** a MITM test harness (proxy between client/GS and GS/VS) fails to
-alter, impersonate or keep a revoked GS alive; fuzzers run in CI.
+### P0 — Hygiene and correctness ✅ done
+Fixed F01–F03, F07, F08, F15–F17 and F20. Unified VS naming. cargo-deny is
+blocking (it uses the RustSec database, so it subsumes `cargo audit`). Fuzz
+targets cover every wire decoder and verifier of untrusted input.
+**Exit criterion, as met:** automated attack tests instead of a proxy harness,
+since verified TLS leaves a proxy nothing to do but drop packets:
+- impersonating VS or GS with a certificate from another CA, or for another
+  name, is refused (`crates/common/tests/pki_tls.rs`,
+  `crates/client-core/tests/gs_impersonation.rs`);
+- a fake VS advertising its own key is refused by the GS
+  (`crates/gs-sim/tests/join_accept_pinning.rs`);
+- forged, replayed, skipped, forked and expired tickets are refused, and a
+  client stops once tickets stop arriving, which is what revocation does
+  (`crates/common/tests/ticket_chain_client.rs`);
+- oversized frames are rejected before allocation and idle peers are dropped
+  at the admission deadline (`crates/common/tests/framing_limits.rs`,
+  `crates/vs/src/admission.rs` tests);
+- `cargo +nightly fuzz run wire_decode` / `verify_untrusted` run in CI.
 
 ### P1 — Protocol core v1 (4–6 weeks)
 `fpp-types`, `fpp-wire`, `fpp-crypto`, `fpp-merkle`, `fpp-tokens`. COSE + CBOR
