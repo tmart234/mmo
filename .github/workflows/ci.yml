@@ -59,8 +59,10 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
+      # The prebuilt cargo-fuzz is a musl binary and would default to building
+      # for musl, where AddressSanitizer is unavailable; target gnu explicitly.
       - name: Fuzz (60 s per target)
         run: |
           for target in wire_decode verify_untrusted; do
-            cargo +nightly fuzz run "$target" -- -max_total_time=60 -rss_limit_mb=2048
+            cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$target" -- -max_total_time=60 -rss_limit_mb=2048
           done
