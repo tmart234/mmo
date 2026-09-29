@@ -50,6 +50,9 @@ typedef enum FppStatus {
   FPP_STATUS_ALGORITHM = 16,
   FPP_STATUS_SIGNATURE = 17,
   FPP_STATUS_SCHEMA = 18,
+  // An external signer's callback failed, or returned a signature that
+  // does not verify under its public key (`fpp_signer_external`).
+  FPP_STATUS_SIGNER_FAILED = 19,
   // P2P sessions (`fpp_p2p_*`): why a datagram was dropped or a call
   // refused. Drop the datagram and carry on; none of these is fatal.
   // Not a packet of this protocol, or too large.
@@ -119,8 +122,15 @@ typedef struct FppP2pHost FppP2pHost;
 // A joining player's endpoint.
 typedef struct FppP2pJoiner FppP2pJoiner;
 
-// An Ed25519 signing key (a player's session key or a host's instance key).
+// An Ed25519 signing key (a player's session key or a host's instance key),
+// held here or outside the SDK (`fpp_signer_external`).
 typedef struct FppSigner FppSigner;
+
+// Signs `len` bytes at `msg` with an Ed25519 key held outside the SDK (an
+// Android Keystore key, a TPM), writing the 64-byte signature to `sig_out`.
+// Returns 0 on success. Called synchronously on the thread that called the
+// SDK function; it may block (secure hardware can take tens of ms).
+typedef int (*FppSignCallback)(void *ctx, const uint8_t *msg, size_t len, uint8_t *sig_out);
 
 // Fields of a verified InputCommit, plus its object digest.
 typedef struct FppInputCommitInfo {
@@ -266,6 +276,21 @@ enum FppStatus fpp_signer_generate(struct FppSigner **out);
 // # Safety
 // `seed` valid for 32 bytes; `out` valid for a pointer write.
 enum FppStatus fpp_signer_from_seed(const uint8_t *seed, struct FppSigner **out);
+
+// A key held outside the SDK: its 32-byte Ed25519 public key and a callback
+// that signs with it (an Android 13+ Keystore Ed25519 key, attested in the
+// TEE, is then the session key itself: tier D2, docs 10 §4). Every signature
+// the callback returns is verified; one that fails, or a non-zero return,
+// makes the signing call return `FPP_STATUS_SIGNER_FAILED` and emit nothing.
+// `ctx` is passed back to the callback unchanged and must outlive the handle.
+//
+// # Safety
+// `public_key` valid for 32 bytes; `callback` safe to call as documented at
+// `FppSignCallback`; `out` valid for a pointer write.
+enum FppStatus fpp_signer_external(const uint8_t *public_key,
+                                   FppSignCallback callback,
+                                   void *ctx,
+                                   struct FppSigner **out);
 
 // # Safety
 // `signer` NULL or a live handle; not used afterwards.

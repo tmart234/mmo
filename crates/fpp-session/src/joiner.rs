@@ -4,7 +4,7 @@ use crate::hello::{HostHello, JoinHello};
 use crate::packet::{self, Packet, COOKIE_LEN};
 use crate::session::{kind, Frame, Session};
 use crate::{random_u32, Error, StaticKeypair, Transmit, NOISE_PARAMS, PROLOGUE};
-use fpp_crypto::Ed25519Signer;
+use fpp_crypto::Ed25519Key;
 use fpp_wire::AdmitPop;
 use std::collections::VecDeque;
 
@@ -73,7 +73,11 @@ impl<A: Clone + Eq> Joiner<A> {
     /// Start joining `host_addr`; the first handshake packet is queued.
     /// `session_key` is the player's FPP session key: it signs the AdmitPop
     /// now and this player's InputCommits later.
-    pub fn new(cfg: JoinConfig, session_key: &Ed25519Signer, host_addr: A) -> Result<Self, Error> {
+    pub fn new(
+        cfg: JoinConfig,
+        session_key: &(impl Ed25519Key + ?Sized),
+        host_addr: A,
+    ) -> Result<Self, Error> {
         let static_key = StaticKeypair::generate();
         let pop = AdmitPop {
             channel: AdmitPop::NOISE_IK.into(),
@@ -81,7 +85,7 @@ impl<A: Clone + Eq> Joiner<A> {
         };
         let hello = JoinHello {
             invite: cfg.invite_secret,
-            session_key: session_key.verifying_key().to_bytes(),
+            session_key: session_key.public_key(),
             admit_pop: fpp_crypto::sign(session_key, &pop),
             attestation: cfg.attestation,
             app: cfg.hello,

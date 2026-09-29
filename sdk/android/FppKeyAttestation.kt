@@ -8,6 +8,11 @@
 //   3. evidence  = fpp_evidence_android_key(chain)                    (C SDK)
 //   4. send evidence in ClientAdmissionRequest; the Verifier appraises it
 //      (crates/attest-android).
+//   With an Ed25519 session key (Android 13+), the key never leaves the TEE:
+//   create the SDK handle with fpp_signer_external(ed25519SessionPub, cb, ctx)
+//   where the native callback calls FppKeyAttestation.sign(alias, msg) over
+//   JNI. The SDK verifies every signature it gets back. That is what earns
+//   tier D2 (docs/anticheat/10 §4).
 package dev.fpp.attest
 
 import android.content.Context
@@ -18,6 +23,8 @@ import android.security.keystore.KeyProperties
 import android.security.keystore.StrongBoxUnavailableException
 import java.security.KeyPairGenerator
 import java.security.KeyStore
+import java.security.PrivateKey
+import java.security.Signature
 import java.security.spec.ECGenParameterSpec
 
 object FppKeyAttestation {
@@ -80,5 +87,20 @@ object FppKeyAttestation {
             spki.copyOfRange(spki.size - 32, spki.size)
         } else null
         return Result(chain, if (strongBox) Storage.STRONGBOX else Storage.TEE, pub)
+    }
+
+    /**
+     * Sign [message] with the attested Ed25519 session key [alias] (for the
+     * fpp_signer_external callback). Returns the 64-byte signature.
+     */
+    @JvmStatic
+    fun sign(alias: String, message: ByteArray): ByteArray {
+        val ks = KeyStore.getInstance(KEYSTORE).apply { load(null) }
+        val key = ks.getKey(alias, null) as PrivateKey
+        return Signature.getInstance("Ed25519").run {
+            initSign(key)
+            update(message)
+            sign()
+        }
     }
 }

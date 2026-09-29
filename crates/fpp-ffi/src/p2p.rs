@@ -584,6 +584,7 @@ pub unsafe extern "C" fn fpp_p2p_joiner_new(
         };
         let addr = unsafe { address(host_addr, host_addr_len) }?;
         let j = Joiner::new(cfg, &key.inner, addr)?;
+        key.inner.check()?;
         unsafe { emit(out, FppP2pJoiner { inner: j }) }
     })
 }

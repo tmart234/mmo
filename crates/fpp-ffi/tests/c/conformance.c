@@ -14,6 +14,15 @@
 
 static int failures = 0;
 
+/* An external signer whose hardware always fails (fpp_signer_external). */
+static int refusing_signer(void *ctx, const uint8_t *msg, size_t len, uint8_t *sig) {
+    (void)ctx;
+    (void)msg;
+    (void)len;
+    (void)sig;
+    return -1;
+}
+
 #define CHECK(cond)                                                        \
     do {                                                                   \
         if (!(cond)) {                                                     \
@@ -249,6 +258,20 @@ int main(void) {
         CHECK_STATUS(fpp_evidence_apple_attest(leaf, sizeof leaf, env, sizeof env, &len), FPP_STATUS_OK);
         CHECK_STATUS(fpp_evidence_apple_assert(twos, leaf, sizeof leaf, env, sizeof env, &len), FPP_STATUS_OK);
         CHECK_STATUS(fpp_evidence_apple_assert(twos, leaf, 0, env, sizeof env, &len), FPP_STATUS_INVALID_ARGUMENT);
+    }
+
+    /* External signers (P3): a callback that fails yields SIGNER_FAILED and
+       no object, not an invalid one. */
+    {
+        FppSigner *ext = NULL;
+        FppInputCommitBuilder *b = commit_builder(0, 0, NULL);
+        uint8_t out[MAX_OBJECT];
+        size_t len = 0;
+        CHECK_STATUS(fpp_signer_external(session_pub, refusing_signer, NULL, &ext), FPP_STATUS_OK);
+        CHECK_STATUS(fpp_input_commit_sign(b, ext, out, sizeof out, &len), FPP_STATUS_SIGNER_FAILED);
+        CHECK_STATUS(fpp_signer_external(session_pub, NULL, NULL, &ext), FPP_STATUS_NULL_POINTER);
+        fpp_input_commit_free(b);
+        fpp_signer_free(ext);
     }
 
     fpp_signer_free(session0);

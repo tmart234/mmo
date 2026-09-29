@@ -103,9 +103,14 @@ quirks.
 
 ## 5. Next steps (P3, in order)
 
-1. **External signers in the SDK.** An `FppSigner` backed by a callback, so
-   the Android Ed25519 Keystore key signs AdmitPops and InputCommits. That
-   makes D2 reachable on real Android devices.
+1. ✅ **External signers in the SDK.** `fpp_signer_external(public_key,
+   callback, ctx)`: an `FppSigner` whose key stays in the Android Keystore
+   (the Kotlin adapter's `sign`). The SDK verifies each signature the
+   callback returns, and returns `FPP_STATUS_SIGNER_FAILED` with no object
+   when the hardware fails or signs with another key. Tests: an external
+   key produces the same bytes as a local key with the same seed (Ed25519 is
+   deterministic), and it signs InputCommits, Checkpoints and the P2P
+   AdmitPop. D2 is reachable on Android 13+ devices.
 2. **P-256 session keys (suite S1, ES256)** in `fpp-crypto`, the tokens and
    `fpp-session`. Secure Enclave and StrongBox keys are P-256 only. An App
    Attest assertion then endorses a Secure Enclave session key, and iOS and
