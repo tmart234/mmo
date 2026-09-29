@@ -389,28 +389,27 @@ impl Match {
                         p.x, p.y
                     ));
                 }
-                Ok(ClientCmd::SpendCoins(sc)) => {
-                    // Idempotent: a retried op_id is applied once (ECO-01).
+                // Idempotent: a retried op_id is applied once (ECO-01).
+                Ok(ClientCmd::SpendCoins(sc))
                     if self
                         .runtime
                         .check_idempotency(&p.session_key, &sc.op_id)
-                        .is_none()
-                    {
-                        self.runtime.record_op(
-                            p.session_key,
-                            sc.op_id,
-                            crate::state::OpResult {
-                                processed_at_ms: now_ms,
-                                success: true,
-                                balance_after: None,
-                            },
-                        );
-                        self.ledger_out.push(format!(
+                        .is_none() =>
+                {
+                    self.runtime.record_op(
+                        p.session_key,
+                        sc.op_id,
+                        crate::state::OpResult {
+                            processed_at_ms: now_ms,
+                            success: true,
+                            balance_after: None,
+                        },
+                    );
+                    self.ledger_out.push(format!(
                             "{{\"tick\":{tick},\"slot\":{slot},\"op\":\"SpendCoins\",\"op_id\":\"{}\",\"amount\":{}}}",
                             hex::encode(sc.op_id),
                             sc.amount
                         ));
-                    }
                 }
                 _ => {}
             }
