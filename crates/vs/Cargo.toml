@@ -28,3 +28,6 @@ fpp-types     = { path = "../fpp-types" }
 fpp-wire      = { path = "../fpp-wire" }
 fpp-crypto    = { path = "../fpp-crypto" }
 fpp-tokens    = { path = "../fpp-tokens" }
+attest-core   = { path = "../attest-core" }
+attest-android = { path = "../attest-android" }
+attest-apple  = { path = "../attest-apple" }

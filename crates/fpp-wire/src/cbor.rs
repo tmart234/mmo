@@ -174,6 +174,9 @@ pub fn encode(v: &Value) -> Result<Vec<u8>, WireError> {
 struct Decoder<'a> {
     buf: &'a [u8],
     pos: usize,
+    /// Map keys in deterministic order (FPP objects); `decode_foreign` only
+    /// requires them to be unique.
+    sorted_keys: bool,
 }
 
 impl<'a> Decoder<'a> {
@@ -261,7 +264,7 @@ impl<'a> Decoder<'a> {
                     if count > self.remaining() / 2 {
                         return Err(WireError::Truncated);
                     }
-                    let mut entries = Vec::with_capacity(count);
+                    let mut entries: Vec<(Value, Value)> = Vec::with_capacity(count);
                     let mut prev_key: Option<&'a [u8]> = None;
                     for _ in 0..count {
                         let start = self.pos;
@@ -273,10 +276,14 @@ impl<'a> Decoder<'a> {
                             return Err(WireError::UnsupportedKey);
                         }
                         let key_bytes = &self.buf[start..self.pos];
-                        if prev_key.is_some_and(|p| p >= key_bytes) {
+                        if self.sorted_keys {
+                            if prev_key.is_some_and(|p| p >= key_bytes) {
+                                return Err(WireError::UnsortedOrDuplicateKey);
+                            }
+                            prev_key = Some(key_bytes);
+                        } else if entries.iter().any(|(k, _)| *k == key) {
                             return Err(WireError::UnsortedOrDuplicateKey);
                         }
-                        prev_key = Some(key_bytes);
                         let value = self.item(depth - 1)?;
                         entries.push((key, value));
                     }
@@ -298,7 +305,28 @@ impl<'a> Decoder<'a> {
 /// Decode exactly one value occupying all of `bytes`, accepting only the
 /// deterministic encoding.
 pub fn decode(bytes: &[u8]) -> Result<Value, WireError> {
-    let mut d = Decoder { buf: bytes, pos: 0 };
+    let mut d = Decoder {
+        buf: bytes,
+        pos: 0,
+        sorted_keys: true,
+    };
+    let v = d.item(MAX_DEPTH)?;
+    if d.remaining() != 0 {
+        return Err(WireError::TrailingBytes);
+    }
+    Ok(v)
+}
+
+/// Decode a value made by someone else's encoder (platform evidence such as
+/// an Apple App Attest object): as `decode`, except that map keys may come in
+/// any order (they must still be unique). Never use it for FPP objects, whose
+/// signatures depend on the one deterministic encoding.
+pub fn decode_foreign(bytes: &[u8]) -> Result<Value, WireError> {
+    let mut d = Decoder {
+        buf: bytes,
+        pos: 0,
+        sorted_keys: false,
+    };
     let v = d.item(MAX_DEPTH)?;
     if d.remaining() != 0 {
         return Err(WireError::TrailingBytes);

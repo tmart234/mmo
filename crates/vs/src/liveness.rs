@@ -57,10 +57,8 @@ pub fn spawn_sar_loop(conn: &Connection, ctx: VsCtx, session_id: [u8; 16]) {
     tokio::spawn(async move {
         let mut seq = 0u64;
         let mut prev = Digest::default();
-        loop {
-            let Some(s) = ctx.sessions.get(&session_id).map(|s| s.clone()) else {
-                break;
-            };
+        // (the map guard is consumed by `map`: no lock is held in the body)
+        while let Some(s) = ctx.sessions.get(&session_id).map(|s| s.clone()) {
             if s.revoked {
                 eprintln!(
                     "[VS] SAR loop ending for session {}.. (revoked)",

@@ -16,6 +16,7 @@ keeping its best ideas.
 | 07 | [Gap analysis and roadmap](07-gap-analysis-and-roadmap.md) | Security findings in current code, coverage, phased plan |
 | 08 | [Reference title: Halo: CE](08-reference-title-halo.md) | Using the Halo decompilation port as the first real game: netcode security review, FPP hook points, staged plan |
 | 09 | [ADR-002: Transport per plane](09-adr-002-transport.md) | *Is QUIC the most efficient transport?* Encrypted UDP for native game data, QUIC for browsers and the control plane |
+| 10 | [Platform attestation and secure boot](10-attestation-and-secure-boot.md) | *Where does secure boot fit?* What Android, iOS, PCs and the Pi can prove; the mobile appraisal built in P3; tiers and next steps |
 
 ## Executive summary
 

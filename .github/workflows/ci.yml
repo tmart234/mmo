@@ -13,10 +13,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Key files by name (raw seeds, DER keys, anything in keys/), and any
+      # tracked file holding a PEM private key. Public certificates, such as
+      # the vendored attestation roots in crates/attest-*/roots/, are allowed.
       - name: No private key material in git
         run: |
-          if git ls-files | grep -E '\.(pk8|pem)$|\.key\.der$|(^|/)keys/[^/]+$' | grep -v '/\.gitignore$'; then
+          if git ls-files | grep -E '\.pk8$|\.key\.der$|(^|/)keys/[^/]+$' | grep -v '/\.gitignore$'; then
             echo "::error::private key material is tracked by git (generate it with gen_keys instead)"
+            exit 1
+          fi
+          if git grep -lI -e '-----BEGIN [A-Z ]*PRIVATE KEY-----' -- . ':!.github/workflows/ci.yml'; then
+            echo "::error::a PEM private key is tracked by git"
             exit 1
           fi
 

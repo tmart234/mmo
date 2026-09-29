@@ -50,6 +50,9 @@ typedef enum FppStatus {
   FPP_STATUS_ALGORITHM = 16,
   FPP_STATUS_SIGNATURE = 17,
   FPP_STATUS_SCHEMA = 18,
+  // An external signer's callback failed, or returned a signature that
+  // does not verify under its public key (`fpp_signer_external`).
+  FPP_STATUS_SIGNER_FAILED = 19,
   // P2P sessions (`fpp_p2p_*`): why a datagram was dropped or a call
   // refused. Drop the datagram and carry on; none of these is fatal.
   // Not a packet of this protocol, or too large.
@@ -119,8 +122,15 @@ typedef struct FppP2pHost FppP2pHost;
 // A joining player's endpoint.
 typedef struct FppP2pJoiner FppP2pJoiner;
 
-// An Ed25519 signing key (a player's session key or a host's instance key).
+// An Ed25519 signing key (a player's session key or a host's instance key),
+// held here or outside the SDK (`fpp_signer_external`).
 typedef struct FppSigner FppSigner;
+
+// Signs `len` bytes at `msg` with an Ed25519 key held outside the SDK (an
+// Android Keystore key, a TPM), writing the 64-byte signature to `sig_out`.
+// Returns 0 on success. Called synchronously on the thread that called the
+// SDK function; it may block (secure hardware can take tens of ms).
+typedef int (*FppSignCallback)(void *ctx, const uint8_t *msg, size_t len, uint8_t *sig_out);
 
 // Fields of a verified InputCommit, plus its object digest.
 typedef struct FppInputCommitInfo {
@@ -199,6 +209,61 @@ enum FppStatus fpp_sha256(const uint8_t *data, size_t len, uint8_t *out);
 // `object` valid for `len` bytes; `out` valid for 32 bytes.
 enum FppStatus fpp_object_digest(const uint8_t *object, size_t len, uint8_t *out);
 
+// The challenge a device binds its platform evidence to (roadmap P3):
+// `SHA-256("fpp/1/attest-challenge" || 0x00 || vs_challenge || session_pub)`.
+// Pass it to Android `KeyGenParameterSpec.Builder.setAttestationChallenge`
+// or as the App Attest `clientDataHash`. Evidence made for another admission
+// challenge or another session key does not verify.
+//
+// # Safety
+// `vs_challenge`, `session_pub` and `out` valid for 32 bytes each.
+enum FppStatus fpp_attest_challenge(const uint8_t *vs_challenge,
+                                    const uint8_t *session_pub,
+                                    uint8_t *out);
+
+// The evidence envelope for an Android Keystore key attestation: the
+// attested key's certificate chain, leaf first
+// (`KeyStore.getCertificateChain`, each `Certificate.getEncoded()`), for
+// `ClientAdmissionRequest.evidence`.
+//
+// # Safety
+// `certs` and `lens` valid for `count` entries; each `certs[i]` valid for
+// `lens[i]` bytes. `out_len` valid for a write; `out` NULL or valid for `cap`.
+enum FppStatus fpp_evidence_android_key(const uint8_t *const *certs,
+                                        const size_t *lens,
+                                        size_t count,
+                                        uint8_t *out,
+                                        size_t cap,
+                                        size_t *out_len);
+
+// The evidence envelope for an Apple App Attest attestation object (from
+// `DCAppAttestService.attestKey`, made with `fpp_attest_challenge` as the
+// client data hash). Send it once per app key; later admissions send
+// assertions (`fpp_evidence_apple_assert`).
+//
+// # Safety
+// `attestation` valid for `len` bytes; `out_len` valid for a write; `out`
+// NULL or valid for `cap` bytes.
+enum FppStatus fpp_evidence_apple_attest(const uint8_t *attestation,
+                                         size_t len,
+                                         uint8_t *out,
+                                         size_t cap,
+                                         size_t *out_len);
+
+// The evidence envelope for an Apple App Attest assertion (from
+// `DCAppAttestService.generateAssertion`, with `fpp_attest_challenge` as the
+// client data hash) by the attested key `key_id` (32 bytes, base64-decoded).
+//
+// # Safety
+// `key_id` valid for 32 bytes; `assertion` valid for `len` bytes; `out_len`
+// valid for a write; `out` NULL or valid for `cap` bytes.
+enum FppStatus fpp_evidence_apple_assert(const uint8_t *key_id,
+                                         const uint8_t *assertion,
+                                         size_t len,
+                                         uint8_t *out,
+                                         size_t cap,
+                                         size_t *out_len);
+
 // Generate a fresh key from the OS random number generator.
 //
 // # Safety
@@ -211,6 +276,21 @@ enum FppStatus fpp_signer_generate(struct FppSigner **out);
 // # Safety
 // `seed` valid for 32 bytes; `out` valid for a pointer write.
 enum FppStatus fpp_signer_from_seed(const uint8_t *seed, struct FppSigner **out);
+
+// A key held outside the SDK: its 32-byte Ed25519 public key and a callback
+// that signs with it (an Android 13+ Keystore Ed25519 key, attested in the
+// TEE, is then the session key itself: tier D2, docs 10 §4). Every signature
+// the callback returns is verified; one that fails, or a non-zero return,
+// makes the signing call return `FPP_STATUS_SIGNER_FAILED` and emit nothing.
+// `ctx` is passed back to the callback unchanged and must outlive the handle.
+//
+// # Safety
+// `public_key` valid for 32 bytes; `callback` safe to call as documented at
+// `FppSignCallback`; `out` valid for a pointer write.
+enum FppStatus fpp_signer_external(const uint8_t *public_key,
+                                   FppSignCallback callback,
+                                   void *ctx,
+                                   struct FppSigner **out);
 
 // # Safety
 // `signer` NULL or a live handle; not used afterwards.

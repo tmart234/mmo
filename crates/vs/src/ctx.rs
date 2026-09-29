@@ -15,6 +15,8 @@ pub struct VsCtx {
     pub keys: Arc<ServiceKeys>,
     pub sessions: Arc<DashMap<[u8; 16], Session>>,
     pub config: VsConfig,
+    /// Client evidence policy and App Attest keys (P3).
+    pub attestation: Arc<crate::appraisal::ClientAttestation>,
 }
 
 /// One admitted game server instance; its session id is also the id of the
@@ -52,6 +54,7 @@ impl VsCtx {
             keys,
             sessions: Arc::new(DashMap::new()),
             config,
+            attestation: Arc::new(crate::appraisal::ClientAttestation::default()),
         }
     }
 

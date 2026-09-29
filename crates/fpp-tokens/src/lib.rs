@@ -15,6 +15,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod evidence;
 use ed25519_dalek::VerifyingKey;
 use fpp_crypto::{cose_key_ed25519, KeyResolver, VerifyError};
 use fpp_types::{
@@ -267,11 +268,14 @@ pub struct Features {
     pub key_in_hw: Option<bool>,
     pub strong_integrity: Option<bool>,
     pub app_attested: Option<bool>,
+    /// The attested key is in a discrete secure element (Android StrongBox),
+    /// not only a TEE.
+    pub strongbox: Option<bool>,
     pub os_patch_age_days: Option<u64>,
 }
 
 impl Features {
-    fn flags(&self) -> [(&'static str, Option<bool>); 9] {
+    fn flags(&self) -> [(&'static str, Option<bool>); 10] {
         [
             ("secure_boot", self.secure_boot),
             ("measured_boot", self.measured_boot),
@@ -282,6 +286,7 @@ impl Features {
             ("key_in_hw", self.key_in_hw),
             ("strong_integrity", self.strong_integrity),
             ("app_attested", self.app_attested),
+            ("strongbox", self.strongbox),
         ]
     }
 
@@ -317,6 +322,7 @@ impl Features {
                 "key_in_hw" => &mut f.key_in_hw,
                 "strong_integrity" => &mut f.strong_integrity,
                 "app_attested" => &mut f.app_attested,
+                "strongbox" => &mut f.strongbox,
                 "os_patch_age_days" => {
                     f.os_patch_age_days =
                         Some(val.as_u64().ok_or(schema(WHAT, "os_patch_age_days"))?);

@@ -17,13 +17,15 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use fpp_crypto::{self as crypto, Ed25519Signer, KeyRole, KeySet, VerifyError};
+use fpp_tokens::evidence::{attest_challenge, Evidence, MAX_CHAIN, MAX_EVIDENCE};
 use fpp_types::{BuildId, Digest, GsInstanceId, MatchId};
 use fpp_wire::msg::frame_leaf_data;
 use fpp_wire::{Checkpoint, InputCommit, InputLeaf};
 use sha2::{Digest as _, Sha256};
-use std::ffi::{c_char, c_int};
+use std::cell::Cell;
+use std::ffi::{c_char, c_int, c_void};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 mod p2p;
@@ -52,6 +54,9 @@ pub enum FppStatus {
     Algorithm = 16,
     Signature = 17,
     Schema = 18,
+    /// An external signer's callback failed, or returned a signature that
+    /// does not verify under its public key (`fpp_signer_external`).
+    SignerFailed = 19,
     /// P2P sessions (`fpp_p2p_*`): why a datagram was dropped or a call
     /// refused. Drop the datagram and carry on; none of these is fatal.
     /// Not a packet of this protocol, or too large.
@@ -237,6 +242,7 @@ pub extern "C" fn fpp_status_str(status: c_int) -> *const c_char {
         16 => b"alg: algorithm does not match key\0",
         17 => b"signature: verification failed\0",
         18 => b"schema: payload fields invalid\0",
+        19 => b"signer: the external key did not sign\0",
         30 => b"p2p: malformed or oversized packet\0",
         31 => b"p2p: unknown session\0",
         32 => b"p2p: replayed or too old\0",
@@ -286,11 +292,224 @@ pub unsafe extern "C" fn fpp_object_digest(
     })
 }
 
+// ------------------------------------------------------------------ platform evidence
+
+/// The challenge a device binds its platform evidence to (roadmap P3):
+/// `SHA-256("fpp/1/attest-challenge" || 0x00 || vs_challenge || session_pub)`.
+/// Pass it to Android `KeyGenParameterSpec.Builder.setAttestationChallenge`
+/// or as the App Attest `clientDataHash`. Evidence made for another admission
+/// challenge or another session key does not verify.
+///
+/// # Safety
+/// `vs_challenge`, `session_pub` and `out` valid for 32 bytes each.
+#[no_mangle]
+pub unsafe extern "C" fn fpp_attest_challenge(
+    vs_challenge: *const u8,
+    session_pub: *const u8,
+    out: *mut u8,
+) -> FppStatus {
+    guard(|| {
+        let challenge = unsafe { fixed::<32>(vs_challenge) }?;
+        let session = unsafe { fixed::<32>(session_pub) }?;
+        unsafe { write_fixed(out, &attest_challenge(&challenge, &session)) }
+    })
+}
+
+fn write_evidence(evidence: Evidence, out: *mut u8, cap: usize, out_len: *mut usize) -> Res {
+    let bytes = evidence.encode();
+    if bytes.len() > MAX_EVIDENCE {
+        return Err(FppStatus::InvalidArgument);
+    }
+    // SAFETY: forwarded caller contract.
+    unsafe { write_object(&bytes, out, cap, out_len) }
+}
+
+/// The evidence envelope for an Android Keystore key attestation: the
+/// attested key's certificate chain, leaf first
+/// (`KeyStore.getCertificateChain`, each `Certificate.getEncoded()`), for
+/// `ClientAdmissionRequest.evidence`.
+///
+/// # Safety
+/// `certs` and `lens` valid for `count` entries; each `certs[i]` valid for
+/// `lens[i]` bytes. `out_len` valid for a write; `out` NULL or valid for `cap`.
+#[no_mangle]
+pub unsafe extern "C" fn fpp_evidence_android_key(
+    certs: *const *const u8,
+    lens: *const usize,
+    count: usize,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> FppStatus {
+    guard(|| {
+        if count == 0 || count > MAX_CHAIN {
+            return Err(FppStatus::InvalidArgument);
+        }
+        if certs.is_null() || lens.is_null() {
+            return Err(FppStatus::NullPointer);
+        }
+        let mut chain = Vec::with_capacity(count);
+        for i in 0..count {
+            // SAFETY: both arrays are valid for `count` entries.
+            let (ptr, len) = unsafe { (*certs.add(i), *lens.add(i)) };
+            if len == 0 {
+                return Err(FppStatus::InvalidArgument);
+            }
+            chain.push(unsafe { input(ptr, len) }?.to_vec());
+        }
+        write_evidence(Evidence::AndroidKey { chain }, out, cap, out_len)
+    })
+}
+
+/// The evidence envelope for an Apple App Attest attestation object (from
+/// `DCAppAttestService.attestKey`, made with `fpp_attest_challenge` as the
+/// client data hash). Send it once per app key; later admissions send
+/// assertions (`fpp_evidence_apple_assert`).
+///
+/// # Safety
+/// `attestation` valid for `len` bytes; `out_len` valid for a write; `out`
+/// NULL or valid for `cap` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn fpp_evidence_apple_attest(
+    attestation: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> FppStatus {
+    guard(|| {
+        let attestation = unsafe { input(attestation, len) }?.to_vec();
+        if attestation.is_empty() {
+            return Err(FppStatus::InvalidArgument);
+        }
+        write_evidence(Evidence::AppleAppAttest { attestation }, out, cap, out_len)
+    })
+}
+
+/// The evidence envelope for an Apple App Attest assertion (from
+/// `DCAppAttestService.generateAssertion`, with `fpp_attest_challenge` as the
+/// client data hash) by the attested key `key_id` (32 bytes, base64-decoded).
+///
+/// # Safety
+/// `key_id` valid for 32 bytes; `assertion` valid for `len` bytes; `out_len`
+/// valid for a write; `out` NULL or valid for `cap` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn fpp_evidence_apple_assert(
+    key_id: *const u8,
+    assertion: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> FppStatus {
+    guard(|| {
+        let key_id = unsafe { fixed::<32>(key_id) }?.to_vec();
+        let assertion = unsafe { input(assertion, len) }?.to_vec();
+        if assertion.is_empty() {
+            return Err(FppStatus::InvalidArgument);
+        }
+        write_evidence(
+            Evidence::AppleAppAssert { key_id, assertion },
+            out,
+            cap,
+            out_len,
+        )
+    })
+}
+
 // ------------------------------------------------------------------ keys
 
-/// An Ed25519 signing key (a player's session key or a host's instance key).
+/// An Ed25519 signing key (a player's session key or a host's instance key),
+/// held here or outside the SDK (`fpp_signer_external`).
 pub struct FppSigner {
-    inner: Ed25519Signer,
+    inner: Key,
+}
+
+/// Signs `len` bytes at `msg` with an Ed25519 key held outside the SDK (an
+/// Android Keystore key, a TPM), writing the 64-byte signature to `sig_out`.
+/// Returns 0 on success. Called synchronously on the thread that called the
+/// SDK function; it may block (secure hardware can take tens of ms).
+pub type FppSignCallback = Option<
+    unsafe extern "C" fn(ctx: *mut c_void, msg: *const u8, len: usize, sig_out: *mut u8) -> c_int,
+>;
+
+/// A key held outside the SDK: the SDK checks every signature it returns.
+struct ExternalSigner {
+    public: VerifyingKey,
+    kid: fpp_types::Kid,
+    callback: unsafe extern "C" fn(*mut c_void, *const u8, usize, *mut u8) -> c_int,
+    ctx: *mut c_void,
+    /// Set when a signature could not be made; read by `Key::check`.
+    failed: Cell<bool>,
+}
+
+enum Key {
+    Local(Ed25519Signer),
+    External(ExternalSigner),
+}
+
+impl Key {
+    fn verifying_key(&self) -> VerifyingKey {
+        match self {
+            Key::Local(s) => s.verifying_key(),
+            Key::External(e) => e.public,
+        }
+    }
+
+    /// After signing: whether every signature was made. An external key that
+    /// failed produced a placeholder the caller must not emit.
+    fn check(&self) -> Res {
+        match self {
+            Key::External(e) if e.failed.replace(false) => Err(FppStatus::SignerFailed),
+            _ => Ok(()),
+        }
+    }
+}
+
+impl crypto::Signer for Key {
+    fn alg(&self) -> i64 {
+        fpp_wire::cose::alg::EDDSA
+    }
+
+    fn kid(&self) -> fpp_types::Kid {
+        match self {
+            Key::Local(s) => s.kid(),
+            Key::External(e) => e.kid,
+        }
+    }
+
+    fn sign(&self, to_be_signed: &[u8]) -> Vec<u8> {
+        match self {
+            Key::Local(s) => s.sign(to_be_signed),
+            Key::External(e) => {
+                let mut sig = [0u8; 64];
+                // SAFETY: the caller of fpp_signer_external promised a callback
+                // that reads `len` bytes at `msg` and writes 64 at `sig_out`.
+                let rc = unsafe {
+                    (e.callback)(
+                        e.ctx,
+                        to_be_signed.as_ptr(),
+                        to_be_signed.len(),
+                        sig.as_mut_ptr(),
+                    )
+                };
+                let valid = rc == 0
+                    && e.public
+                        .verify_strict(to_be_signed, &ed25519_dalek::Signature::from_bytes(&sig))
+                        .is_ok();
+                if !valid {
+                    e.failed.set(true);
+                }
+                sig.to_vec()
+            }
+        }
+    }
+}
+
+impl crypto::Ed25519Key for Key {
+    fn public_key(&self) -> [u8; 32] {
+        self.verifying_key().to_bytes()
+    }
 }
 
 /// Generate a fresh key from the OS random number generator.
@@ -305,7 +524,7 @@ pub unsafe extern "C" fn fpp_signer_generate(out: *mut *mut FppSigner) -> FppSta
             emit(
                 out,
                 FppSigner {
-                    inner: Ed25519Signer::new(sk),
+                    inner: Key::Local(Ed25519Signer::new(sk)),
                 },
             )
         }
@@ -325,7 +544,53 @@ pub unsafe extern "C" fn fpp_signer_from_seed(
     guard(|| {
         let seed: [u8; 32] = unsafe { fixed(seed) }?;
         let signer = Ed25519Signer::new(SigningKey::from_bytes(&seed));
-        unsafe { emit(out, FppSigner { inner: signer }) }
+        unsafe {
+            emit(
+                out,
+                FppSigner {
+                    inner: Key::Local(signer),
+                },
+            )
+        }
+    })
+}
+
+/// A key held outside the SDK: its 32-byte Ed25519 public key and a callback
+/// that signs with it (an Android 13+ Keystore Ed25519 key, attested in the
+/// TEE, is then the session key itself: tier D2, docs 10 §4). Every signature
+/// the callback returns is verified; one that fails, or a non-zero return,
+/// makes the signing call return `FPP_STATUS_SIGNER_FAILED` and emit nothing.
+/// `ctx` is passed back to the callback unchanged and must outlive the handle.
+///
+/// # Safety
+/// `public_key` valid for 32 bytes; `callback` safe to call as documented at
+/// `FppSignCallback`; `out` valid for a pointer write.
+#[no_mangle]
+pub unsafe extern "C" fn fpp_signer_external(
+    public_key: *const u8,
+    callback: FppSignCallback,
+    ctx: *mut c_void,
+    out: *mut *mut FppSigner,
+) -> FppStatus {
+    guard(|| {
+        let public = VerifyingKey::from_bytes(&unsafe { fixed::<32>(public_key) }?)
+            .map_err(|_| FppStatus::InvalidArgument)?;
+        let callback = callback.ok_or(FppStatus::NullPointer)?;
+        let signer = ExternalSigner {
+            kid: crypto::kid(&public),
+            public,
+            callback,
+            ctx,
+            failed: Cell::new(false),
+        };
+        unsafe {
+            emit(
+                out,
+                FppSigner {
+                    inner: Key::External(signer),
+                },
+            )
+        }
     })
 }
 
@@ -488,6 +753,7 @@ pub unsafe extern "C" fn fpp_input_commit_sign(
         let b = unsafe { handle(builder) }?;
         let key = unsafe { handle(session_key) }?;
         let signed = crypto::sign(&key.inner, &b.finish());
+        key.inner.check()?;
         unsafe { write_object(&signed, out, cap, out_len) }
     })
 }
@@ -704,6 +970,7 @@ pub unsafe extern "C" fn fpp_checkpoint_sign(
         cp.roster_root = fpp_merkle::root(&b.roster);
         cp.roster_n = b.roster.len() as u32;
         let signed = crypto::sign(&key.inner, &cp);
+        key.inner.check()?;
         unsafe { write_object(&signed, out, cap, out_len) }
     })
 }

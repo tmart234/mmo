@@ -75,8 +75,8 @@ crates/
   attest-core/        # RATS appraisal engine, policy evaluation, tier computation
   attest-tpm/         # TPM2 quote + TCG log replay + EK chain (Verifier side)
   attest-windows/     # runtime attestation report, VBS enclave report parsing
-  attest-android/     # Play Integrity + key attestation chain
-  attest-apple/       # App Attest
+  attest-android/     # Play Integrity + key attestation chain (key attestation ✅)
+  attest-apple/       # App Attest (✅)
   attest-cvm/         # SEV-SNP / TDX reports
   gs-authority/       # tick loop, jitter buffer, validators trait, interest mgmt, lag-comp bounds
   gs-checkpoint/      # epoch accumulators, VRF, checkpoint signing, host batching
@@ -175,6 +175,13 @@ Verifier appraisal for TPM 2.0 (EK chain, credential activation, TCG log
 replay), Windows runtime attestation reports, Android (Play Integrity + key
 attestation), Apple (App Attest). Build Registry with SLSA provenance.
 Device ID (DID) and tiers. IA core with platform adapters and the C ABI.
+**Mobile slice ◐ done** ([10](10-attestation-and-secure-boot.md)):
+`attest-core`, `attest-android` (key attestation to Google's roots,
+revocation list, verified boot, app identity) and `attest-apple` (App Attest
+attestations and assertions), wired into the VS; evidence bound to the VS
+challenge and the session key; C SDK `fpp_attest_challenge` and
+`fpp_evidence_*`; reference Kotlin and Swift adapters. Next: external
+signers, P-256 session keys, Play Integrity, `attest-tpm`.
 **Exit:** red-team tests: replayed quote rejected; software TPM rejected;
 test-signing/HVCI-off machine lands in the correct tier; tier drives
 matchmaking in a staging queue.

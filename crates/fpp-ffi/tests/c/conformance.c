@@ -14,6 +14,15 @@
 
 static int failures = 0;
 
+/* An external signer whose hardware always fails (fpp_signer_external). */
+static int refusing_signer(void *ctx, const uint8_t *msg, size_t len, uint8_t *sig) {
+    (void)ctx;
+    (void)msg;
+    (void)len;
+    (void)sig;
+    return -1;
+}
+
 #define CHECK(cond)                                                        \
     do {                                                                   \
         if (!(cond)) {                                                     \
@@ -222,6 +231,47 @@ int main(void) {
         CHECK_STATUS(fpp_verify_input_commit(obj, len, pub, NULL), FPP_STATUS_OK);
         fpp_input_commit_free(b);
         fpp_signer_free(fresh);
+    }
+
+    /* Platform evidence (P3): the challenge, checked against an independent
+       SHA-256 of "fpp/1/attest-challenge" || 0x00 || 01*32 || 02*32 (Python
+       hashlib), and the envelopes' size protocol. */
+    {
+        static const uint8_t want[32] = {
+            0x22, 0x23, 0xb7, 0x60, 0x37, 0x27, 0xd8, 0xc6, 0xc6, 0xcf, 0x3c, 0x4f, 0xe9, 0x44, 0x33, 0xed,
+            0xa2, 0x1f, 0xa3, 0x0d, 0xef, 0xce, 0x05, 0xd4, 0x43, 0x27, 0x7f, 0xdc, 0xa7, 0x43, 0xf9, 0x31};
+        uint8_t ones[32], twos[32], got[32], env[256];
+        const uint8_t leaf[3] = {0x30, 0x01, 0x00}, inter[2] = {0x30, 0x00};
+        const uint8_t *certs[2] = {leaf, inter};
+        const size_t lens[2] = {sizeof leaf, sizeof inter};
+        size_t need = 0, len = 0;
+        memset(ones, 1, 32);
+        memset(twos, 2, 32);
+        CHECK_STATUS(fpp_attest_challenge(ones, twos, got), FPP_STATUS_OK);
+        CHECK(memcmp(got, want, 32) == 0);
+        CHECK_STATUS(fpp_attest_challenge(NULL, twos, got), FPP_STATUS_NULL_POINTER);
+        CHECK_STATUS(fpp_evidence_android_key(certs, lens, 2, NULL, 0, &need), FPP_STATUS_BUFFER_TOO_SMALL);
+        CHECK(need > 0 && need <= sizeof env);
+        CHECK_STATUS(fpp_evidence_android_key(certs, lens, 2, env, sizeof env, &len), FPP_STATUS_OK);
+        CHECK(len == need);
+        CHECK_STATUS(fpp_evidence_android_key(certs, lens, 0, env, sizeof env, &len), FPP_STATUS_INVALID_ARGUMENT);
+        CHECK_STATUS(fpp_evidence_apple_attest(leaf, sizeof leaf, env, sizeof env, &len), FPP_STATUS_OK);
+        CHECK_STATUS(fpp_evidence_apple_assert(twos, leaf, sizeof leaf, env, sizeof env, &len), FPP_STATUS_OK);
+        CHECK_STATUS(fpp_evidence_apple_assert(twos, leaf, 0, env, sizeof env, &len), FPP_STATUS_INVALID_ARGUMENT);
+    }
+
+    /* External signers (P3): a callback that fails yields SIGNER_FAILED and
+       no object, not an invalid one. */
+    {
+        FppSigner *ext = NULL;
+        FppInputCommitBuilder *b = commit_builder(0, 0, NULL);
+        uint8_t out[MAX_OBJECT];
+        size_t len = 0;
+        CHECK_STATUS(fpp_signer_external(session_pub, refusing_signer, NULL, &ext), FPP_STATUS_OK);
+        CHECK_STATUS(fpp_input_commit_sign(b, ext, out, sizeof out, &len), FPP_STATUS_SIGNER_FAILED);
+        CHECK_STATUS(fpp_signer_external(session_pub, NULL, NULL, &ext), FPP_STATUS_NULL_POINTER);
+        fpp_input_commit_free(b);
+        fpp_signer_free(ext);
     }
 
     fpp_signer_free(session0);

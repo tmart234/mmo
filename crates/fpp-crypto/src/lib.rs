@@ -100,6 +100,12 @@ pub trait Signer {
     fn sign(&self, to_be_signed: &[u8]) -> Vec<u8>;
 }
 
+/// An Ed25519 signing key whose private half may live outside this process
+/// (an Android Keystore key, a TPM): the session and instance keys of FPP.
+pub trait Ed25519Key: Signer {
+    fn public_key(&self) -> [u8; 32];
+}
+
 /// Ed25519 signer (suite FPP-S1). Keys held in hardware implement `Signer` too.
 pub struct Ed25519Signer {
     sk: SigningKey,
@@ -131,8 +137,14 @@ impl Signer for Ed25519Signer {
     }
 }
 
+impl Ed25519Key for Ed25519Signer {
+    fn public_key(&self) -> [u8; 32] {
+        self.sk.verifying_key().to_bytes()
+    }
+}
+
 /// Sign a payload under its own context and content type.
-pub fn sign<P: Payload>(signer: &impl Signer, payload: &P) -> Vec<u8> {
+pub fn sign<P: Payload>(signer: &(impl Signer + ?Sized), payload: &P) -> Vec<u8> {
     sign_raw(signer, P::CTX, P::CONTENT_TYPE, payload.to_cbor())
 }
 
@@ -140,7 +152,7 @@ pub fn sign<P: Payload>(signer: &impl Signer, payload: &P) -> Vec<u8> {
 /// deterministic encoding, role and schema; this exists for producing
 /// interop vectors, including negative ones.
 pub fn sign_raw(
-    signer: &impl Signer,
+    signer: &(impl Signer + ?Sized),
     context: &str,
     content_type: &str,
     payload: Vec<u8>,
