@@ -89,6 +89,12 @@ pub async fn send_msg_continue<T: Serialize>(s: &mut SendStream, msg: &T) -> Res
 /// Checkpoints with TPM quotes) is far smaller than this.
 pub const MAX_CONTROL_FRAME: usize = 64 * 1024;
 
+/// A game server's JoinRequest with TPM 2.0 evidence carries the kernel's
+/// IMA log, which grows with every program the machine has run. (Read
+/// before the GS is authenticated, like every JoinRequest: one per
+/// address-validated connection, within the admission deadline.)
+pub const MAX_JOIN_FRAME: usize = 8 * 1024 * 1024;
+
 /// Validate a frame's 4-byte little-endian length prefix against `max`,
 /// before anything is allocated for the body.
 pub fn frame_len(prefix: [u8; 4], max: usize) -> Result<usize> {

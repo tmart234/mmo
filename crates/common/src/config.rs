@@ -5,6 +5,9 @@
 
 use std::time::Duration;
 
+/// Where a game server's binary is installed by default (`deploy/`).
+pub const DEFAULT_GS_PROGRAM_PATH: &str = "/opt/fpp/gs-sim";
+
 /// Network robustness configuration for VS (Validation Server).
 #[derive(Debug, Clone)]
 pub struct VsConfig {
@@ -44,6 +47,23 @@ pub struct VsConfig {
 
     /// Reject a JoinRequest that carries no TPM quote (default: false).
     pub require_tpm_quote: bool,
+
+    /// TPM manufacturers' root certificates (DER): a game server's TPM 2.0
+    /// evidence counts only with an EK certificate chaining to one.
+    pub tpm_ek_roots: Vec<Vec<u8>>,
+
+    /// Build Registry: SHA-256 of the GS builds CI made (with signed
+    /// provenance), and a label for each. Non-empty: a game server is
+    /// admitted only with TPM 2.0 evidence whose IMA log shows the kernel
+    /// ran one of these at `gs_program_path` (F06).
+    pub build_registry: Vec<([u8; 32], String)>,
+
+    /// Where the GS binary is installed, as the kernel names it in its IMA
+    /// log.
+    pub gs_program_path: String,
+
+    /// Require the measured-boot log to show Secure Boot on.
+    pub require_secure_boot: bool,
 }
 
 impl Default for VsConfig {
@@ -56,6 +76,10 @@ impl Default for VsConfig {
             required_pcr_baselines: std::collections::BTreeMap::new(),
             trusted_ak_keys: Vec::new(),
             require_tpm_quote: false,
+            tpm_ek_roots: Vec::new(),
+            build_registry: Vec::new(),
+            gs_program_path: DEFAULT_GS_PROGRAM_PATH.to_string(),
+            require_secure_boot: false,
         }
     }
 }

@@ -31,3 +31,6 @@ da_log/
 
 # Python bytecode (interop checkers)
 __pycache__/
+
+# Checkpoint evidence the VS stores during local runs and the smoke test
+/evidence/

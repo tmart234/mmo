@@ -140,11 +140,17 @@ quirks.
      registered build when another ran) fail. A fuzz target covers every
      parser.
 
-   Next: the VS's GS admission uses it (enrollment by credential
-   activation, quotes with boot and IMA logs, `--build-registry`), the GS's
-   `hardware-tpm` provider gathers the evidence, and CI publishes the
-   registry with signed build provenance. `dbx` currency is not appraised
-   yet.
+   ✅ Wired in: the VS admits a GS with a real TPM (`vs --tpm-ek-roots
+   --build-registry --gs-program --require-secure-boot`); the GS gathers the
+   evidence with tpm2-tools (`gs-sim --tpm2`), and credential activation
+   runs at every join, before `JoinAccept`. CI builds the GS with signed
+   SLSA provenance and publishes each build's registry line
+   (`.github/workflows/gs-release.yml`). An end-to-end test joins a GS on
+   swtpm over QUIC and refuses: a GS claiming another build, a GS with no
+   TPM evidence, a guessed credential, an unregistered build, a TPM from an
+   untrusted manufacturer, and a modified GS that really ran. Operator
+   steps: `TPM_GUIDE.md`. Open: TPM 2.0 re-attestation during a session,
+   and `dbx` currency.
 5. **Persistent App Attest keys** in the VS (today in memory: a restarted VS
    asks each app to attest a new key).
 

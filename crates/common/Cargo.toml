@@ -27,9 +27,6 @@ serde_json       = { workspace = true }
 
 fpp-crypto       = { path = "../fpp-crypto" }
 
-# TPM 2.0 support (optional, for hardware attestation)
-tss-esapi        = { version = "7.4", optional = true }
 
 [features]
 default = []
-hardware-tpm = ["tss-esapi"]
