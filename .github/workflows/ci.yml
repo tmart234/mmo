@@ -42,10 +42,16 @@ jobs:
           restore-keys: |
             cargo-${{ runner.os }}-
 
+      # A real TPM 2.0 for attest-tpm's tests (tests/swtpm.rs): swtpm, the
+      # reference implementation, with tpm2-tools
+      - name: swtpm and tpm2-tools
+        run: sudo apt-get update -q && sudo apt-get install -y -q swtpm swtpm-tools tpm2-tools
+
       - name: Run CI-lite (fmt, clippy, build, test, smoke)
         run: make ci
         env:
           STRICT_SMOKE: "1"
+          FPP_REQUIRE_SWTPM: "1"
 
       # The Halo: CE port (first reference title) is 32-bit x86: keep the C SDK
       # building and conforming for that ABI.
@@ -86,6 +92,6 @@ jobs:
           PY
       - name: Fuzz (60 s per target)
         run: |
-          for target in wire_decode verify_untrusted fpp_decode p2p_recv; do
+          for target in wire_decode verify_untrusted fpp_decode p2p_recv tpm_evidence; do
             cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$target" -- -max_total_time=60 -rss_limit_mb=2048
           done
