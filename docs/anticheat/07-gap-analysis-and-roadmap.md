@@ -169,6 +169,21 @@ infrastructure-as-code deployment.
 **Exit:** revocation→kick ≤ 5 s p99 in a load test; the Log produces
 inclusion/consistency proofs; the SAR lapse test disconnects clients of a
 rogue GS that ignores revocation.
+**Transparency Log ✅ (P2.1):** `fpp-log` is an RFC 9162 log stored as C2SP
+`tlog-tiles`, with `tlog-checkpoint` signed notes, witness cosignatures
+(`cosignature/v1`), hybrid-signed `LogReceipt`s and inclusion/consistency
+proofs. Suite FPP-S1H (Ed25519 + ML-DSA-65 `COSE_Sign`, `fpp-crypto`
+feature `s1h`) is implemented for it: the Log key is hybrid, as §4
+requires. `svc-log` and `svc-witness` run as separate processes with their
+own keys; `fpp-svc` gives every service a cell identity, mutual TLS over
+QUIC and per-request caller authorization (only configured writers append,
+only witnesses cosign). The witness refuses rollbacks and split views and
+remembers across restarts. Go's `golang.org/x/mod/sumdb` independently
+verifies the checkpoint, every tile, every entry and inclusion proofs
+(`interop/go/tlog`, in CI).
+**Next (P2.2–P2.4):** Revocation Feed (Enforcement key, `RevocationEvent`,
+log entries, subscribers), Evidence Store, then the VS split into Verifier,
+Broker and Server Liveness processes, and a regional cell deployment.
 
 ### P3 — Real attestation (8–12 weeks, parallelizable per platform)
 Verifier appraisal for TPM 2.0 (EK chain, credential activation, TCG log
