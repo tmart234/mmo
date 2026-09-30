@@ -2879,6 +2879,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
 
 [[package]]
+name = "fpp-audit"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "fpp-crypto",
+ "fpp-merkle",
+ "fpp-types",
+ "fpp-wire",
+ "rand 0.8.8",
+]
+
+[[package]]
 name = "fpp-crypto"
 version = "0.1.0"
 dependencies = [

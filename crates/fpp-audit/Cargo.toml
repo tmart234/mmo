@@ -1,0 +1,21 @@
+[package]
+name = "fpp-audit"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Fair-Play Protocol v1: audits a player-hosted match's evidence bundles (milestone M4, accounting audit)"
+
+[[bin]]
+name = "fpp-audit"
+path = "src/main.rs"
+
+[dependencies]
+fpp-types = { path = "../fpp-types" }
+fpp-wire = { path = "../fpp-wire" }
+fpp-crypto = { path = "../fpp-crypto" }
+fpp-merkle = { path = "../fpp-merkle" }
+ed25519-dalek = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
