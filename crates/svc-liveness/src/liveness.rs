@@ -3,7 +3,7 @@
 //! and its clients lapse within a few intervals.
 
 use common::framing::send_msg;
-use common::proto::SarIssue;
+use common::proto::ToGameServer;
 use fpp_tokens::{instance_id, sar_link, ServerAttestationResult};
 use fpp_types::{BuildId, Digest, ServerClass};
 use quinn::Connection;
@@ -15,6 +15,8 @@ use crate::ctx::Ctx;
 pub const SAR_INTERVAL: Duration = Duration::from_secs(2);
 pub const SAR_LIFETIME_S: u64 = 10;
 pub const LIVENESS_ISS: &str = "live.dev";
+/// The region this cell serves (SAR `region`; revocation scopes name it).
+pub const REGION: &str = "dev";
 
 pub fn now_s() -> u64 {
     common::crypto::now_ms() / 1000
@@ -40,7 +42,7 @@ pub fn issue(
         noise_static: Some(*noise_static),
         server_class: ServerClass::FirstParty,
         build_id: BuildId(*sw_hash),
-        region: "dev".into(),
+        region: REGION.into(),
         seq,
         prev,
         vrf_pub: None,
@@ -73,7 +75,7 @@ pub fn spawn_sar_loop(conn: &Connection, ctx: Ctx, session_id: [u8; 16]) {
             prev = sar_link(&sar).expect("own SAR decodes");
             let sent = async {
                 let mut uni = conn.open_uni().await?;
-                send_msg(&mut uni, &SarIssue { sar }).await
+                send_msg(&mut uni, &ToGameServer::Sar(sar)).await
             };
             if let Err(e) = sent.await {
                 eprintln!("[liveness] send SAR failed: {e:#}");

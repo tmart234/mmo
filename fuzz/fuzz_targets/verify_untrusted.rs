@@ -13,8 +13,15 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let mut keys = KeySet::default();
-    for (seed, role) in [(0x11, KeyRole::VerifierAr), (0x12, KeyRole::BrokerSat), (0x13, KeyRole::ServerLiveness)] {
-        keys.insert_ed25519(role, Ed25519Signer::new(SigningKey::from_bytes(&[seed; 32])).verifying_key());
+    for (seed, role) in [
+        (0x11, KeyRole::VerifierAr),
+        (0x12, KeyRole::BrokerSat),
+        (0x13, KeyRole::ServerLiveness),
+    ] {
+        keys.insert_ed25519(
+            role,
+            Ed25519Signer::new(SigningKey::from_bytes(&[seed; 32])).verifying_key(),
+        );
     }
     let now = 1_790_000_000;
     match selector % 2 {
@@ -33,7 +40,15 @@ fuzz_target!(|data: &[u8]| {
                 matches: vec![MatchId([0; 16])],
                 min_tier: DeviceTier::D0Unknown,
             };
-            let _ = admit(&body[..mid], &body[mid..], &[0; 32], &keys, &policy, &Revocations::default(), now);
+            let _ = admit(
+                &body[..mid],
+                &body[mid..],
+                &[0; 32],
+                &keys,
+                &policy,
+                &Revocations::default(),
+                now,
+            );
         }
     }
 });

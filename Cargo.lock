@@ -2938,6 +2938,8 @@ dependencies = [
  "anyhow",
  "common",
  "ed25519-dalek",
+ "fpp-crypto",
+ "fpp-wire",
  "hex",
  "quinn",
  "rand 0.8.8",
@@ -5387,6 +5389,7 @@ dependencies = [
  "fpp-svc",
  "fpp-tokens",
  "fpp-types",
+ "fpp-wire",
  "hex",
  "quinn",
  "rand 0.8.8",
@@ -5434,6 +5437,26 @@ dependencies = [
  "fpp-types",
  "fpp-wire",
  "serde",
+ "tokio",
+]
+
+[[package]]
+name = "svc-revocation"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ed25519-dalek",
+ "fpp-crypto",
+ "fpp-log",
+ "fpp-svc",
+ "fpp-types",
+ "fpp-wire",
+ "hex",
+ "rand 0.8.8",
+ "serde_json",
+ "sha2",
+ "svc-log",
  "tokio",
 ]
 
@@ -5770,9 +5793,17 @@ name = "tools"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "client-core",
  "common",
  "ctrlc",
+ "ed25519-dalek",
+ "fpp-crypto",
  "fpp-svc",
+ "fpp-types",
+ "fpp-wire",
+ "sha2",
+ "svc-revocation",
+ "tokio",
 ]
 
 [[package]]

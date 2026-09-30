@@ -8,8 +8,8 @@ use common::{
     framing::{recv_msg, send_msg, send_msg_continue},
     keys::KeyBundle,
     proto::{
-        CheckpointSubmit, CredentialChallenge, CredentialResponse, JoinAccept, JoinRequest,
-        SarIssue, Sig,
+        CheckpointSubmit, CredentialChallenge, CredentialResponse, JoinAccept, JoinRequest, Sig,
+        ToGameServer,
     },
     tpm::join_quote_nonce,
 };
@@ -81,6 +81,12 @@ struct Opts {
     /// Key bundle: Verifier, Broker and Server Liveness keys.
     #[arg(long, default_value = common::keys::DEFAULT_BUNDLE)]
     bundle: String,
+
+    /// Test only: a rogue game server that ignores revocation events and
+    /// keeps serving when its SARs stop. Its players still drop, on their
+    /// own, once its SAR chain goes stale.
+    #[arg(long, hide = true)]
+    ignore_revocations: bool,
 
     /// CA certificate (DER) Server Liveness's TLS certificate must chain to.
     #[arg(long, default_value = common::pki::DEFAULT_CA_CERT)]
@@ -189,26 +195,43 @@ async fn main() -> Result<()> {
     let session_id = ja.session_id;
     println!("[GS] joined; match {}..", hex::encode(&session_id[..4]));
 
-    // ---- SAR chain from Server Liveness: verified, and must certify our own keys.
+    // ---- From Server Liveness: the SAR chain (verified, and it must certify
+    //      our own keys) and revocation events (verified under the
+    //      Enforcement key in our bundle).
     let (sar_tx, sar_rx) = watch::channel::<Option<Vec<u8>>>(None);
+    let (rev_tx, rev_rx) = mpsc::unbounded_channel::<fpp_wire::RevocationEvent>();
     {
         let conn = conn.clone();
         let keyset = keyset.clone();
+        let ignore_revocations = opts.ignore_revocations;
         tokio::spawn(async move {
             let mut chain: Option<SarChain> = None;
             loop {
                 let Ok(mut uni) = conn.accept_uni().await else {
                     break;
                 };
-                let Ok(issue) = recv_msg::<SarIssue>(&mut uni).await else {
+                let Ok(msg) = recv_msg::<ToGameServer>(&mut uni).await else {
                     continue;
+                };
+                let sar = match msg {
+                    ToGameServer::Sar(sar) => sar,
+                    ToGameServer::Revocation(signed) => {
+                        match fpp_crypto::verify::<fpp_wire::RevocationEvent>(&signed, &keyset) {
+                            Ok(v) if !ignore_revocations => {
+                                let _ = rev_tx.send(v.payload);
+                            }
+                            Ok(_) => eprintln!("[GS] (rogue) ignoring a revocation event"),
+                            Err(e) => eprintln!("[GS] revocation event refused: {e}"),
+                        }
+                        continue;
+                    }
                 };
                 let now = now_ms() / 1000;
                 let verified = match chain.as_mut() {
-                    None => SarChain::start(&issue.sar, &keyset, now).map(|c| {
+                    None => SarChain::start(&sar, &keyset, now).map(|c| {
                         chain = Some(c);
                     }),
-                    Some(c) => c.update(&issue.sar, &keyset, now),
+                    Some(c) => c.update(&sar, &keyset, now),
                 };
                 let ours = chain.as_ref().is_some_and(|c| {
                     c.current().cnf == instance_pub
@@ -221,11 +244,15 @@ async fn main() -> Result<()> {
                     eprintln!("[GS] rejected SAR: {e}; stopping");
                     break;
                 }
-                if sar_tx.send(Some(issue.sar)).is_err() {
+                if sar_tx.send(Some(sar)).is_err() {
                     break;
                 }
             }
-            // Dropping `sar_tx` tells the match it lost its blessing.
+            // Dropping `sar_tx` tells the match it lost its blessing (a rogue
+            // server keeps it, and serves on).
+            if ignore_revocations {
+                std::future::pending::<()>().await;
+            }
         });
     }
 
@@ -258,14 +285,26 @@ async fn main() -> Result<()> {
             build_id: BuildId(sw_hash),
             keys: keyset,
             min_tier: DeviceTier::D0Unknown,
-            sar_grace_ms: game::SAR_GRACE_MS,
+            sar_grace_ms: if opts.ignore_revocations {
+                u64::MAX
+            } else {
+                game::SAR_GRACE_MS
+            },
         },
         Host::new(host_cfg),
     );
     let ledger = Ledger::open_for_session(&hex::encode(&session_id[..2])).ok();
     let stop = Arc::new(AtomicBool::new(false));
     println!("[GS] game port (fpp-session/UDP) on {game_addr}");
-    let game_task = tokio::spawn(game::run(socket, m, sar_rx, cp_tx, ledger, stop.clone()));
+    let game_task = tokio::spawn(game::run(
+        socket,
+        m,
+        sar_rx,
+        rev_rx,
+        cp_tx,
+        ledger,
+        stop.clone(),
+    ));
 
     if opts.test_once {
         tokio::time::sleep(Duration::from_secs(opts.test_secs)).await;

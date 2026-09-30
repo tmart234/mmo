@@ -47,6 +47,7 @@ TYPES = {
     "attestation-result": ("fpp/1/attestation-result", "application/fpp-ar+cwt"),
     "sat": ("fpp/1/sat", "application/fpp-sat+cwt"),
     "sar": ("fpp/1/sar", "application/fpp-sar+cwt"),
+    "revocation": ("fpp/1/revocation", "application/fpp-revocation+cbor"),
 }
 
 
@@ -485,8 +486,44 @@ def parse_sar(m):
     return c
 
 
+# ---- enforcement (04-protocol.md §9): text keys
+
+SUBJECT_ID_LEN = {0: 32, 1: 32, 2: 32, 3: 16, 4: 32, 5: 32}  # account, device, session, sat, gs_instance, build
+
+
+def parse_revocation(m):
+    _require(isinstance(m, dict), "RevocationEvent is not a map")
+    subject = m.get("subject")
+    _require(isinstance(subject, dict), "subject")
+    kind = _uint(subject, "kind", 8)
+    _require(kind in SUBJECT_ID_LEN, "subject kind")
+    subject_id = _fixed(subject, "id", SUBJECT_ID_LEN[kind])
+    action = _uint(m, "action", 8)
+    _require(action <= 6, "action")
+    scope_in = m.get("scope")
+    _require(isinstance(scope_in, dict), "scope")
+    scope = {}
+    for k in ("titles", "queues", "regions"):
+        if k in scope_in:
+            v = scope_in[k]
+            _require(isinstance(v, list) and 1 <= len(v) <= 16
+                     and all(isinstance(x, str) and 1 <= len(x.encode()) <= 64 for x in v), f"scope {k}")
+            scope[k] = v
+    effective_at = _uint(m, "effective_at", 64)
+    expires_at = None
+    if "expires_at" in m:
+        expires_at = _uint(m, "expires_at", 64)
+        _require(expires_at > effective_at, "expires_at <= effective_at")
+    return {
+        "id": _fixed(m, "id", 16).hex(), "subject_kind": kind, "subject_id": subject_id.hex(),
+        "action": action, "scope": scope, "effective_at": effective_at, "expires_at": expires_at,
+        "reason": _uint(m, "reason", 16), "record": _fixed(m, "record", 32).hex(),
+    }
+
+
 PARSERS = {"input-commit": parse_input_commit, "checkpoint": parse_checkpoint, "admit-pop": parse_admit_pop,
-           "attestation-result": parse_attestation_result, "sat": parse_sat, "sar": parse_sar}
+           "attestation-result": parse_attestation_result, "sat": parse_sat, "sar": parse_sar,
+           "revocation": parse_revocation}
 
 
 def verify(cose, kind, keys):
@@ -589,6 +626,8 @@ def run(path):
         r.check(hashlib.sha256(cose).hexdigest() == o["digest"], f"{name}: object digest")
         derive = o["derive"]
         r.check(key["name"] == derive["signer"], f"{name}: signer")
+        if o["type"] == "revocation":
+            continue
         if o["type"] in ("attestation-result", "sat"):
             if o["type"] == "sat":
                 ar = parse_attestation_result(cbor_decode(cbor_decode(bytes.fromhex(by_object[derive["ar_object"]]["cose"]))[2]))

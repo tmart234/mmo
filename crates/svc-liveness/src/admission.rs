@@ -141,6 +141,11 @@ async fn admit_game_server(
     send_msg(&mut send, &JoinAccept { session_id })
         .await
         .context("send JoinAccept")?;
+    // Revocation events in force go to it now, and new ones as they come.
+    ctx.links.insert(session_id, conn.clone());
+    for signed in crate::revocation::in_force(&ctx) {
+        crate::revocation::push(&conn, signed);
+    }
 
     spawn_sar_loop(&conn, ctx.clone(), session_id);
     spawn_checkpoint_listener(&conn, ctx.clone(), session_id);

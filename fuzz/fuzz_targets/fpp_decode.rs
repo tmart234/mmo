@@ -9,7 +9,10 @@ use libfuzzer_sys::fuzz_target;
 fuzz_target!(|data: &[u8]| {
     // Exactly one accepted encoding: whatever decodes re-encodes identically.
     if let Ok(v) = cbor::decode(data) {
-        assert_eq!(cbor::encode(&v).expect("decoded maps have unique keys"), data);
+        assert_eq!(
+            cbor::encode(&v).expect("decoded maps have unique keys"),
+            data
+        );
     }
     let _ = Sign1::decode(data);
     let _ = InputCommit::from_cbor(data);
@@ -22,8 +25,16 @@ fuzz_target!(|data: &[u8]| {
     let _ = fpp_wire::InputFrame::decode(data);
 
     let mut keys = KeySet::default();
-    for (seed, role) in [(0x51, KeyRole::Session), (0x52, KeyRole::Session), (0x61, KeyRole::GsInstance), (0x71, KeyRole::Log)] {
-        keys.insert_ed25519(role, Ed25519Signer::new(SigningKey::from_bytes(&[seed; 32])).verifying_key());
+    for (seed, role) in [
+        (0x51, KeyRole::Session),
+        (0x52, KeyRole::Session),
+        (0x61, KeyRole::GsInstance),
+        (0x71, KeyRole::Log),
+    ] {
+        keys.insert_ed25519(
+            role,
+            Ed25519Signer::new(SigningKey::from_bytes(&[seed; 32])).verifying_key(),
+        );
     }
     let _ = verify::<InputCommit>(data, &keys);
     let _ = verify::<Checkpoint>(data, &keys);

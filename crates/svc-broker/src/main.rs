@@ -19,6 +19,9 @@ struct Opts {
     /// Server Liveness's cell address (mutual TLS).
     #[arg(long, default_value = "127.0.0.1:4454")]
     liveness: std::net::SocketAddr,
+    /// The Revocation Feed's cell address.
+    #[arg(long)]
+    feed: Option<std::net::SocketAddr>,
     /// TLS certificate (DER) presented to clients; must chain to the CA they pin.
     #[arg(long, default_value = "keys/broker_tls.der")]
     tls_cert: String,
@@ -31,8 +34,12 @@ struct Opts {
 async fn main() -> Result<()> {
     let o = Opts::parse();
     let key = fpp_svc::keys::ed25519(&o.cell, "broker", BROKER_ISS)?;
-    let link = LivenessLink::new(&fpp_svc::cell::load(&o.cell, "broker")?, o.liveness)?;
+    let identity = fpp_svc::cell::load(&o.cell, "broker")?;
+    let link = LivenessLink::new(&identity, o.liveness)?;
     let broker = Arc::new(Broker::new(Ed25519Signer::new(key), o.cell.clone(), link));
+    if let Some(feed) = o.feed {
+        tokio::spawn(broker.clone().follow(identity, feed));
+    }
     let identity = common::pki::ServerIdentity::load(&o.tls_cert, &o.tls_key)?;
     let endpoint = common::admission::server_endpoint(&identity, o.bind)?;
     println!(

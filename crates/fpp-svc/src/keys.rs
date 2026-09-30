@@ -76,8 +76,8 @@ pub fn ed25519(cell: &Path, service: &str, name: &str) -> Result<SigningKey> {
     Ok(key)
 }
 
-/// The key bundle of a cell: the public keys the Verifier, the Broker and
-/// Server Liveness published there.
+/// The key bundle of a cell: the public keys the Verifier, the Broker,
+/// Server Liveness and Enforcement published there.
 pub fn bundle(cell: &Path) -> Result<common::keys::KeyBundle> {
     let key = |service: &str| -> Result<ed25519_dalek::VerifyingKey> {
         ed25519_dalek::VerifyingKey::from_bytes(&PublicKeys::read(cell, service)?.ed25519)
@@ -87,5 +87,6 @@ pub fn bundle(cell: &Path) -> Result<common::keys::KeyBundle> {
         verifier_ar: key("verifier")?,
         broker_sat: key("broker")?,
         server_liveness: key("liveness")?,
+        enforcement: key("enforcement")?,
     })
 }

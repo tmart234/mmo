@@ -14,6 +14,8 @@
 //!    it to Server Liveness, and its digest (`CheckpointHead`) to every player.
 //! 6. New SARs are forwarded (`SarUpdate`). If they stop, the server has lost
 //!    its blessing: every player is kicked with `SAR_LAPSED`.
+//! 7. Revocation events (verified by the caller) remove the players they
+//!    name at once, and refuse them for the rest of the match (04 §9).
 //!
 //! [`Match`] is sans-I/O (tests drive it directly); [`run`] adds the socket
 //! and the clock.
@@ -21,11 +23,11 @@
 use common::proto::{ClientCmd, WorldSnapshot};
 use fpp_crypto::{Ed25519Signer, KeyResolver, KeyRole, KeySet};
 use fpp_session::{Host, HostEvent, Transmit};
-use fpp_tokens::admission::{admit, AdmissionPolicy, Revocations};
+use fpp_tokens::admission::{admit, AdmissionPolicy, Admitted, Revocations};
 use fpp_tokens::control::Control;
 use fpp_types::{BuildId, DeviceTier, Digest, GsInstanceId, MatchId, Reason};
 use fpp_wire::msg::frame_leaf_data;
-use fpp_wire::{Checkpoint, InputCommit, InputFrame, InputLeaf};
+use fpp_wire::{Checkpoint, InputCommit, InputFrame, InputLeaf, RevocationEvent, SubjectKind};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, HashMap};
 
@@ -54,6 +56,8 @@ pub enum Signal {
 struct Player {
     peer: u32,
     session_key: [u8; 32],
+    /// The SAT and AR it was admitted with (for revocations).
+    tokens: Admitted,
     x: f32,
     y: f32,
     /// Received intents by tick (current and previous epoch).
@@ -88,6 +92,8 @@ pub struct Match {
     last_sar_ms: Option<u64>,
     revoked: bool,
     revocations: Revocations,
+    /// Revocation events not yet in force (unix seconds).
+    scheduled: Vec<RevocationEvent>,
     prev_checkpoint: Digest,
     next_checkpoint_epoch: u32,
     /// State digest at the end of each epoch not yet checkpointed.
@@ -125,6 +131,7 @@ impl Match {
             last_sar_ms: None,
             revoked: false,
             revocations: Revocations::default(),
+            scheduled: Vec::new(),
             prev_checkpoint: Digest::default(),
             next_checkpoint_epoch: 0,
             epoch_state: BTreeMap::new(),
@@ -271,6 +278,7 @@ impl Match {
             Player {
                 peer,
                 session_key,
+                tokens: a.clone(),
                 x: 0.0,
                 y: 0.0,
                 frames: BTreeMap::new(),
@@ -362,6 +370,7 @@ impl Match {
 
     /// Advance one simulation tick. Call at `TICK_HZ`.
     pub fn step(&mut self, now_ms: u64) {
+        self.apply_scheduled(common::crypto::now_ms() / 1000);
         if !self.revoked
             && self
                 .last_sar_ms
@@ -508,8 +517,12 @@ impl Match {
         if self.revoked {
             return;
         }
-        self.revoked = true;
         eprintln!("[GS] SAR chain lapsed: no longer blessed; kicking all players");
+        self.end(Reason::SarLapsed as u16);
+    }
+
+    fn end(&mut self, code: u16) {
+        self.revoked = true;
         let peers: Vec<u32> = self
             .players
             .values()
@@ -517,13 +530,77 @@ impl Match {
             .chain(self.pending.keys().copied())
             .collect();
         for peer in peers {
-            self.control(peer, &Control::kick(Reason::SarLapsed));
+            self.control(peer, &Control::Kick { code });
             let _ = self.host.tick(0);
-            let _ = self.host.disconnect(peer, Reason::SarLapsed as u16);
+            let _ = self.host.disconnect(peer, code);
         }
         self.players.clear();
         self.pending.clear();
         self.slot_of.clear();
+    }
+
+    /// A revocation event from Enforcement (its signature already checked):
+    /// remove the players it names now, refuse them from now on. `now_s` is
+    /// wall-clock unix seconds. Returns how many players it removed.
+    pub fn apply_revocation(&mut self, event: RevocationEvent, now_s: u64) -> usize {
+        if event.expires_at.is_some_and(|e| e <= now_s) || self.revoked {
+            return 0;
+        }
+        if event.effective_at > now_s + fpp_tokens::SKEW_S {
+            self.scheduled.push(event);
+            return 0;
+        }
+        let acts = event.action.removes_players() || event.action.denies_admission();
+        if !acts {
+            return 0;
+        }
+        if event.subject_kind == SubjectKind::GsInstance {
+            if event.subject_id == self.instance_id().0 {
+                eprintln!("[GS] this instance is revoked by Enforcement: ending the match");
+                let n = self.players.len();
+                self.end(event.reason);
+                return n;
+            }
+            return 0;
+        }
+        let mut one = Revocations::default();
+        one.add(&event);
+        self.revocations.add(&event);
+        if !event.action.removes_players() {
+            return 0;
+        }
+        let named: Vec<(u16, u32)> = self
+            .players
+            .iter()
+            .filter(|(_, p)| one.covers(&p.tokens.sat, &p.tokens.ar))
+            .map(|(slot, p)| (*slot, p.peer))
+            .collect();
+        for (slot, peer) in &named {
+            println!(
+                "[GS] slot {slot} removed by Enforcement ({:?})",
+                event.action
+            );
+            self.control(*peer, &Control::Kick { code: event.reason });
+            let _ = self.host.tick(0);
+            let _ = self.host.disconnect(*peer, event.reason);
+            self.players.remove(slot);
+            self.slot_of.remove(peer);
+        }
+        named.len()
+    }
+
+    /// Apply revocation events that came into force.
+    fn apply_scheduled(&mut self, now_s: u64) {
+        if self.scheduled.is_empty() {
+            return;
+        }
+        let due: Vec<RevocationEvent>;
+        (due, self.scheduled) = std::mem::take(&mut self.scheduled)
+            .into_iter()
+            .partition(|e| e.effective_at <= now_s);
+        for e in due {
+            self.apply_revocation(e, now_s);
+        }
     }
 
     pub fn poll_transmit(&mut self) -> Option<Transmit<Vec<u8>>> {
@@ -576,6 +653,7 @@ pub async fn run(
     socket: tokio::net::UdpSocket,
     mut m: Match,
     sar_rx: tokio::sync::watch::Receiver<Option<Vec<u8>>>,
+    mut revocations: tokio::sync::mpsc::UnboundedReceiver<RevocationEvent>,
     cp_tx: tokio::sync::mpsc::UnboundedSender<(u32, Vec<u8>)>,
     mut ledger: Option<crate::ledger::Ledger>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -594,6 +672,9 @@ pub async fn run(
                 if let Ok((n, from)) = r {
                     m.on_datagram(addr_bytes(&from), &buf[..n]);
                 }
+            }
+            Some(event) = revocations.recv() => {
+                m.apply_revocation(event, common::crypto::now_ms() / 1000);
             }
             changed = sar_changed(&mut sar_rx) => {
                 match changed {

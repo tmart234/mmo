@@ -20,6 +20,9 @@ struct Opts {
     /// Cell services allowed to place players.
     #[arg(long, value_delimiter = ',', default_value = "broker")]
     callers: Vec<String>,
+    /// The Revocation Feed's cell address.
+    #[arg(long)]
+    feed: Option<std::net::SocketAddr>,
     /// TLS certificate (DER) presented to game servers; must chain to the CA they pin.
     #[arg(long, default_value = "keys/liveness_tls.der")]
     tls_cert: String,
@@ -71,7 +74,17 @@ async fn main() -> Result<()> {
         }
     );
     let identity = common::pki::ServerIdentity::load(&o.tls_cert, &o.tls_key)?;
-    svc_liveness::start(&o.cell, &identity, o.bind, o.rpc, o.callers, config)?;
+    svc_liveness::start(
+        &o.cell,
+        &identity,
+        svc_liveness::Addrs {
+            public: o.bind,
+            rpc: o.rpc,
+            callers: o.callers,
+            feed: o.feed,
+        },
+        config,
+    )?;
     println!(
         "[liveness] key published in {}; game servers on {}; cell API on {}",
         o.cell.join("public/liveness").display(),

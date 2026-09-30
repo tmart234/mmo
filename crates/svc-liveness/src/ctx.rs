@@ -6,6 +6,9 @@ use fpp_crypto::Ed25519Signer;
 use fpp_types::Digest;
 use std::sync::Arc;
 
+/// Revocation events seen, each with its signed bytes.
+pub type Revocations = Vec<(fpp_wire::RevocationEvent, Vec<u8>)>;
+
 #[derive(Clone)]
 pub struct Ctx {
     /// Signs SARs (Server Liveness role, 04 §4); made in this service's own
@@ -13,6 +16,11 @@ pub struct Ctx {
     pub key: Arc<Ed25519Signer>,
     pub sessions: Arc<DashMap<[u8; 16], Session>>,
     pub config: LivenessConfig,
+    /// Each admitted game server's link, for pushing revocation events.
+    pub links: Arc<DashMap<[u8; 16], quinn::Connection>>,
+    /// Revocation events seen so far (signed), sent to each game server
+    /// as it joins.
+    pub revocations: Arc<std::sync::Mutex<Revocations>>,
 }
 
 /// One admitted game server instance; its session id is also the id of the
@@ -39,6 +47,8 @@ impl Ctx {
             key: Arc::new(key),
             sessions: Arc::new(DashMap::new()),
             config,
+            links: Arc::new(DashMap::new()),
+            revocations: Arc::default(),
         }
     }
 

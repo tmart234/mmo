@@ -31,7 +31,7 @@ because several **chain together**.
 | F15 | Low | Private key material is committed (`crates/client-core/keys/client_ed25519.pk8`, presumably a test key). `.pk8` files hold raw 32-byte seeds, not PKCS#8. | repo | ✅ Fixed (P0): keys untracked, `crates/*/keys/` ignored, CI guard fails on tracked key files |
 | F16 | Low | `cargo audit \|\| true`: advisories never fail CI. | `.github/workflows/ci.yml:39` | ✅ Fixed (P0): cargo-deny (advisories, licenses, bans, sources) is a blocking CI job; see F20 |
 | F17 | Low | `.gitignore` ignores `*.lock` while `Cargo.lock` is tracked. Lockfiles for binaries must be tracked for reproducible builds. | `.gitignore:23` | ✅ Fixed (P0) |
-| F18 | Info | Revocation state lives in three places. | `vs/src/ctx.rs:22`, `vs/src/enforcer.rs:33`, `gs-sim/src/state.rs:103` | Single subject-state model (P2) |
+| F18 | Info | Revocation state lives in three places. | `vs/src/ctx.rs:22`, `vs/src/enforcer.rs:33`, `gs-sim/src/state.rs:103` | ✅ P2.2: one source, the Revocation Feed's signed events; the Broker, Server Liveness and game servers each keep a cache of it |
 | F19 | Info | GS client port is hard-coded to `127.0.0.1:50000`. | `crates/gs-sim/src/client_port.rs:78` | ✅ Fixed (P1): `--game-addr`, advertised to the VS in the signed JoinRequest and to clients by the Broker |
 | F21 | **Critical** | `verify_quote` checked a quote's signature with the attestation key *carried in the quote*. Anyone could sign a "quote" for any PCR values, including the configured baselines, with a key they made up; PCR baselines gave no assurance. | `crates/common/src/tpm.rs` `verify_quote` | ✅ Fixed for TPM 2.0: an AK counts only after credential activation against an EK certified by a pinned manufacturer root, at every join. The simulated TPM path is removed |
 | F20 | **High** | Vulnerable dependencies, hidden by the non-blocking audit (F16): quinn-proto remote DoS and memory exhaustion (RUSTSEC-2026-0037, -0185), rustls accepting TLS 1.3 handshake messages across encryption levels (RUSTSEC-2026-0285), rustls-webpki name-constraint and CRL flaws, aws-lc-sys X.509/PKCS7 bypasses, unsound `lru` used directly by gs-sim, protobuf recursion crash via prometheus 0.13, plus bytes, time and anyhow issues. | `Cargo.lock`, `crates/gs-sim/Cargo.toml`, `Cargo.toml` | ✅ Fixed (P0): lockfile updates, lru 0.18, prometheus 0.14; remaining ignores documented in `deny.toml` (bincode, until P1 replaces it) |
@@ -50,7 +50,7 @@ because several **chain together**.
 | EVD (evidence) | ◐ | Hash-chained receipts + notarization exist (good instinct). Linear chain, local files, no log or witnesses. |
 | IA (Integrity Agent) | ✗ | Not started. |
 | DET (detection) | ✗ | Only the VS speed check. |
-| ENF (enforcement) | ◐ | Session revocation via ticket starvation. No subjects, actions, feed or appeals. |
+| ENF (enforcement) | ◐ | Signed revocation events for accounts, devices, sessions, SATs, instances and builds, through a logged feed to Brokers, Server Liveness and game servers (P2.2); instance revocation also by SAR starvation. No appeals or two-person rule yet. |
 | ECO (economy) | ◐ | Idempotency via LRU in GS memory; not durable or transactional. |
 | NET | ✗ | Not addressed. |
 | SEC (AC security) | ◐ | Rust (good); CI audit non-blocking; no fuzzing; keys in repo. |
@@ -195,10 +195,24 @@ three; an AR signed by the Broker's or Liveness's key, or used by another
 key, is refused; a non-Broker caller cannot place players; with Server
 Liveness stopped the Verifier and Broker keep answering and the Broker
 refuses within 2 s (`svc-broker/tests/cell.rs`, `make ci` smoke).
-**Next (P2.2, P2.3):** Revocation Feed (Enforcement key, `RevocationEvent`,
-log entries, subscribers, revocation→kick load test), Evidence Store
-(Server Liveness still writes Checkpoints to local files), and the SAR
-lapse exit test.
+**Revocation Feed ✅ (P2.2):** `RevocationEvent` (04 §9) is a signed FPP
+object under the Enforcement key, with golden vectors checked by the
+independent Python verifier. `fpp-enforce` logs an enforcement record in
+the Transparency Log and publishes the event naming its hash;
+`svc-revocation` accepts only Enforcement's signature, appends every event
+to the log before accepting it, persists them, and serves them by long
+poll to the Broker (refuses denied accounts, devices, session keys,
+builds) and Server Liveness (stops a revoked instance's SARs, relays every
+event to its game servers, which verify it and remove the players it
+names). **Exit tests** (`tools/src/revocation_load.rs`, in `make ci`):
+revocation→kick p99 111–222 ms over 32 players (bound 5 s; 42 ms over 60 in a
+release build); a denied account is refused; a rogue GS that ignores its
+revocation loses all its players to SAR lapse in 5–6.2 s (bound: one SAR
+lifetime). Scopes by region (Liveness, Broker) and queue (Broker) are
+honored. Open: the regional compacted topic and Bloom filter of §9 (one
+feed per cell today), scopes by title, and appeals.
+**Next (P2.3):** Evidence Store (Server Liveness still writes Checkpoints
+to local files).
 
 ### P3 — Real attestation (8–12 weeks, parallelizable per platform)
 Verifier appraisal for TPM 2.0 (EK chain, credential activation, TCG log

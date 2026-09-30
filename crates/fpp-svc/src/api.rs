@@ -32,3 +32,36 @@ pub mod liveness {
         pub slot: u16,
     }
 }
+
+/// The Revocation Feed (04 §9): Enforcement publishes signed
+/// `RevocationEvent`s; Brokers and Server Liveness follow them.
+pub mod revocation {
+    use serde::{Deserialize, Serialize};
+
+    /// The longest a `Since` request waits for new events.
+    pub const MAX_WAIT_MS: u64 = 30_000;
+
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+    pub enum Request {
+        /// A signed `RevocationEvent` (COSE_Sign1 by the Enforcement key).
+        /// Publishers only.
+        Publish(Vec<u8>),
+        /// Events from sequence number `from` on, waiting up to `wait_ms`
+        /// (at most [`MAX_WAIT_MS`]) for one if there is none yet.
+        /// Subscribers only.
+        Since { from: u64, wait_ms: u64 },
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+    pub enum Response {
+        /// Its sequence number in the feed, and its index in the
+        /// Transparency Log (when the feed logs).
+        Published {
+            seq: u64,
+            log_index: Option<u64>,
+        },
+        /// (sequence number, signed event), in order.
+        Events(Vec<(u64, Vec<u8>)>),
+        Refused(String),
+    }
+}

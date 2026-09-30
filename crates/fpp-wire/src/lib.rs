@@ -11,7 +11,10 @@ pub mod msg;
 
 pub use cbor::Value;
 pub use frame::InputFrame;
-pub use msg::{AdmitPop, Checkpoint, InputCommit, InputLeaf, LogReceipt, Payload};
+pub use msg::{
+    Action, AdmitPop, Checkpoint, InputCommit, InputLeaf, LogReceipt, Payload, RevocationEvent,
+    Scope, SubjectKind,
+};
 
 /// Why bytes were rejected. Decoders never panic on untrusted input.
 #[derive(Clone, Debug, PartialEq, Eq)]

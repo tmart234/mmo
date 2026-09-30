@@ -5,10 +5,12 @@
 // Wire format:
 //   [4-byte little-endian length][bincode payload]
 //
-// Used on the QUIC control links:
-//   GS <-> VS: ChallengeRequest, AttestChallenge, JoinRequest, JoinAccept,
-//              SarIssue (VS -> GS), CheckpointSubmit (GS -> VS)
-//   client <-> VS: ChallengeRequest, AttestChallenge, ClientAdmission*
+// Used on the QUIC links to the public services (`proto`):
+//   GS <-> Server Liveness: ChallengeRequest, AttestChallenge, JoinRequest,
+//              JoinAccept, ToGameServer (-> GS), CheckpointSubmit (GS ->)
+//   client <-> Verifier, Broker: ChallengeRequest, AttestChallenge,
+//              EvidenceRequest/Answer, MatchRequest/Answer
+// and, with `fpp-svc`, between the services of a cell.
 
 use anyhow::{Context, Result};
 use quinn::{RecvStream, SendStream};
@@ -17,7 +19,7 @@ use serde::{de::DeserializeOwned, Serialize};
 /// Send one message on a QUIC SendStream, then FIN the send side.
 ///
 /// Use this for request/response patterns where you send one message
-/// and then are done sending (e.g., VS protocol messages).
+/// and then are done sending.
 ///
 /// Usage pattern:
 /// ```ignore

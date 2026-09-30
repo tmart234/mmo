@@ -6,7 +6,7 @@ use common::framing::{decode_frame, MAX_CONTROL_FRAME};
 use common::proto::{
     AttestChallenge, ChallengeRequest, CheckpointSubmit, ClientCmd, CredentialChallenge,
     CredentialResponse, EvidenceAnswer, EvidenceRequest, JoinAccept, JoinRequest, MatchAnswer,
-    MatchRequest, SarIssue, WorldSnapshot,
+    MatchRequest, ToGameServer, WorldSnapshot,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -24,7 +24,7 @@ fuzz_target!(|data: &[u8]| {
         1 => decode::<JoinAccept>(body),
         2 => decode::<ChallengeRequest>(body),
         3 => decode::<AttestChallenge>(body),
-        4 => decode::<SarIssue>(body),
+        4 => decode::<ToGameServer>(body),
         5 => decode::<CheckpointSubmit>(body),
         6 => decode::<EvidenceRequest>(body),
         7 => decode::<EvidenceAnswer>(body),

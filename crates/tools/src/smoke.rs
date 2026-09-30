@@ -1,5 +1,6 @@
 // CI-lite / `make ci` smoke test of the whole FPP prototype, with the trust
-// plane as a cell of separate services (tools::cell):
+// plane as a cell of separate services (tools::cell; the Transparency Log
+// and Revocation Feed run too, and `revocation_load` tests them):
 //
 // - Server Liveness: GS admission (challenge + JoinRequest), SAR chain,
 //   Checkpoint verification, placement for the Broker (cell mutual TLS)

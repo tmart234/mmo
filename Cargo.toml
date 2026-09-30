@@ -20,6 +20,7 @@ members = [
     "crates/svc-liveness",
     "crates/svc-verifier",
     "crates/svc-broker",
+    "crates/svc-revocation",
     "crates/tools",
     "crates/client-core",
     "crates/client-bevy",
