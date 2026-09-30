@@ -17,6 +17,10 @@ path = "src/smoke.rs"
 name = "play"
 path = "src/play.rs"
 
+[[bin]]
+name = "mint_ar"
+path = "src/mint_ar.rs"
+
 [dependencies]
 clap = { workspace = true }
 ed25519-dalek = { workspace = true }
@@ -24,3 +28,6 @@ rand = { workspace = true }
 ctrlc = { workspace = true }
 anyhow = { workspace = true }
 common = { path = "../common" }
+fpp-crypto = { path = "../fpp-crypto" }
+fpp-tokens = { path = "../fpp-tokens" }
+fpp-types = { path = "../fpp-types" }

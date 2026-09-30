@@ -5888,6 +5888,9 @@ dependencies = [
  "common",
  "ctrlc",
  "ed25519-dalek",
+ "fpp-crypto",
+ "fpp-tokens",
+ "fpp-types",
  "rand 0.8.8",
 ]
 
