@@ -1,0 +1,110 @@
+# One regional cell of the trust plane (development): Server Liveness, the
+# Verifier and the Broker, each in its own container with its own key.
+# Each service mounts only its own directory of the cell (its signing seed,
+# cell identity and public TLS identity), the cell CA certificate, and the
+# shared directory where services publish their public keys. See README.md.
+#
+#   docker compose -f deploy/cell/docker-compose.yml up --build
+#
+# Needs Docker Engine 26+ (volume subpaths).
+
+name: fpp-cell
+
+x-service: &service
+  image: fpp-cell:dev
+  read_only: true
+  restart: on-failure
+  depends_on:
+    init:
+      condition: service_completed_successfully
+
+networks:
+  cell:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  state:
+
+services:
+  # Makes the dev PKI and the cell once, then moves each service's public
+  # TLS identity into that service's own directory.
+  init:
+    build:
+      context: ../..
+      dockerfile: deploy/cell/Dockerfile
+    image: fpp-cell:dev
+    restart: "no"
+    volumes:
+      - state:/var/lib/fpp
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        [ -f cellca/ca.der ] && exit 0
+        gen_keys
+        for s in liveness verifier broker; do
+          mv keys/$${s}_tls.der cell/$$s/public_tls.der
+          mv keys/$${s}_tls.key.der cell/$$s/public_tls.key.der
+          chmod 600 cell/$$s/public_tls.key.der
+        done
+        mkdir -p cell/public evidence cellca/liveness cellca/verifier cellca/broker cellca/public
+        cp cell/ca.der cellca/
+
+  liveness:
+    <<: *service
+    networks:
+      cell:
+        ipv4_address: 172.30.0.10
+    ports:
+      - "4444:4444/udp"
+    working_dir: /var/lib/fpp
+    command: >-
+      svc-liveness --cell /cell --bind 0.0.0.0:4444 --rpc 0.0.0.0:4454
+      --tls-cert /cell/liveness/public_tls.der --tls-key /cell/liveness/public_tls.key.der
+    volumes:
+      - {type: volume, source: state, target: /cell, read_only: true, volume: {subpath: cellca}}
+      - {type: volume, source: state, target: /cell/liveness, volume: {subpath: cell/liveness}}
+      - {type: volume, source: state, target: /cell/public, volume: {subpath: cell/public}}
+      - {type: volume, source: state, target: /var/lib/fpp/evidence, volume: {subpath: evidence}}
+
+  verifier:
+    <<: *service
+    networks:
+      cell:
+        ipv4_address: 172.30.0.11
+    ports:
+      - "4445:4445/udp"
+    command: >-
+      svc-verifier --cell /cell --bind 0.0.0.0:4445
+      --tls-cert /cell/verifier/public_tls.der --tls-key /cell/verifier/public_tls.key.der
+    volumes:
+      - {type: volume, source: state, target: /cell, read_only: true, volume: {subpath: cellca}}
+      - {type: volume, source: state, target: /cell/verifier, volume: {subpath: cell/verifier}}
+      - {type: volume, source: state, target: /cell/public, volume: {subpath: cell/public}}
+
+  broker:
+    <<: *service
+    networks:
+      cell:
+        ipv4_address: 172.30.0.12
+    ports:
+      - "4446:4446/udp"
+    command: >-
+      svc-broker --cell /cell --bind 0.0.0.0:4446 --liveness 172.30.0.10:4454
+      --tls-cert /cell/broker/public_tls.der --tls-key /cell/broker/public_tls.key.der
+    volumes:
+      - {type: volume, source: state, target: /cell, read_only: true, volume: {subpath: cellca}}
+      - {type: volume, source: state, target: /cell/broker, volume: {subpath: cell/broker}}
+      - {type: volume, source: state, target: /cell/public, volume: {subpath: cell/public}}
+
+  # Gathers the key bundle game servers and clients trust, once the three
+  # services have published their keys (retried until they have).
+  bundle:
+    <<: *service
+    depends_on: [liveness, verifier, broker]
+    networks: [cell]
+    command: fpp-cell bundle /cell /var/lib/fpp/keys/fpp_key_bundle.json
+    volumes:
+      - {type: volume, source: state, target: /cell/public, read_only: true, volume: {subpath: cell/public}}
+      - {type: volume, source: state, target: /var/lib/fpp/keys, volume: {subpath: keys}}

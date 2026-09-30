@@ -29,12 +29,10 @@ crates/*/keys/
 # Runtime output of gs-sim (the match ledger)
 ledger/
 # A development cell: service identities and signing seeds (gen_keys, fpp-cell init)
-cell/
-# Checkpoint evidence Server Liveness keeps (until the Evidence Store)
-evidence/
+/cell/
 
 # Python bytecode (interop checkers)
 __pycache__/
 
-# Checkpoint evidence the VS stores during local runs and the smoke test
+# Checkpoint evidence Server Liveness keeps (until the Evidence Store)
 /evidence/
