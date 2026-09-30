@@ -34,5 +34,3 @@ ledger/
 # Python bytecode (interop checkers)
 __pycache__/
 
-# Checkpoint evidence Server Liveness keeps (until the Evidence Store)
-/evidence/

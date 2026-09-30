@@ -65,3 +65,29 @@ pub mod revocation {
         Refused(String),
     }
 }
+
+/// The Evidence Store: content-addressed objects (SHA-256 of their bytes),
+/// indexed by match. Server Liveness stores the Checkpoints it verified;
+/// auditors read them back.
+pub mod evidence {
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+    pub enum Request {
+        /// Store `object` under its digest, listed under `match_id`.
+        /// Writers only.
+        Put { match_id: [u8; 16], object: Vec<u8> },
+        /// Readers only.
+        Get([u8; 32]),
+        /// Digests stored under a match, in the order stored. Readers only.
+        List([u8; 16]),
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+    pub enum Response {
+        Stored([u8; 32]),
+        Object(Option<Vec<u8>>),
+        Digests(Vec<[u8; 32]>),
+        Refused(String),
+    }
+}

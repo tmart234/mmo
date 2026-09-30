@@ -19,6 +19,8 @@ Client <-> GS <-> trust plane, speaking the Fair-Play Protocol (FPP v1).
     revocation events (`fpp-enforce`) to the Broker and Server Liveness,
     which relays them to game servers; every event is in the Transparency
     Log first.
+  - **Evidence Store** (`svc-evidence`) keeps the Checkpoints Server
+    Liveness verified, content addressed, for auditors (`fpp-evidence`).
   - **Transparency Log** and its **witness** (`svc-log`, `svc-witness`).
 - **GS** – runs the match. Clients join over **fpp-session** (Noise over UDP,
   ADR-002): the GS shows its current SAR, checks `Admit{SAT, AR}`, applies

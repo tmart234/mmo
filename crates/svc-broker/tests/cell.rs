@@ -50,6 +50,7 @@ async fn start(dir: &Path) -> TestCell {
             rpc,
             callers: vec!["broker".into()],
             feed: None,
+            evidence: None,
         },
         LivenessConfig::default(),
     )

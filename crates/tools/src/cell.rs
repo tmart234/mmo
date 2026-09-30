@@ -1,5 +1,5 @@
 //! A development cell on this machine: the Transparency Log, the Revocation
-//! Feed, Server Liveness, the Verifier and the Broker as separate
+//! Feed, the Evidence Store, Server Liveness, the Verifier and the Broker as separate
 //! processes, each with its own key in `cell/<service>/`, calling each
 //! other over the cell's mutual TLS; the public ones (Liveness, Verifier,
 //! Broker) with their own certificates in `keys/`. Enforcement's key is
@@ -13,20 +13,30 @@ use std::time::{Duration, Instant};
 
 pub const CELL_DIR: &str = "cell";
 /// The services a dev cell runs, in start order (each after those it calls).
-pub const SERVICES: [&str; 5] = ["log", "revocation", "liveness", "verifier", "broker"];
-/// Cell identities: the services, and Enforcement (a tool, not a service).
-pub const IDENTITIES: [&str; 6] = [
+pub const SERVICES: [&str; 6] = [
     "log",
     "revocation",
+    "evidence",
+    "liveness",
+    "verifier",
+    "broker",
+];
+/// Cell identities: the services, Enforcement and auditors (tools).
+pub const IDENTITIES: [&str; 8] = [
+    "log",
+    "revocation",
+    "evidence",
     "liveness",
     "verifier",
     "broker",
     "enforcement",
+    "audit",
 ];
 
 /// Cell addresses of the internal services.
 pub const LOG_ADDR: &str = "127.0.0.1:7201";
 pub const FEED_ADDR: &str = "127.0.0.1:4460";
+pub const EVIDENCE_ADDR: &str = "127.0.0.1:4470";
 
 /// Each service's arguments beyond `--cell`.
 fn args(service: &str) -> Vec<String> {
@@ -40,7 +50,9 @@ fn args(service: &str) -> Vec<String> {
             "revocation,enforcement,liveness",
         ],
         "revocation" => &["--bind", FEED_ADDR, "--log", LOG_ADDR],
-        "liveness" | "broker" => &["--feed", FEED_ADDR],
+        "evidence" => &["--bind", EVIDENCE_ADDR],
+        "liveness" => &["--feed", FEED_ADDR, "--evidence", EVIDENCE_ADDR],
+        "broker" => &["--feed", FEED_ADDR],
         _ => &[],
     };
     v.iter().map(|s| s.to_string()).collect()

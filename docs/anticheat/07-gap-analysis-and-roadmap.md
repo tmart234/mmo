@@ -27,7 +27,7 @@ because several **chain together**.
 | F11 | Medium | No domain separation in signatures. `JoinAccept` signs the raw 16-byte `session_id` with the same key that signs tickets and receipts. | `crates/vs/src/admission.rs:143` | ✅ Fixed (P1) for every FPP object: tokens, Checkpoints, InputCommits and AdmitPops are COSE with `fpp-ctx` and per-role keys (Verifier, Broker, Liveness keys are distinct). `JoinAccept` no longer carries a signature (P2.4, see F02), and each role key is now made by its own service, not derived from one seed |
 | F12 | Medium | Protocol version mismatch is logged but the session proceeds. | `crates/gs-sim/src/client_port.rs:258` | ✅ Fixed (P1): control links reject an unknown `ChallengeRequest.version`; fpp-session binds its version in the Noise prologue and handshake payloads; tokens carry `fpp-v` |
 | F13 | Medium | The VS "physics" check uses GS-claimed positions and GS-claimed time, sampled every ~2 s. It does not constrain a rogue GS and is bypassed by teleport-and-return. | `crates/vs/src/enforcer.rs` | ✅ Removed from the trust plane (P1): the VS no longer sees positions; the GS clamps intent (AUTH-01) and signs per-epoch Checkpoints over applied inputs and state. ✅ `fpp-audit` (M4, 04 §8.5) verifies Checkpoints independently from players' evidence bundles (signatures, chains, roots, acknowledgements, an outcome for every input, equivocation across bundles). Open: re-simulation (was each decision right?), which needs a title's headless build |
-| F14 | Low | Evidence ("DA log") is written to local files in the working directory: no integrity, durability or replication. | `crates/vs/src/streams.rs:401-420` | Evidence Store (P2) |
+| F14 | Low | Evidence ("DA log") is written to local files in the working directory: no integrity, durability or replication. | `crates/vs/src/streams.rs:401-420` | ✅ P2.3: the Evidence Store (`svc-evidence`), content addressed and checked on every read, written by Server Liveness only. Open: replication, retention, encryption at rest |
 | F15 | Low | Private key material is committed (`crates/client-core/keys/client_ed25519.pk8`, presumably a test key). `.pk8` files hold raw 32-byte seeds, not PKCS#8. | repo | ✅ Fixed (P0): keys untracked, `crates/*/keys/` ignored, CI guard fails on tracked key files |
 | F16 | Low | `cargo audit \|\| true`: advisories never fail CI. | `.github/workflows/ci.yml:39` | ✅ Fixed (P0): cargo-deny (advisories, licenses, bans, sources) is a blocking CI job; see F20 |
 | F17 | Low | `.gitignore` ignores `*.lock` while `Cargo.lock` is tracked. Lockfiles for binaries must be tracked for reproducible builds. | `.gitignore:23` | ✅ Fixed (P0) |
@@ -47,7 +47,7 @@ because several **chain together**.
 | ATT (attestation) | ◐ | Game servers: real TPM 2.0 admission (EK chain, credential activation, quote, boot and IMA logs, a Build Registry of CI builds with provenance; F05/F06/F21), tested end to end against swtpm; re-attestation during a session is TBD (the simulated TPM path is removed). Freshness (F04) and self-asserted AKs (F21) fixed in the prototype. No client attestation yet, but player-hosted joins now carry an AR slot (04 §7.7). |
 | ID (identity) | ✗ | Self-generated client keys; no account, device, or ban-durable identity. |
 | PROTO (protocol/crypto) | ◐ | QUIC + Ed25519 are good foundations. Unverified TLS, bincode tuples, no domain separation or versioning, no PQ, no datagrams. |
-| EVD (evidence) | ◐ | Hash-chained receipts + notarization exist (good instinct). Linear chain, local files, no log or witnesses. |
+| EVD (evidence) | ◐ | Hash-chained Checkpoints and InputCommits, players' evidence bundles and `fpp-audit` (P1, M4); a Transparency Log with a witness (P2.1); a content-addressed Evidence Store (P2.3). Not yet replicated or encrypted at rest. |
 | IA (Integrity Agent) | ✗ | Not started. |
 | DET (detection) | ✗ | Only the VS speed check. |
 | ENF (enforcement) | ◐ | Signed revocation events for accounts, devices, sessions, SATs, instances and builds, through a logged feed to Brokers, Server Liveness and game servers (P2.2); instance revocation also by SAR starvation. No appeals or two-person rule yet. |
@@ -211,8 +211,19 @@ revocation loses all its players to SAR lapse in 5–6.2 s (bound: one SAR
 lifetime). Scopes by region (Liveness, Broker) and queue (Broker) are
 honored. Open: the regional compacted topic and Bloom filter of §9 (one
 feed per cell today), scopes by title, and appeals.
-**Next (P2.3):** Evidence Store (Server Liveness still writes Checkpoints
-to local files).
+**Evidence Store ✅ (P2.3):** `svc-evidence` stores objects under the
+SHA-256 of their bytes, indexed by match, and re-checks every object on
+every read (a corrupted disk is refused, not served; the client checks
+again). Only Server Liveness writes (every Checkpoint it verified, queued
+and retried so a store outage never holds up SARs); only `audit` and
+`enforcement` read (`fpp-evidence`). The smoke test reads a match's
+Checkpoints back as an auditor and checks they form one chain. Open:
+replication across the region, retention, encryption at rest.
+**P2 status:** all four parts and the exit tests are done, in one regional
+cell of separate processes and keys (`tools::cell`, `deploy/cell` in CI,
+`deploy/pi`). What P2 left open is listed under each part above; the
+cross-cutting gaps are multi-region deployment, service metrics, and TPM
+2.0 re-attestation during a session.
 
 ### P3 — Real attestation (8–12 weeks, parallelizable per platform)
 Verifier appraisal for TPM 2.0 (EK chain, credential activation, TCG log

@@ -22,6 +22,7 @@ fpp-wire      = { path = "../fpp-wire" }
 fpp-crypto    = { path = "../fpp-crypto" }
 fpp-tokens    = { path = "../fpp-tokens" }
 fpp-svc       = { path = "../fpp-svc" }
+svc-evidence  = { path = "../svc-evidence" }
 attest-tpm    = { path = "../attest-tpm" }
 attest-core   = { path = "../attest-core" }
 

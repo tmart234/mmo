@@ -1,8 +1,8 @@
 //! Receive one signed Checkpoint per epoch (04 §8.1). Each must be signed by the instance
 //! key certified in this session's SARs, be for this session's match, and
 //! extend the `prev` chain epoch by epoch. Anything else is misbehavior and
-//! revokes the instance. Verified Checkpoints are kept as evidence (files
-//! until the Evidence Store and Log arrive in P2).
+//! revokes the instance. Verified Checkpoints go to the Evidence Store
+//! ([`crate::evidence`]).
 
 use anyhow::{bail, Result};
 use common::framing::recv_msg;
@@ -47,13 +47,6 @@ pub fn verify_checkpoint(
     Ok((cp.epoch, v.digest))
 }
 
-fn store(session_id: &[u8; 16], epoch: u32, cose: &[u8]) {
-    let dir = format!("evidence/{}", hex::encode(session_id));
-    if std::fs::create_dir_all(&dir).is_ok() {
-        let _ = std::fs::write(format!("{dir}/checkpoint-{epoch:08}.cose"), cose);
-    }
-}
-
 pub fn spawn_checkpoint_listener(conn: &Connection, ctx: Ctx, session_id: [u8; 16]) {
     let conn = conn.clone();
     tokio::spawn(async move {
@@ -90,7 +83,7 @@ pub fn spawn_checkpoint_listener(conn: &Connection, ctx: Ctx, session_id: [u8; 1
                     continue;
                 }
             };
-            store(&session_id, epoch, &submit.checkpoint);
+            ctx.keep_evidence(session_id, submit.checkpoint);
             if let Some(mut s) = ctx.sessions.get_mut(&session_id) {
                 s.last_checkpoint = Some((epoch, digest));
                 s.last_seen_ms = common::crypto::now_ms();

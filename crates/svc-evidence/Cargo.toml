@@ -1,0 +1,26 @@
+[package]
+name = "svc-evidence"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "The Evidence Store (03 §3): content-addressed evidence (Checkpoints), indexed by match, written by Server Liveness and read by auditors"
+
+[dependencies]
+anyhow        = { workspace = true }
+tokio         = { workspace = true }
+clap          = { workspace = true }
+sha2          = { workspace = true }
+hex           = { workspace = true }
+fpp-svc       = { path = "../fpp-svc" }
+
+[[bin]]
+name = "svc-evidence"
+path = "src/bin/svc-evidence.rs"
+
+[[bin]]
+name = "fpp-evidence"
+path = "src/bin/fpp-evidence.rs"
+
+[dev-dependencies]
+fpp-svc       = { path = "../fpp-svc" }
