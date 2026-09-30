@@ -120,6 +120,17 @@ tmart234/mmo (this repo, Rust, no Halo code)
   tools/linux_build.py          links libfpp_sdk.a
 ```
 
+The fork pins one commit of this repository (`COMMIT` in its
+`tools/fpp_sdk.py`), with that commit's `fpp.h` vendored, so every build of
+the game says exactly which SDK it carries. Nobody raises the pin by hand:
+the fork's "Update the fpp SDK" workflow runs `tools/fpp_sdk.py bump` every
+six hours, and at once when this repository's CI passes on main (the
+`dependents.yml` workflow here, given a `HALO_DISPATCH_TOKEN` secret). It
+takes the new commit only if the SDK's source changed, builds and tests
+every port with it, and merges when they pass. When they fail, the pull
+request stays open for a person, because the C ABI changed in a way the
+glue must follow.
+
 The port's game code assumes 32-bit pointers (Xbox heritage), so the desktop
 builds are 32-bit x86. Rust supports `i686-unknown-linux-gnu` and
 `i686-pc-windows-msvc` at Tier 1, so this is no obstacle.
