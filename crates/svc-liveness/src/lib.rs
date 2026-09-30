@@ -7,7 +7,8 @@
 //! - `tpm2`: TPM 2.0 evidence: EK chain, quote, logs, Build Registry,
 //!   credential activation (attest-tpm)
 //! - `liveness`: the SAR chain per game server
-//! - `checkpoints`: Checkpoint verification and evidence storage
+//! - `checkpoints`: Checkpoint verification
+//! - `evidence`: verified Checkpoints to the Evidence Store
 //! - `watchdog`: revoke when Checkpoints stop
 //! - `placement`: the cell API the Broker places players with
 //! - `revocation`: following the Revocation Feed
@@ -16,6 +17,7 @@ pub mod admission;
 pub mod checkpoints;
 pub mod config;
 pub mod ctx;
+pub mod evidence;
 pub mod liveness;
 pub mod placement;
 pub mod revocation;
@@ -35,6 +37,8 @@ pub struct Addrs {
     pub callers: Vec<String>,
     /// The Revocation Feed.
     pub feed: Option<SocketAddr>,
+    /// The Evidence Store (none: Checkpoints are verified, not kept).
+    pub evidence: Option<SocketAddr>,
 }
 
 /// Start Server Liveness with the key in `cell`, presenting `identity` to
@@ -46,8 +50,16 @@ pub fn start(
     config: config::LivenessConfig,
 ) -> Result<ctx::Ctx> {
     let key = fpp_svc::keys::ed25519(cell, "liveness", liveness::LIVENESS_ISS)?;
-    let ctx = ctx::Ctx::new(fpp_crypto::Ed25519Signer::new(key), config);
+    let mut ctx = ctx::Ctx::new(fpp_crypto::Ed25519Signer::new(key), config);
     let cell_identity = fpp_svc::cell::load(cell, "liveness")?;
+    if let Some(store) = addrs.evidence {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        ctx.evidence = Some(tx);
+        tokio::spawn(evidence::upload(
+            svc_evidence::Client::new(&cell_identity, store)?,
+            rx,
+        ));
+    }
     let cell_endpoint = fpp_svc::mtls::server_endpoint(&cell_identity, addrs.rpc)?;
     let (public, callers) = (addrs.public, addrs.callers);
     if let Some(feed) = addrs.feed {

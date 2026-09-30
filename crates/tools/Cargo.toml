@@ -37,3 +37,5 @@ fpp-wire = { path = "../fpp-wire" }
 ed25519-dalek = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }
+svc-evidence = { path = "../svc-evidence" }
+hex = { workspace = true }

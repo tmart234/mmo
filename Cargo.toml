@@ -21,6 +21,7 @@ members = [
     "crates/svc-verifier",
     "crates/svc-broker",
     "crates/svc-revocation",
+    "crates/svc-evidence",
     "crates/tools",
     "crates/client-core",
     "crates/client-bevy",

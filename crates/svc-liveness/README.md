@@ -17,5 +17,9 @@ svc-liveness --cell cell --bind 0.0.0.0:4444 --rpc 127.0.0.1:4454 \
   --tpm-ek-roots tpm-manufacturers.pem --build-registry build-registry.txt
 ```
 
-TBD: re-attestation during a session; Checkpoint evidence goes to local
-files until the Evidence Store (P2.3).
+With `--feed`, it follows the Revocation Feed (`revocation.rs`): a revoked
+instance gets no more SARs, and every event is relayed to the game servers
+here. With `--evidence`, every verified Checkpoint goes to the Evidence
+Store (`evidence.rs`).
+
+TBD: re-attestation during a session.

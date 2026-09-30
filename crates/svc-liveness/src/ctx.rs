@@ -21,6 +21,8 @@ pub struct Ctx {
     /// Revocation events seen so far (signed), sent to each game server
     /// as it joins.
     pub revocations: Arc<std::sync::Mutex<Revocations>>,
+    /// Verified Checkpoints on their way to the Evidence Store (none: not kept).
+    pub evidence: Option<tokio::sync::mpsc::UnboundedSender<([u8; 16], Vec<u8>)>>,
 }
 
 /// One admitted game server instance; its session id is also the id of the
@@ -49,6 +51,14 @@ impl Ctx {
             config,
             links: Arc::new(DashMap::new()),
             revocations: Arc::default(),
+            evidence: None,
+        }
+    }
+
+    /// Send a verified Checkpoint of match `session_id` to the Evidence Store.
+    pub fn keep_evidence(&self, session_id: [u8; 16], checkpoint: Vec<u8>) {
+        if let Some(tx) = &self.evidence {
+            let _ = tx.send((session_id, checkpoint));
         }
     }
 

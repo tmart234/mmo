@@ -1,5 +1,6 @@
 # systemd template for one service of the cell on a Raspberry Pi Zero 2 W:
-# fpp@log, fpp@revocation, fpp@liveness, fpp@verifier, fpp@broker. Each
+# fpp@log, fpp@revocation, fpp@evidence, fpp@liveness, fpp@verifier,
+# fpp@broker. Each
 # runs as its own user and
 # can read only its own directory of the cell (its signing seed, cell
 # identity and public TLS identity). Install: deploy/pi/README.md.
@@ -35,7 +36,7 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 # its own key directory, the shared public-key directory, its working directory
 ReadWritePaths=/var/lib/fpp/cell/%i /var/lib/fpp/cell/public /var/lib/fpp/work/%i
-# 512 MB RAM on the board: five services well inside it.
+# 512 MB RAM on the board: six services well inside it.
 MemoryMax=96M
 
 [Install]

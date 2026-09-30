@@ -5400,6 +5400,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "svc-evidence"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "fpp-svc",
+ "hex",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "svc-liveness"
 version = "0.1.0"
 dependencies = [
@@ -5420,6 +5432,7 @@ dependencies = [
  "quinn",
  "rand 0.8.8",
  "sha2",
+ "svc-evidence",
  "tokio",
 ]
 
@@ -5801,7 +5814,9 @@ dependencies = [
  "fpp-svc",
  "fpp-types",
  "fpp-wire",
+ "hex",
  "sha2",
+ "svc-evidence",
  "svc-revocation",
  "tokio",
 ]

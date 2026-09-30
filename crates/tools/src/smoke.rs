@@ -2,6 +2,9 @@
 // plane as a cell of separate services (tools::cell; the Transparency Log
 // and Revocation Feed run too, and `revocation_load` tests them):
 //
+// - Evidence Store: the match's verified Checkpoints, read back by an
+//   auditor, one unbroken chain
+//
 // - Server Liveness: GS admission (challenge + JoinRequest), SAR chain,
 //   Checkpoint verification, placement for the Broker (cell mutual TLS)
 // - Verifier: the client's session key and evidence -> AR
@@ -131,7 +134,19 @@ fn run_smoke_pass() -> Result<(bool, bool, bool)> {
     let gs_status = gs_child.wait().context("wait gs-sim")?;
     println!("[SMOKE] gs-sim: {:?}", gs_status.code());
 
-    // 5. Failure domains: Server Liveness down, the rest still serving.
+    // 5. The Evidence Store holds the match's Checkpoints as one chain.
+    let evidence_ok = match check_evidence() {
+        Ok(n) => {
+            println!("[SMOKE] Evidence Store: {n} Checkpoints of the match, one chain");
+            true
+        }
+        Err(e) => {
+            println!("[SMOKE] Evidence Store: FAILED: {e:#}");
+            false
+        }
+    };
+
+    // 6. Failure domains: Server Liveness down, the rest still serving.
     cell.stop("liveness");
     let without_liveness = client(&["--expect-refused"])?;
     let domains_ok = without_liveness.success() && cell.check_running().is_ok();
@@ -145,7 +160,42 @@ fn run_smoke_pass() -> Result<(bool, bool, bool)> {
     );
     drop(cell);
 
-    Ok((client_ok, gs_status.success(), domains_ok))
+    Ok((client_ok, gs_status.success() && evidence_ok, domains_ok))
+}
+
+/// Read the newest match's Checkpoints back from the Evidence Store (as the
+/// `audit` identity) and check they chain; how many.
+fn check_evidence() -> Result<usize> {
+    use fpp_wire::{Checkpoint, Payload};
+    let index = std::path::Path::new("cell/evidence/data/matches");
+    let newest = fs::read_dir(index)?
+        .filter_map(|e| e.ok())
+        .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
+        .context("no match in the Evidence Store")?;
+    let match_id: [u8; 16] = hex::decode(newest.file_name().to_string_lossy().as_bytes())?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("bad match id"))?;
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let audit = svc_evidence::Client::new(
+            &fpp_svc::cell::load(std::path::Path::new("cell"), "audit")?,
+            tools::cell::EVIDENCE_ADDR.parse()?,
+        )?;
+        let digests = audit.list(match_id).await?;
+        anyhow::ensure!(digests.len() >= 3, "only {} Checkpoints", digests.len());
+        let mut prev = fpp_types::Digest::default();
+        for (epoch, d) in digests.iter().enumerate() {
+            let cose = audit.get(*d).await?.context("listed but missing")?;
+            let cp = Checkpoint::from_cbor(&fpp_wire::cose::Sign1::decode(&cose)?.payload)?;
+            anyhow::ensure!(cp.match_id.0 == match_id, "Checkpoint of another match");
+            anyhow::ensure!(
+                cp.epoch as usize == epoch && cp.prev == prev,
+                "chain broken at epoch {epoch}"
+            );
+            prev = fpp_crypto::object_digest(&cose);
+        }
+        Ok(digests.len())
+    })
 }
 
 fn main() -> Result<()> {

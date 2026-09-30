@@ -23,6 +23,10 @@ struct Opts {
     /// The Revocation Feed's cell address.
     #[arg(long)]
     feed: Option<std::net::SocketAddr>,
+    /// The Evidence Store's cell address (without one, Checkpoints are
+    /// verified but not kept).
+    #[arg(long)]
+    evidence: Option<std::net::SocketAddr>,
     /// TLS certificate (DER) presented to game servers; must chain to the CA they pin.
     #[arg(long, default_value = "keys/liveness_tls.der")]
     tls_cert: String,
@@ -73,6 +77,9 @@ async fn main() -> Result<()> {
             )
         }
     );
+    if o.evidence.is_none() {
+        println!("[liveness] no --evidence: Checkpoints are verified, not kept");
+    }
     let identity = common::pki::ServerIdentity::load(&o.tls_cert, &o.tls_key)?;
     svc_liveness::start(
         &o.cell,
@@ -82,6 +89,7 @@ async fn main() -> Result<()> {
             rpc: o.rpc,
             callers: o.callers,
             feed: o.feed,
+            evidence: o.evidence,
         },
         config,
     )?;

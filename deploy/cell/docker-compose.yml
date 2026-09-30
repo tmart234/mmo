@@ -1,5 +1,5 @@
 # One regional cell of the trust plane (development): the Transparency Log,
-# the Revocation Feed, Server Liveness, the Verifier and the Broker, each in
+# the Revocation Feed, the Evidence Store, Server Liveness, the Verifier and the Broker, each in
 # its own container with its own key; Enforcement's key in a tool container.
 # Each service mounts only its own directory of the cell (its signing seed,
 # cell identity and public TLS identity), the cell CA certificate, and the
@@ -49,8 +49,8 @@ services:
           mv keys/$${s}_tls.key.der cell/$$s/public_tls.key.der
           chmod 600 cell/$$s/public_tls.key.der
         done
-        mkdir -p cell/public evidence
-        for s in log revocation liveness verifier broker enforcement public; do mkdir -p cellca/$$s; done
+        mkdir -p cell/public
+        for s in log revocation evidence liveness verifier broker enforcement audit public; do mkdir -p cellca/$$s; done
         cp cell/ca.der cellca/
 
   log:
@@ -76,6 +76,28 @@ services:
       - {type: volume, source: state, target: /cell, read_only: true, volume: {subpath: cellca}}
       - {type: volume, source: state, target: /cell/revocation, volume: {subpath: cell/revocation}}
       - {type: volume, source: state, target: /cell/public, volume: {subpath: cell/public}}
+
+  evidence:
+    <<: *service
+    networks:
+      cell:
+        ipv4_address: 172.30.0.15
+    command: svc-evidence --cell /cell --bind 0.0.0.0:4470
+    volumes:
+      - {type: volume, source: state, target: /cell, read_only: true, volume: {subpath: cellca}}
+      - {type: volume, source: state, target: /cell/evidence, volume: {subpath: cell/evidence}}
+
+  # Reading evidence, as an auditor:
+  #   docker compose -f deploy/cell/docker-compose.yml run --rm audit list <match hex>
+  audit:
+    <<: *service
+    profiles: [tools]
+    restart: "no"
+    networks: [cell]
+    entrypoint: [fpp-evidence, --cell, /cell, --store, "172.30.0.15:4470"]
+    volumes:
+      - {type: volume, source: state, target: /cell, read_only: true, volume: {subpath: cellca}}
+      - {type: volume, source: state, target: /cell/audit, read_only: true, volume: {subpath: cell/audit}}
 
   # Enforcement's key, made once; its public half goes into the bundle.
   enforcement-init:
@@ -104,15 +126,14 @@ services:
         ipv4_address: 172.30.0.10
     ports:
       - "4444:4444/udp"
-    working_dir: /var/lib/fpp
     command: >-
       svc-liveness --cell /cell --bind 0.0.0.0:4444 --rpc 0.0.0.0:4454 --feed 172.30.0.14:4460
+      --evidence 172.30.0.15:4470
       --tls-cert /cell/liveness/public_tls.der --tls-key /cell/liveness/public_tls.key.der
     volumes:
       - {type: volume, source: state, target: /cell, read_only: true, volume: {subpath: cellca}}
       - {type: volume, source: state, target: /cell/liveness, volume: {subpath: cell/liveness}}
       - {type: volume, source: state, target: /cell/public, volume: {subpath: cell/public}}
-      - {type: volume, source: state, target: /var/lib/fpp/evidence, volume: {subpath: evidence}}
 
   verifier:
     <<: *service
