@@ -551,10 +551,24 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 name = "fpp-crypto"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "ed25519-dalek",
  "fpp-types",
  "fpp-wire",
  "sha2",
+]
+
+[[package]]
+name = "fpp-log"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "fpp-crypto",
+ "fpp-merkle",
+ "fpp-types",
+ "fpp-wire",
+ "sha2",
+ "thiserror",
 ]
 
 [[package]]
@@ -926,6 +940,7 @@ dependencies = [
  "common",
  "ed25519-dalek",
  "fpp-crypto",
+ "fpp-log",
  "fpp-session",
  "fpp-tokens",
  "fpp-types",

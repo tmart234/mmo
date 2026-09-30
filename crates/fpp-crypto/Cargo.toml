@@ -11,6 +11,13 @@ fpp-types = { path = "../fpp-types" }
 fpp-wire = { path = "../fpp-wire" }
 ed25519-dalek = { workspace = true }
 sha2 = { workspace = true }
+# FPP-S1H (hybrid Ed25519 + ML-DSA-65) for the trust-plane services only:
+# the C SDK (fpp-ffi) does not enable it, so its cross builds need no aws-lc.
+aws-lc-rs = { workspace = true, optional = true }
+
+[features]
+default = []
+s1h = ["dep:aws-lc-rs"]
 
 [dev-dependencies]
 # Dev-only cycle (allowed by Cargo): the golden vectors cover every signed object.

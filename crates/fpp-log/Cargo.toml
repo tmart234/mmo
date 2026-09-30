@@ -1,0 +1,16 @@
+[package]
+name = "fpp-log"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "FPP Transparency Log: C2SP tlog-tiles, signed checkpoints, witness cosignatures, receipts and proofs"
+
+[dependencies]
+fpp-types = { path = "../fpp-types" }
+fpp-merkle = { path = "../fpp-merkle" }
+fpp-crypto = { path = "../fpp-crypto", features = ["s1h"] }
+fpp-wire = { path = "../fpp-wire" }
+ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
