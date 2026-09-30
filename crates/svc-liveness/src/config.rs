@@ -1,10 +1,10 @@
-//! The VS's configuration.
+//! Server Liveness configuration.
 
 /// Where a game server's binary is installed by default (`deploy/`).
 pub const DEFAULT_GS_PROGRAM_PATH: &str = "/opt/fpp/gs-sim";
 
 #[derive(Debug, Clone)]
-pub struct VsConfig {
+pub struct LivenessConfig {
     /// Maximum time skew allowed for JoinRequest timestamp (default: 30 s,
     /// for cross-region clocks).
     pub join_max_skew_ms: u64,
@@ -36,7 +36,7 @@ pub struct VsConfig {
     pub require_secure_boot: bool,
 }
 
-impl Default for VsConfig {
+impl Default for LivenessConfig {
     fn default() -> Self {
         Self {
             join_max_skew_ms: 30_000,

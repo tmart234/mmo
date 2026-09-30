@@ -1,21 +1,18 @@
-// crates/vs/src/ctx.rs
-use common::config::VsConfig;
-use common::keys::ServiceKeys;
+//! Server Liveness's shared state: its key, config and admitted servers.
+
+use crate::config::LivenessConfig;
 use dashmap::DashMap;
-use ed25519_dalek::SigningKey;
+use fpp_crypto::Ed25519Signer;
 use fpp_types::Digest;
 use std::sync::Arc;
 
 #[derive(Clone)]
-pub struct VsCtx {
-    /// Signs JoinAccepts (GS admission).
-    pub vs_sk: Arc<SigningKey>,
-    /// Verifier, Broker and Server Liveness role keys (04 §4).
-    pub keys: Arc<ServiceKeys>,
+pub struct Ctx {
+    /// Signs SARs (Server Liveness role, 04 §4); made in this service's own
+    /// cell directory.
+    pub key: Arc<Ed25519Signer>,
     pub sessions: Arc<DashMap<[u8; 16], Session>>,
-    pub config: VsConfig,
-    /// Client evidence policy and App Attest keys (P3).
-    pub attestation: Arc<crate::appraisal::ClientAttestation>,
+    pub config: LivenessConfig,
 }
 
 /// One admitted game server instance; its session id is also the id of the
@@ -32,19 +29,16 @@ pub struct Session {
     pub revoked: bool,
     /// Epoch and digest of the last verified Checkpoint (the `prev` chain).
     pub last_checkpoint: Option<(u32, Digest)>,
-    /// Next player slot the Broker hands out for this match.
+    /// Next player slot handed out (to the Broker) for this match.
     pub next_slot: u16,
 }
 
-impl VsCtx {
-    pub fn new_with_config(vs_sk: Arc<SigningKey>, config: VsConfig) -> Self {
-        let keys = Arc::new(ServiceKeys::derive(&vs_sk.to_bytes()));
+impl Ctx {
+    pub fn new(key: Ed25519Signer, config: LivenessConfig) -> Self {
         Self {
-            vs_sk,
-            keys,
+            key: Arc::new(key),
             sessions: Arc::new(DashMap::new()),
             config,
-            attestation: Arc::new(crate::appraisal::ClientAttestation::default()),
         }
     }
 
@@ -53,7 +47,7 @@ impl VsCtx {
             if !s.revoked {
                 s.revoked = true;
                 eprintln!(
-                    "[VS] REVOKED session {}.. ({why}); no further SARs",
+                    "[liveness] REVOKED session {}.. ({why}); no further SARs",
                     hex::encode(&session_id[..4])
                 );
             }

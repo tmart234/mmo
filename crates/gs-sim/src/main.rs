@@ -1,7 +1,6 @@
-// crates/gs-sim/src/main.rs
-//! Prototype game server: joins the VS, keeps its SAR chain, submits one
-//! signed Checkpoint per epoch, and serves one match to clients over
-//! fpp-session (see `game.rs`).
+//! Prototype game server: joins Server Liveness, keeps its SAR chain,
+//! submits one signed Checkpoint per epoch, and serves one match to clients
+//! over fpp-session (see `game.rs`).
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use common::{
@@ -9,8 +8,8 @@ use common::{
     framing::{recv_msg, send_msg, send_msg_continue},
     keys::KeyBundle,
     proto::{
-        AttestChallenge, ChallengeRequest, CheckpointSubmit, CredentialChallenge,
-        CredentialResponse, JoinAccept, JoinRequest, PeerRole, SarIssue, Sig,
+        CheckpointSubmit, CredentialChallenge, CredentialResponse, JoinAccept, JoinRequest,
+        SarIssue, Sig,
     },
     tpm::join_quote_nonce,
 };
@@ -20,14 +19,12 @@ use fpp_session::{Host, HostConfig, StaticKeypair};
 use fpp_tokens::SarChain;
 use fpp_types::{BuildId, DeviceTier, MatchId};
 use gs_sim::{
-    admission,
     game::{self, Match, MatchConfig},
     ledger::Ledger,
 };
-use quinn::{Connection, Endpoint};
 use rand::{rngs::OsRng, RngCore};
 use std::{
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
+    net::SocketAddr,
     path::PathBuf,
     sync::{atomic::AtomicBool, Arc},
     time::Duration,
@@ -36,9 +33,9 @@ use tokio::sync::{mpsc, watch};
 
 #[derive(Parser, Debug)]
 struct Opts {
-    /// VS address (ip:port)
+    /// Server Liveness address (ip:port).
     #[arg(long, default_value = "127.0.0.1:4444")]
-    vs: String,
+    liveness: SocketAddr,
 
     /// UDP address of the game port clients join (fpp-session).
     #[arg(long, default_value = "127.0.0.1:50000")]
@@ -61,8 +58,8 @@ struct Opts {
     gs_pk: String,
 
     /// A real TPM 2.0, through tpm2-tools (`TPM2TOOLS_TCTI`; default the
-    /// kernel's resource manager): the EK certificate, a quote over the VS's
-    /// challenge, the boot and IMA logs, and credential activation. The VS
+    /// kernel's resource manager): the EK certificate, a quote over Server Liveness's
+    /// challenge, the boot and IMA logs, and credential activation. Server Liveness
     /// then knows this binary's build from the kernel's measurement, not
     /// from the binary (F06).
     #[arg(long)]
@@ -81,15 +78,11 @@ struct Opts {
     #[arg(long, default_value = gs_sim::tpm2::IMA_LOG)]
     ima_log: PathBuf,
 
-    /// Pinned VS key for JoinAccept.
-    #[arg(long, default_value = "keys/vs_ed25519.pub")]
-    vs_pk: String,
-
     /// Key bundle: Verifier, Broker and Server Liveness keys.
     #[arg(long, default_value = common::keys::DEFAULT_BUNDLE)]
     bundle: String,
 
-    /// CA certificate (DER) the VS's TLS certificate must chain to.
+    /// CA certificate (DER) Server Liveness's TLS certificate must chain to.
     #[arg(long, default_value = common::pki::DEFAULT_CA_CERT)]
     ca_cert: String,
 }
@@ -99,7 +92,6 @@ async fn main() -> Result<()> {
     let opts = Opts::parse();
 
     let (gs_sk_long, gs_pk_long) = load_or_make_keys(&opts.gs_sk, &opts.gs_pk)?;
-    let pinned_vs = common::crypto::load_verifying_key(&opts.vs_pk)?;
     let ca_der = common::pki::load_ca(&opts.ca_cert)?;
     let bundle = KeyBundle::load(&opts.bundle)?;
     let keyset = bundle.keyset();
@@ -143,16 +135,11 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("bind game port {game_addr}"))?;
 
-    // ---- Control link to the VS (QUIC, pinned CA).
-    let (endpoint, server_addr) = make_endpoint_and_addr(&opts.vs)?;
-    let conn: Connection = endpoint
-        .connect_with(
-            common::pki::quic_client_config(&ca_der)?,
-            server_addr,
-            common::pki::VS_SERVER_NAME,
-        )?
-        .await?;
-    println!("[GS] connected to VS at {server_addr}");
+    // ---- Control link to Server Liveness (QUIC, pinned CA). Its
+    //      challenge comes first, so the quote covers a nonce it chose (F04).
+    let opened = common::admission::request_challenge(&ca_der, opts.liveness, "liveness").await?;
+    let (conn, mut jsend, mut jrecv) = (opened.conn, opened.send, opened.recv);
+    println!("[GS] connected to Server Liveness at {}", opts.liveness);
 
     let mut nonce = [0u8; 16];
     OsRng.fill_bytes(&mut nonce);
@@ -167,18 +154,6 @@ async fn main() -> Result<()> {
         &opts.game_addr,
     );
     let sig_gs: Sig = sign(&gs_sk_long, &to_sign).to_vec();
-
-    // Ask for the VS's challenge first so the quote covers a nonce the VS chose (F04).
-    let (mut jsend, mut jrecv) = conn.open_bi().await?;
-    send_msg_continue(
-        &mut jsend,
-        &ChallengeRequest {
-            version: common::proto::ADMISSION_VERSION,
-            role: PeerRole::GameServer,
-        },
-    )
-    .await?;
-    let challenge: AttestChallenge = recv_msg(&mut jrecv).await.context("recv AttestChallenge")?;
     let jr = JoinRequest {
         gs_id: opts.gs_id.clone(),
         sw_hash,
@@ -191,29 +166,30 @@ async fn main() -> Result<()> {
         gs_pub: gs_pk_long.to_bytes(),
         tpm2: match &tpm2 {
             Some(t) => Some(
-                t.evidence(&join_quote_nonce(&challenge.nonce, &to_sign))
+                t.evidence(&join_quote_nonce(&opened.challenge, &to_sign))
                     .context("TPM 2.0 evidence")?,
             ),
             None => None,
         },
     };
     if let Some(t) = &tpm2 {
-        // credential activation: the VS's secret, which only this TPM opens
+        // credential activation: a secret only this TPM opens
         send_msg_continue(&mut jsend, &jr).await?;
         let credential: CredentialChallenge = recv_msg(&mut jrecv)
             .await
-            .context("recv CredentialChallenge (the VS refused the TPM evidence?)")?;
+            .context("recv CredentialChallenge (TPM evidence refused?)")?;
         let secret = t.activate(&credential)?;
         send_msg(&mut jsend, &CredentialResponse { secret }).await?;
     } else {
         send_msg(&mut jsend, &jr).await?;
     }
+    // (over TLS to the pinned CA and name: no one else could have sent this
+    // JoinAccept; what blesses us is the SAR chain below)
     let ja: JoinAccept = recv_msg(&mut jrecv).await?;
-    admission::verify_join_accept(&pinned_vs, &ja)?;
     let session_id = ja.session_id;
     println!("[GS] joined; match {}..", hex::encode(&session_id[..4]));
 
-    // ---- SAR chain from the VS: verified, and must certify our own keys.
+    // ---- SAR chain from Server Liveness: verified, and must certify our own keys.
     let (sar_tx, sar_rx) = watch::channel::<Option<Vec<u8>>>(None);
     {
         let conn = conn.clone();
@@ -242,7 +218,7 @@ async fn main() -> Result<()> {
                     ours.then_some(())
                         .ok_or("SAR does not certify our keys".to_string())
                 }) {
-                    eprintln!("[GS] rejected SAR from VS: {e}; stopping");
+                    eprintln!("[GS] rejected SAR: {e}; stopping");
                     break;
                 }
                 if sar_tx.send(Some(issue.sar)).is_err() {
@@ -253,7 +229,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    // ---- Checkpoints to the VS.
+    // ---- Checkpoints to Server Liveness.
     let (cp_tx, mut cp_rx) = mpsc::unbounded_channel::<(u32, Vec<u8>)>();
     {
         let conn = conn.clone();
@@ -336,19 +312,4 @@ fn load_or_make_keys(sk_path: &str, pk_path: &str) -> Result<(SigningKey, Verify
         );
         Ok((sk, pk))
     }
-}
-
-/// Create a Quinn client Endpoint bound to an ephemeral UDP port.
-fn make_endpoint_and_addr(vs: &str) -> Result<(Endpoint, SocketAddr)> {
-    use quinn::{EndpointConfig, TokioRuntime};
-
-    let server_addr: SocketAddr = vs.parse().context("bad vs address")?;
-    let bind_ip = match server_addr {
-        SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-        SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-    };
-    let udp = UdpSocket::bind(SocketAddr::new(bind_ip, 0))?;
-    udp.set_nonblocking(true)?;
-    let endpoint = Endpoint::new(EndpointConfig::default(), None, udp, Arc::new(TokioRuntime))?;
-    Ok((endpoint, server_addr))
 }

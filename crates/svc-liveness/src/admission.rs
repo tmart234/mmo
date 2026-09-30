@@ -1,9 +1,7 @@
-// crates/vs/src/admission.rs
-//! Control-connection entry point. Every connection starts with
-//! `ChallengeRequest{role}` → `AttestChallenge` (single-use nonce, F04),
-//! then either a game server's `JoinRequest` or a client's
-//! `ClientAdmissionRequest` (handled by the stub Verifier and Broker in
-//! `broker.rs`).
+//! Game server admission: `ChallengeRequest` → `AttestChallenge`
+//! (single-use nonce, F04), then the GS's `JoinRequest` with its TPM 2.0
+//! evidence, credential activation, and `JoinAccept`. The GS then stays
+//! connected: SARs out, Checkpoints in.
 
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::VerifyingKey;
@@ -13,66 +11,27 @@ use std::time::Duration;
 use tokio::time::timeout;
 
 use crate::checkpoints::spawn_checkpoint_listener;
-use crate::ctx::{Session, VsCtx};
+use crate::ctx::{Ctx, Session};
 use crate::liveness::spawn_sar_loop;
 use crate::watchdog::spawn_watchdog;
 
 use common::{
-    crypto::{join_request_sign_bytes, now_ms, sign, verify},
+    admission::accept_challenge,
+    crypto::{join_request_sign_bytes, now_ms, verify},
     framing::{recv_msg, recv_msg_max, send_msg, send_msg_continue, MAX_JOIN_FRAME},
-    proto::{
-        AttestChallenge, ChallengeRequest, ClientAdmissionRequest, CredentialResponse, JoinAccept,
-        JoinRequest, PeerRole, Sig,
-    },
+    proto::{CredentialResponse, JoinAccept, JoinRequest},
 };
 
-pub use common::proto::ADMISSION_VERSION;
-
-/// Admit one peer. Game servers stay connected (SARs out, Checkpoints in);
-/// clients get their tokens and leave.
-pub async fn admit_and_run(connecting: quinn::Incoming, ctx: VsCtx) -> Result<()> {
-    // QUIC handshake, challenge and request under one deadline, so a peer
-    // that connects and goes quiet cannot hold a VS task forever (F08).
-    let deadline = Duration::from_millis(ctx.config.admission_timeout_ms);
-    let (conn, mut send, mut recv, role, challenge) = timeout(deadline, async {
-        let conn: Connection = connecting.await.context("handshake accept")?;
-        let (mut send, mut recv) = conn.accept_bi().await.context("accept_bi")?;
-        let hello: ChallengeRequest = recv_msg(&mut recv).await.context("recv ChallengeRequest")?;
-        if hello.version != ADMISSION_VERSION {
-            bail!("unsupported admission version {}", hello.version);
-        }
-        let mut challenge = [0u8; 32];
-        OsRng.fill_bytes(&mut challenge);
-        send_msg_continue(&mut send, &AttestChallenge { nonce: challenge })
-            .await
-            .context("send AttestChallenge")?;
-        Ok::<_, anyhow::Error>((conn, send, recv, hello.role, challenge))
-    })
-    .await
-    .map_err(|_| anyhow!("admission timed out after {} ms", deadline.as_millis()))??;
-
-    match role {
-        PeerRole::Client => {
-            let req: ClientAdmissionRequest = timeout(deadline, recv_msg(&mut recv))
-                .await
-                .map_err(|_| anyhow!("admission timed out after {} ms", deadline.as_millis()))?
-                .context("recv ClientAdmissionRequest")?;
-            let answer = crate::broker::admit_client(&ctx, &challenge, &req);
-            send_msg(&mut send, &answer)
-                .await
-                .context("send ClientAdmission")?;
-            // Let the reply drain before the connection is dropped.
-            let _ = timeout(Duration::from_secs(2), conn.closed()).await;
-            Ok(())
-        }
-        PeerRole::GameServer => {
-            let jr: JoinRequest = timeout(deadline, recv_msg_max(&mut recv, MAX_JOIN_FRAME))
-                .await
-                .map_err(|_| anyhow!("admission timed out after {} ms", deadline.as_millis()))?
-                .context("recv JoinRequest")?;
-            admit_game_server(conn, send, recv, jr, challenge, ctx).await
-        }
-    }
+/// Admit one game server and keep it connected.
+pub async fn admit_and_run(incoming: quinn::Incoming, ctx: Ctx) -> Result<()> {
+    let deadline = deadline_of(&ctx);
+    let o = accept_challenge(incoming, deadline).await?;
+    let (conn, send, mut recv) = (o.conn, o.send, o.recv);
+    let jr: JoinRequest = timeout(deadline, recv_msg_max(&mut recv, MAX_JOIN_FRAME))
+        .await
+        .map_err(|_| anyhow!("admission timed out after {} ms", deadline.as_millis()))?
+        .context("recv JoinRequest")?;
+    admit_game_server(conn, send, recv, jr, o.challenge, ctx).await
 }
 
 async fn admit_game_server(
@@ -81,10 +40,10 @@ async fn admit_game_server(
     mut recv: quinn::RecvStream,
     jr: JoinRequest,
     challenge: [u8; 32],
-    ctx: VsCtx,
+    ctx: Ctx,
 ) -> Result<()> {
     println!(
-        "[VS] JoinRequest from gs_id={} (instance ..{:02x}{:02x}, game port {})",
+        "[liveness] JoinRequest from gs_id={} (instance ..{:02x}{:02x}, game port {})",
         jr.gs_id, jr.ephemeral_pub[0], jr.ephemeral_pub[1], jr.game_addr
     );
 
@@ -117,8 +76,8 @@ async fn admit_game_server(
     }
 
     // 3) The build. With TPM 2.0 evidence it is what the kernel measured
-    //    (a registered build, F06), not what the GS says; a VS with a Build
-    //    Registry admits nothing else (without one: development).
+    //    (a registered build, F06), not what the GS says; with a Build
+    //    Registry nothing else is admitted (without one: development).
     let tpm2 = match &jr.tpm2 {
         Some(evidence) => Some(
             crate::tpm2::appraise_join(
@@ -132,7 +91,7 @@ async fn admit_game_server(
             .context("TPM 2.0 appraisal failed")?,
         ),
         None if !ctx.config.build_registry.is_empty() => {
-            bail!("TPM 2.0 evidence required: the VS admits registered builds only, as the kernel measured them")
+            bail!("TPM 2.0 evidence required: only registered builds are admitted, as the kernel measured them")
         }
         None => None,
     };
@@ -148,7 +107,7 @@ async fn admit_game_server(
             .context("recv CredentialResponse")?;
         crate::tpm2::check_activation(admission, &answer.secret)?;
         println!(
-            "[VS] TPM 2.0: EK ..{} certified and its AK activated; secure boot {:?}; build {}",
+            "[liveness] TPM 2.0: EK ..{} certified and its AK activated; secure boot {:?}; build {}",
             hex::encode(&admission.ek_digest[28..]),
             admission.secure_boot,
             admission
@@ -179,13 +138,9 @@ async fn admit_game_server(
         },
     );
 
-    let sig_vs: Sig = sign(ctx.vs_sk.as_ref(), &session_id).to_vec();
-    let ja = JoinAccept {
-        session_id,
-        sig_vs,
-        vs_pub: ctx.vs_sk.verifying_key().to_bytes(),
-    };
-    send_msg(&mut send, &ja).await.context("send JoinAccept")?;
+    send_msg(&mut send, &JoinAccept { session_id })
+        .await
+        .context("send JoinAccept")?;
 
     spawn_sar_loop(&conn, ctx.clone(), session_id);
     spawn_checkpoint_listener(&conn, ctx.clone(), session_id);
@@ -193,16 +148,17 @@ async fn admit_game_server(
     Ok(())
 }
 
-fn deadline_of(ctx: &VsCtx) -> Duration {
+fn deadline_of(ctx: &Ctx) -> Duration {
     Duration::from_millis(ctx.config.admission_timeout_ms)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::{config::VsConfig, pki};
+    use crate::config::LivenessConfig;
+    use common::pki;
     use ed25519_dalek::SigningKey;
-    use std::sync::Arc;
+    use fpp_crypto::Ed25519Signer;
 
     /// F08: a peer that completes the QUIC handshake but never sends a
     /// request is dropped at the admission deadline.
@@ -210,7 +166,7 @@ mod tests {
     async fn idle_peer_is_dropped_at_admission_deadline() {
         let dev = pki::DevPki::generate().unwrap();
         let server = quinn::Endpoint::server(
-            pki::quic_server_config(&dev.vs).unwrap(),
+            pki::quic_server_config(dev.service("liveness")).unwrap(),
             "127.0.0.1:0".parse().unwrap(),
         )
         .unwrap();
@@ -221,16 +177,16 @@ mod tests {
             .connect_with(
                 pki::quic_client_config(&dev.ca_cert_der).unwrap(),
                 addr,
-                pki::VS_SERVER_NAME,
+                &pki::server_name("liveness"),
             )
             .unwrap();
 
         let incoming = server.accept().await.unwrap();
-        let config = VsConfig {
+        let config = LivenessConfig {
             admission_timeout_ms: 200,
-            ..VsConfig::default()
+            ..LivenessConfig::default()
         };
-        let ctx = VsCtx::new_with_config(Arc::new(SigningKey::from_bytes(&[3; 32])), config);
+        let ctx = Ctx::new(Ed25519Signer::new(SigningKey::from_bytes(&[3; 32])), config);
 
         // The client completes the handshake, then stays connected and silent.
         let client_task = tokio::spawn(async move {

@@ -69,6 +69,29 @@ jobs:
           rustup target add i686-unknown-linux-gnu
           make ffi-c-test-i686
 
+  # One regional cell in containers (deploy/cell): the image builds, the
+  # three services start with their own keys, and the key bundle is gathered.
+  cell-containers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and start the cell
+        run: docker compose -f deploy/cell/docker-compose.yml up -d --build
+      - name: Key bundle gathered, services running
+        run: |
+          compose="docker compose -f deploy/cell/docker-compose.yml"
+          for i in $(seq 30); do
+            $compose ps -a bundle --format '{{.State}} {{.ExitCode}}' | grep -q '^exited 0$' && break
+            sleep 2
+          done
+          $compose ps -a bundle --format '{{.State}} {{.ExitCode}}' | grep -q '^exited 0$'
+          test "$($compose ps --status running --services | sort | tr '\n' ' ')" = "broker liveness verifier "
+          $compose logs
+      - name: Stop the cell
+        if: always()
+        run: docker compose -f deploy/cell/docker-compose.yml down -v
+
   # Advisories (RustSec, same database as cargo-audit), licenses, bans and
   # sources, per deny.toml. Blocking.
   dependency-policy:

@@ -17,7 +17,6 @@ path = "src/bin/client_sim.rs"
 anyhow         = { workspace = true }
 clap           = { workspace = true }
 tokio          = { workspace = true }
-quinn          = { workspace = true }
 bincode        = { workspace = true }
 ed25519-dalek  = { workspace = true }
 common         = { path = "../common" }

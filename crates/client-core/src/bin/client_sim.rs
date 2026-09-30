@@ -6,9 +6,12 @@ use tokio::time::Duration;
 
 #[derive(Parser, Debug)]
 struct Opts {
-    /// VS control address (stub Verifier + Broker).
-    #[arg(long, default_value = "127.0.0.1:4444")]
-    vs: String,
+    /// The Verifier's address.
+    #[arg(long, default_value = "127.0.0.1:4445")]
+    verifier: std::net::SocketAddr,
+    /// The Broker's address.
+    #[arg(long, default_value = "127.0.0.1:4446")]
+    broker: std::net::SocketAddr,
     /// Queue to join: `open` (any device) or `verified` (tier D2+).
     #[arg(long, default_value = "open")]
     queue: String,
@@ -24,12 +27,16 @@ struct Opts {
 async fn main() -> Result<()> {
     let opts = Opts::parse();
     let trust = ClientTrust::load_default()?;
+    let services = Services {
+        verifier: opts.verifier,
+        broker: opts.broker,
+    };
 
-    // The GS needs a moment to join the VS and sign its first Checkpoint.
+    // The GS needs a moment to join Server Liveness and sign its first Checkpoint.
     let mut attempt = 0;
     let creds = loop {
         attempt += 1;
-        match request_admission(&opts.vs, &trust, &opts.queue).await {
+        match request_admission(&services, &trust, &opts.queue).await {
             Ok(c) => break c,
             Err(e) => {
                 if let Some(SessionEnd::Refused(code)) = e.downcast_ref::<SessionEnd>() {

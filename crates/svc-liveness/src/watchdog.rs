@@ -1,12 +1,11 @@
-// crates/vs/src/watchdog.rs
 use quinn::Connection;
 use tokio::time::{sleep, Duration};
 
-use crate::ctx::VsCtx;
+use crate::ctx::Ctx;
 use common::crypto::now_ms;
 
 /// Revoke and close when Checkpoints stop arriving, or once revoked.
-pub fn spawn_watchdog(conn: &Connection, ctx: VsCtx, session_id: [u8; 16]) {
+pub fn spawn_watchdog(conn: &Connection, ctx: Ctx, session_id: [u8; 16]) {
     let conn = conn.clone();
     let ctx = ctx.clone();
 
@@ -23,7 +22,7 @@ pub fn spawn_watchdog(conn: &Connection, ctx: VsCtx, session_id: [u8; 16]) {
 
             if revoked {
                 eprintln!(
-                    "[VS] watchdog closing session {}.. (revoked)",
+                    "[liveness] watchdog closing session {}.. (revoked)",
                     hex::encode(&session_id[..4])
                 );
                 conn.close(0u32.into(), b"revoked");

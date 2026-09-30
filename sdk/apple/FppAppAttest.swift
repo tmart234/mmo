@@ -5,7 +5,7 @@
 //
 // Flow:
 //   first admission on this install:
-//     challenge = fpp_attest_challenge(vs_challenge, session_pub)   (C SDK)
+//     challenge = fpp_attest_challenge(verifier_challenge, session_pub)   (C SDK)
 //     (keyId, attestation) = try await FppAppAttest.attest(challenge)
 //     evidence = fpp_evidence_apple_attest(attestation)
 //   later admissions:

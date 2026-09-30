@@ -255,14 +255,14 @@ enum FppStatus fpp_sha256(const uint8_t *data, size_t len, uint8_t *out);
 enum FppStatus fpp_object_digest(const uint8_t *object, size_t len, uint8_t *out);
 
 // The challenge a device binds its platform evidence to (roadmap P3):
-// `SHA-256("fpp/1/attest-challenge" || 0x00 || vs_challenge || session_pub)`.
+// `SHA-256("fpp/1/attest-challenge" || 0x00 || verifier_challenge || session_pub)`.
 // Pass it to Android `KeyGenParameterSpec.Builder.setAttestationChallenge`
 // or as the App Attest `clientDataHash`. Evidence made for another admission
 // challenge or another session key does not verify.
 //
 // # Safety
-// `vs_challenge`, `session_pub` and `out` valid for 32 bytes each.
-enum FppStatus fpp_attest_challenge(const uint8_t *vs_challenge,
+// `verifier_challenge`, `session_pub` and `out` valid for 32 bytes each.
+enum FppStatus fpp_attest_challenge(const uint8_t *verifier_challenge,
                                     const uint8_t *session_pub,
                                     uint8_t *out);
 

@@ -1,4 +1,3 @@
-// crates/vs/src/checkpoints.rs
 //! Receive one signed Checkpoint per epoch (04 §8.1). Each must be signed by the instance
 //! key certified in this session's SARs, be for this session's match, and
 //! extend the `prev` chain epoch by epoch. Anything else is misbehavior and
@@ -14,7 +13,7 @@ use fpp_types::{Digest, MatchId};
 use fpp_wire::Checkpoint;
 use quinn::Connection;
 
-use crate::ctx::VsCtx;
+use crate::ctx::Ctx;
 
 /// Check a Checkpoint against the session's instance key and chain.
 /// Returns its epoch and digest.
@@ -55,21 +54,21 @@ fn store(session_id: &[u8; 16], epoch: u32, cose: &[u8]) {
     }
 }
 
-pub fn spawn_checkpoint_listener(conn: &Connection, ctx: VsCtx, session_id: [u8; 16]) {
+pub fn spawn_checkpoint_listener(conn: &Connection, ctx: Ctx, session_id: [u8; 16]) {
     let conn = conn.clone();
     tokio::spawn(async move {
         loop {
             let mut uni = match conn.accept_uni().await {
                 Ok(u) => u,
                 Err(e) => {
-                    eprintln!("[VS] accept_uni: {e}");
+                    eprintln!("[liveness] accept_uni: {e}");
                     break;
                 }
             };
             let submit: CheckpointSubmit = match recv_msg(&mut uni).await {
                 Ok(m) => m,
                 Err(e) => {
-                    eprintln!("[VS] bad CheckpointSubmit: {e:#}");
+                    eprintln!("[liveness] bad CheckpointSubmit: {e:#}");
                     continue;
                 }
             };

@@ -8,12 +8,11 @@
 //!
 //! Keys: the log's is hybrid (FPP-S1H), made on first start in its own cell
 //! directory; the witness's is its own Ed25519 key. Each publishes its
-//! public keys in `<cell>/<service>/public` for the others to read.
+//! public keys in `<cell>/public/<service>` for the others to read.
 
-use std::path::Path;
-
-use anyhow::{anyhow, Context, Result};
-use fpp_log::{b64, Log};
+use anyhow::{anyhow, Result};
+use fpp_log::Log;
+pub use fpp_svc::PublicKeys;
 use fpp_svc::{rpc::serve, Caller};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -48,54 +47,6 @@ pub enum Response {
     Proof(Vec<[u8; 32]>),
     Done,
     Refused(String),
-}
-
-/// A service's published public keys: `key value` lines.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct PublicKeys {
-    pub name: String,
-    pub ed25519: [u8; 32],
-    pub ml_dsa: Option<Vec<u8>>,
-}
-
-impl PublicKeys {
-    pub fn write(&self, cell: &Path, service: &str) -> Result<()> {
-        let mut text = format!(
-            "name {}\ned25519 {}\n",
-            self.name,
-            b64::encode(&self.ed25519)
-        );
-        if let Some(ml) = &self.ml_dsa {
-            text.push_str(&format!("ml-dsa-65 {}\n", b64::encode(ml)));
-        }
-        std::fs::write(cell.join(service).join("public"), text)?;
-        Ok(())
-    }
-
-    pub fn read(cell: &Path, service: &str) -> Result<PublicKeys> {
-        let path = cell.join(service).join("public");
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("read {} (start {service} first)", path.display()))?;
-        let mut out = PublicKeys::default();
-        for line in text.lines() {
-            let (k, v) = line
-                .split_once(' ')
-                .ok_or_else(|| anyhow!("{}: bad line", path.display()))?;
-            match k {
-                "name" => out.name = v.to_string(),
-                "ed25519" => {
-                    out.ed25519 = b64::decode(v)
-                        .and_then(|b| b.try_into().ok())
-                        .ok_or_else(|| anyhow!("ed25519 key"))?
-                }
-                "ml-dsa-65" => {
-                    out.ml_dsa = Some(b64::decode(v).ok_or_else(|| anyhow!("ml-dsa key"))?)
-                }
-                _ => {}
-            }
-        }
-        Ok(out)
-    }
 }
 
 pub struct LogConfig {

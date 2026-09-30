@@ -1,8 +1,8 @@
 //! A game server's TPM 2.0 evidence, gathered with tpm2-tools (the TCTI in
 //! `TPM2TOOLS_TCTI`, default the kernel's resource manager): the EK and its
-//! certificate from NV, an Attestation Key, quotes over the VS's challenge,
+//! certificate from NV, an Attestation Key, quotes over Server Liveness's challenge,
 //! the firmware's and kernel's measurement logs, and credential
-//! activation. The VS appraises it (`vs/src/tpm2.rs`, `attest-tpm`).
+//! activation. Server Liveness appraises it (`svc-liveness/src/tpm2.rs`, `attest-tpm`).
 //!
 //! For the kernel to measure the GS binary, the machine needs an IMA policy
 //! that measures executables (boot with `ima_policy=tcb`, or a policy with
@@ -175,7 +175,7 @@ impl Tpm2 {
             .join(",");
         let selection = format!("sha256:{list}");
         // (the logs first: a measurement between reading them and quoting
-        // would make them stale, and the VS would refuse the join)
+        // would make them stale, and Server Liveness would refuse the join)
         let boot_log = read_optional(&self.opts.boot_log)?;
         let ima_log = read_optional(&self.opts.ima_log)?;
         t.run(&[
@@ -210,7 +210,7 @@ impl Tpm2 {
         })
     }
 
-    /// `TPM2_ActivateCredential`: the VS's secret, if it was made for this
+    /// `TPM2_ActivateCredential`: Server Liveness's secret, if it was made for this
     /// TPM's EK and AK.
     pub fn activate(&self, challenge: &CredentialChallenge) -> Result<Vec<u8>> {
         let dir = &self.opts.workdir;

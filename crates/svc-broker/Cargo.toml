@@ -1,0 +1,33 @@
+[package]
+name = "svc-broker"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "The Broker (04 §5.2): admits a client with an Attestation Result to a match on a live game server and signs its Session Admission Token, with its own key, in its own process"
+
+[dependencies]
+anyhow         = { workspace = true }
+tokio          = { workspace = true }
+quinn          = { workspace = true }
+clap           = { workspace = true }
+ed25519-dalek  = { workspace = true }
+sha2           = { workspace = true }
+rand           = { workspace = true }
+hex            = { workspace = true }
+
+common         = { path = "../common" }
+fpp-types      = { path = "../fpp-types" }
+fpp-crypto     = { path = "../fpp-crypto" }
+fpp-tokens     = { path = "../fpp-tokens" }
+fpp-svc        = { path = "../fpp-svc" }
+
+[[bin]]
+name = "svc-broker"
+path = "src/main.rs"
+
+[dev-dependencies]
+client-core    = { path = "../client-core" }
+svc-liveness   = { path = "../svc-liveness" }
+svc-verifier   = { path = "../svc-verifier" }
+fpp-types      = { path = "../fpp-types" }

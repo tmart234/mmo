@@ -17,7 +17,6 @@ path = "src/main.rs"
 anyhow        = { workspace = true }
 
 tokio         = { workspace = true }
-quinn         = { workspace = true }
 
 bincode       = { workspace = true }
 

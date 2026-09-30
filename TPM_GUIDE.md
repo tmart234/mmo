@@ -1,18 +1,18 @@
 # TPM Guide: Admitting a Game Server by Its Hardware and Its Build
 
-A game server (GS) is admitted by the Validation Server (VS) with evidence
+A game server (GS) is admitted by Server Liveness (`svc-liveness`) with evidence
 from its TPM 2.0. The GS never vouches for itself: the TPM manufacturer
 vouches for the TPM, the TPM vouches for what was measured, and the kernel
-measured the GS binary before it ran. The VS checks all of it
-(`crates/attest-tpm`, `crates/vs/src/tpm2.rs`); the design is in
+measured the GS binary before it ran. Server Liveness checks all of it
+(`crates/attest-tpm`, `crates/svc-liveness/src/tpm2.rs`); the design is in
 [docs/anticheat/10-attestation-and-secure-boot.md](docs/anticheat/10-attestation-and-secure-boot.md)
 §5, the findings it closes (F05, F06, F21) in
 [docs/anticheat/07-gap-analysis-and-roadmap.md](docs/anticheat/07-gap-analysis-and-roadmap.md).
 
-## What the VS checks at admission
+## What Server Liveness checks at admission
 
 ```text
-GS (gs-sim --tpm2, tpm2-tools)                         VS
+GS (gs-sim --tpm2, tpm2-tools)                         Server Liveness
   ChallengeRequest ─────────────────────────────────►
                    ◄──────────────────────────────── AttestChallenge (fresh nonce)
   JoinRequest + Tpm2Evidence ───────────────────────► 1. EK certificate → manufacturer root (--tpm-ek-roots)
@@ -41,16 +41,16 @@ measures executables with SHA-256 (kernel command line
 at `/opt/fpp/gs-sim`, then:
 
 ```bash
-gs-sim --tpm2 --vs vs.example:4444
+gs-sim --tpm2 --liveness 203.0.113.10:4444
 #   --tpm2-pcrs 0,1,2,3,4,5,6,7,10   (default)
 #   --tpm2-ek-intermediates ca.pem   (if the TPM's NV does not hold them)
 #   TPM2TOOLS_TCTI=device:/dev/tpmrm0 (the default)
 ```
 
-**The VS**:
+**Server Liveness**:
 
 ```bash
-vs --tpm-ek-roots tpm-manufacturers.pem \
+svc-liveness --tpm-ek-roots tpm-manufacturers.pem \
    --build-registry build-registry.txt \
    --gs-program /opt/fpp/gs-sim \
    --require-secure-boot
@@ -73,7 +73,7 @@ vs --tpm-ek-roots tpm-manufacturers.pem \
 - `swtpm` gives a real TPM 2.0 (libtpms) in software. `gs_sim::tpm2::swtpm`
   starts one with an EK certificate from a CA of its own, as the tests do
   (`crates/attest-tpm/tests/swtpm.rs`, the admission test in
-  `crates/vs/src/tpm2.rs`). CI installs swtpm and tpm2-tools and requires
+  `crates/svc-liveness/src/tpm2.rs`). CI installs swtpm and tpm2-tools and requires
   those tests (`FPP_REQUIRE_SWTPM=1`).
 
 ## Limits

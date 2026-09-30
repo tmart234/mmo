@@ -1,13 +1,10 @@
 //! F07: frame lengths are checked against a cap before any allocation.
 
 use common::framing::{decode_frame, frame_len, MAX_CONTROL_FRAME};
-use common::proto::{ChallengeRequest, PeerRole};
+use common::proto::ChallengeRequest;
 
 fn hello() -> ChallengeRequest {
-    ChallengeRequest {
-        version: 1,
-        role: PeerRole::Client,
-    }
+    ChallengeRequest { version: 1 }
 }
 
 fn frame(payload: &[u8]) -> Vec<u8> {

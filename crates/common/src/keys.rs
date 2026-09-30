@@ -1,54 +1,18 @@
-//! FPP service keys for the prototype (04-protocol.md §4).
+//! The regional key bundle (04-protocol.md §4): the public keys of the
+//! Verifier (ARs), the Broker (SATs) and Server Liveness (SARs), which
+//! relying parties (clients, game servers) trust.
 //!
-//! The prototype VS plays three FPP roles until P2 splits it into services:
-//! Verifier (signs ARs), Broker (signs SATs) and Server Liveness (signs
-//! SARs). Each role has its own key, because a key may sign only its role's
-//! contexts. For development they are derived from the one VS seed on disk;
-//! relying parties load only the public **key bundle** (`keys/fpp_key_bundle.json`),
-//! which in production is signed by the Publisher Root chain and fetched per region.
+//! Each service makes its own signing key in its own cell directory and
+//! publishes only the public half (`fpp-svc`); `fpp-cell bundle` gathers
+//! them into `keys/fpp_key_bundle.json`. In production the bundle is signed
+//! by the Publisher Root chain and fetched per region.
 
 use anyhow::{Context, Result};
-use ed25519_dalek::{SigningKey, VerifyingKey};
-use fpp_crypto::{Ed25519Signer, KeyRole, KeySet};
-use sha2::{Digest, Sha256};
+use ed25519_dalek::VerifyingKey;
+use fpp_crypto::{KeyRole, KeySet};
 use std::path::Path;
 
 pub const DEFAULT_BUNDLE: &str = "keys/fpp_key_bundle.json";
-
-/// The VS's role keys.
-pub struct ServiceKeys {
-    pub verifier: Ed25519Signer,
-    pub broker: Ed25519Signer,
-    pub liveness: Ed25519Signer,
-}
-
-fn derive(role: &str, seed: &[u8; 32]) -> Ed25519Signer {
-    let mut h = Sha256::new();
-    h.update(b"mmo/dev-role-key/v1\0");
-    h.update(role.as_bytes());
-    h.update([0]);
-    h.update(seed);
-    Ed25519Signer::new(SigningKey::from_bytes(&h.finalize().into()))
-}
-
-impl ServiceKeys {
-    /// Derive the three role keys from the VS seed (dev only).
-    pub fn derive(vs_seed: &[u8; 32]) -> Self {
-        Self {
-            verifier: derive("verifier-ar", vs_seed),
-            broker: derive("broker-sat", vs_seed),
-            liveness: derive("server-liveness", vs_seed),
-        }
-    }
-
-    pub fn bundle(&self) -> KeyBundle {
-        KeyBundle {
-            verifier_ar: self.verifier.verifying_key(),
-            broker_sat: self.broker.verifying_key(),
-            server_liveness: self.liveness.verifying_key(),
-        }
-    }
-}
 
 /// Public keys relying parties trust, by role.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,7 +46,7 @@ impl KeyBundle {
         let path = path.as_ref();
         let text = std::fs::read_to_string(path).with_context(|| {
             format!(
-                "read {} (generate it with `cargo run -p tools --bin gen_keys`)",
+                "read {} (gather it with `fpp-cell bundle` once the services have started)",
                 path.display()
             )
         })?;
@@ -104,13 +68,16 @@ impl KeyBundle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
 
     #[test]
-    fn roles_get_distinct_keys_and_the_bundle_round_trips() {
-        let keys = ServiceKeys::derive(&[7; 32]);
-        let b = keys.bundle();
-        assert_ne!(b.verifier_ar, b.broker_sat);
-        assert_ne!(b.broker_sat, b.server_liveness);
+    fn the_bundle_round_trips() {
+        let key = |n: u8| SigningKey::from_bytes(&[n; 32]).verifying_key();
+        let b = KeyBundle {
+            verifier_ar: key(1),
+            broker_sat: key(2),
+            server_liveness: key(3),
+        };
         let dir = std::env::temp_dir().join(format!("bundle-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("b.json");

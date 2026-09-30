@@ -3,7 +3,7 @@
 // the game's Android app. The Halo port's app is port/android/app.
 //
 // Flow, per admission:
-//   1. challenge = fpp_attest_challenge(vs_challenge, session_pub)   (C SDK)
+//   1. challenge = fpp_attest_challenge(verifier_challenge, session_pub)   (C SDK)
 //   2. chain     = FppKeyAttestation.attest(challenge, ...)          (this file)
 //   3. evidence  = fpp_evidence_android_key(chain)                    (C SDK)
 //   4. send evidence in ClientAdmissionRequest; the Verifier appraises it

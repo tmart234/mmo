@@ -15,6 +15,8 @@ rcgen = { workspace = true }
 serde = { workspace = true }
 x509-parser = { workspace = true }
 rand = { workspace = true }
+hex = { workspace = true }
+ed25519-dalek = { workspace = true }
 common = { path = "../common" }
 
 [[bin]]

@@ -1,13 +1,9 @@
-// crates/tools/src/bin/play.rs
-// Launch VS + GS (no --test-once), give the GS time to join, then run the Bevy client.
+// Launch a dev cell (Server Liveness, Verifier, Broker) and a GS (no
+// --test-once), give the GS time to join, then run the Bevy client.
 // Cleans up children on Bevy exit or Ctrl-C.
 
 use anyhow::{Context, Result};
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 use std::{
-    fs,
-    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -16,49 +12,7 @@ use std::{
     thread,
     time::Duration,
 };
-
-#[cfg(target_os = "windows")]
-const BIN_EXT: &str = ".exe";
-#[cfg(not(target_os = "windows"))]
-const BIN_EXT: &str = "";
-
-// Resolve path to target/{debug|release}/{bin}
-fn bin_path(bin: &str, profile: &str) -> PathBuf {
-    let tools_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = tools_dir
-        .parent() // crates/
-        .and_then(|p| p.parent()) // workspace root
-        .expect("could not locate workspace root");
-
-    workspace_root
-        .join("target")
-        .join(profile)
-        .join(format!("{bin}{BIN_EXT}"))
-}
-
-// Ensure VS has signing keys so GS/clients can pin VS.
-fn ensure_vs_keys() -> Result<()> {
-    let skp = PathBuf::from("keys/vs_ed25519.pk8");
-    let pkp = PathBuf::from("keys/vs_ed25519.pub");
-    if common::pki::ensure_dev_pki("keys").context("dev PKI")? {
-        println!("[PLAY] generated dev PKI under keys/");
-    }
-
-    if skp.exists() && pkp.exists() {
-        return Ok(());
-    }
-    fs::create_dir_all("keys").context("mkdir keys")?;
-    let sk = SigningKey::generate(&mut OsRng);
-    let pk = sk.verifying_key();
-    fs::write(&skp, sk.to_bytes()).context("write vs_sk")?;
-    fs::write(&pkp, pk.to_bytes()).context("write vs_pk")?;
-    println!(
-        "[PLAY] generated VS dev keys: {}, {}",
-        skp.display(),
-        pkp.display()
-    );
-    Ok(())
-}
+use tools::cell::{bin_path, ensure_dev_keys, Cell, Launch};
 
 fn main() -> Result<()> {
     // Profile selector for child binaries (debug by default).
@@ -76,43 +30,29 @@ fn main() -> Result<()> {
         .context("install ctrl-c handler")?;
     }
 
-    // 1) Keys for VS
-    ensure_vs_keys()?;
+    // 1) Keys, and the cell
+    ensure_dev_keys()?;
+    let cell = Cell::start(&Launch::from_env(&profile))?;
 
-    // 2) Paths to child binaries
-    let vs_bin = bin_path("vs", &profile);
+    // 2) GS (no --test-once so it runs indefinitely)
     let gs_sim_bin = bin_path("gs-sim", &profile);
-
-    // 3) Spawn VS (QUIC on 127.0.0.1:4444)
-    let mut vs_child = Command::new(&vs_bin)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .with_context(|| format!("spawn {:?}", vs_bin))?;
-
-    // Give VS a moment to bind
-    thread::sleep(Duration::from_millis(200));
-
-    // 4) Spawn GS (no --test-once so it runs indefinitely)
     let mut gs_child = Command::new(&gs_sim_bin)
-        .arg("--vs")
-        .arg("127.0.0.1:4444")
+        .args(["--liveness", "127.0.0.1:4444"])
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
         .with_context(|| format!("spawn {:?}", gs_sim_bin))?;
 
-    // The game port is UDP (fpp-session): give the GS time to join the VS
-    // and sign its first Checkpoint before the client asks the Broker.
+    // The game port is UDP (fpp-session): give the GS time to join Server
+    // Liveness and sign its first Checkpoint before the client asks the Broker.
     thread::sleep(Duration::from_millis(2500));
     if let Ok(Some(status)) = gs_child.try_wait() {
         eprintln!("[PLAY] gs-sim exited early ({status})");
-        let _ = vs_child.kill();
-        let _ = vs_child.wait();
+        drop(cell);
         std::process::exit(1);
     }
 
-    // 5) Resolve Bevy client launch plan
+    // 3) Resolve Bevy client launch plan
     let bevy_bin_candidates = [
         bin_path("client-bevy", &profile),
         bin_path("sanity3d", &profile),
@@ -144,7 +84,7 @@ fn main() -> Result<()> {
             .context("cargo run -p client-bevy")?
     };
 
-    // 6) Wait for Bevy to exit OR Ctrl-C, then tear down servers
+    // 4) Wait for Bevy to exit OR Ctrl-C, then tear down servers
     //    Poll so Ctrl-C can interrupt while Bevy runs.
     loop {
         if cancelled.load(Ordering::SeqCst) {
@@ -169,11 +109,10 @@ fn main() -> Result<()> {
         }
     }
 
-    // Tear down VS/GS
+    // Tear down the GS and the cell
     let _ = gs_child.kill();
     let _ = gs_child.wait();
-    let _ = vs_child.kill();
-    let _ = vs_child.wait();
+    drop(cell);
 
     Ok(())
 }

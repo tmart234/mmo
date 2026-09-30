@@ -1,11 +1,10 @@
-// crates/vs/src/appraisal.rs
 //! Verifier appraisal of client platform evidence (roadmap P3, ATT-01..06):
-//! `ClientAdmissionRequest.evidence` → Device Trust Tier, feature claims and
+//! `EvidenceRequest.evidence` → Device Trust Tier, feature claims and
 //! a hardware-rooted DID where the platform gives one.
 //!
 //! Formats (attest_core::Evidence): Android key attestation (`attest-android`),
 //! Apple App Attest attestations and assertions (`attest-apple`). All bind to
-//! `attest_challenge(vs_challenge, session_pub)`, so evidence made for another
+//! `attest_challenge(verifier_challenge, session_pub)`, so evidence made for another
 //! admission or another session key fails. Evidence that fails appraisal is
 //! not an error for the client: it is tier D0 with a warning (03 §4.2), and
 //! the queue's tier floor decides.
@@ -18,13 +17,13 @@ use fpp_tokens::Features;
 use fpp_types::DeviceTier;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// What the Verifier accepts, set from the command line (`vs --help`).
+/// What the Verifier accepts, set from the command line (`svc-verifier --help`).
 #[derive(Default)]
 pub struct ClientAttestation {
     pub android: Option<AndroidPolicy>,
     pub apple: Option<ApplePolicy>,
     /// App Attest keys appraised so far, by key id (in memory: a restarted
-    /// VS asks the app to attest a new key).
+    /// Verifier asks the app to attest a new key).
     pub apple_keys: DashMap<[u8; 32], AppKey>,
 }
 
@@ -171,7 +170,7 @@ fn appraise_evidence(
 /// Appraise an admission's evidence (empty: D0).
 pub fn appraise(
     cfg: &ClientAttestation,
-    vs_challenge: &[u8; 32],
+    verifier_challenge: &[u8; 32],
     session_pub: &[u8; 32],
     evidence: &[u8],
 ) -> Appraised {
@@ -181,7 +180,7 @@ pub fn appraise(
         Err(e) => return unrooted(format!("evidence-rejected: {e}")),
     };
     let (now_unix, now_yyyymm) = now();
-    let challenge = attest_challenge(vs_challenge, session_pub);
+    let challenge = attest_challenge(verifier_challenge, session_pub);
     match appraise_evidence(cfg, evidence, &challenge, session_pub, now_unix, now_yyyymm) {
         Ok(claims) => Appraised {
             tier: device_tier(&claims),

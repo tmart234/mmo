@@ -5,7 +5,7 @@
 //! chain stops (revocation).
 
 use client_core::*;
-use common::keys::ServiceKeys;
+use common::keys::KeyBundle;
 use common::proto::ClientCmd;
 use ed25519_dalek::SigningKey;
 use fpp_crypto::Ed25519Signer;
@@ -25,6 +25,32 @@ const MATCH: MatchId = MatchId(*b"test-match-00001");
 
 fn unix_s() -> u64 {
     common::crypto::now_ms() / 1000
+}
+
+/// The Verifier's, Broker's and Server Liveness's keys, as a test makes them.
+struct ServiceKeys {
+    verifier: Ed25519Signer,
+    broker: Ed25519Signer,
+    liveness: Ed25519Signer,
+}
+
+impl ServiceKeys {
+    fn new(seed: u8) -> Self {
+        let key = |n: u8| Ed25519Signer::new(SigningKey::from_bytes(&[seed ^ n; 32]));
+        Self {
+            verifier: key(1),
+            broker: key(2),
+            liveness: key(3),
+        }
+    }
+
+    fn bundle(&self) -> KeyBundle {
+        KeyBundle {
+            verifier_ar: self.verifier.verifying_key(),
+            broker_sat: self.broker.verifying_key(),
+            server_liveness: self.liveness.verifying_key(),
+        }
+    }
 }
 
 struct Server {
@@ -159,7 +185,7 @@ fn credentials(
 }
 
 fn setup() -> (Arc<ServiceKeys>, ClientTrust) {
-    let keys = Arc::new(ServiceKeys::derive(&[9; 32]));
+    let keys = Arc::new(ServiceKeys::new(9));
     let trust = ClientTrust {
         ca_der: Vec::new(),
         bundle: keys.bundle(),
