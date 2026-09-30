@@ -1,0 +1,39 @@
+name: Tell dependents
+
+# When CI passes on main, tells the games that build the fpp SDK from this
+# repository, so that they update it at once (halo-ce-pi's "Update the fpp
+# SDK" workflow, which also runs every six hours without this). It pins the
+# new commit only if the SDK's source changed, then builds and tests the
+# game with it before merging.
+#
+# Needs a HALO_DISPATCH_TOKEN secret: a fine-grained token for
+# tmart234/halo-ce-pi with "Contents: read and write" (what a
+# repository_dispatch event needs). Without it, nothing is sent.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  dispatch:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: halo-ce-pi
+        env:
+          TOKEN: ${{ secrets.HALO_DISPATCH_TOKEN }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "no HALO_DISPATCH_TOKEN secret: halo-ce-pi picks this up on its schedule"
+            exit 0
+          fi
+          curl -fsS -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/tmart234/halo-ce-pi/dispatches \
+            -d "{\"event_type\": \"mmo-main\", \"client_payload\": {\"sha\": \"$SHA\"}}"
