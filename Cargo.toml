@@ -7,6 +7,7 @@ members = [
     "crates/fpp-tokens",
     "crates/fpp-session",
     "crates/fpp-ffi",
+    "crates/fpp-audit",
     "crates/attest-core",
     "crates/attest-android",
     "crates/attest-apple",

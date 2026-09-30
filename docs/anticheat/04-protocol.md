@@ -583,6 +583,55 @@ For a match, given evidence objects:
    `(match_id, epoch)` is an **equivocation proof**, which revokes the instance
    automatically (ENF-02 crypto-proof path).
 
+### 8.5 Accounting profile and evidence bundles (player-hosted matches)
+
+A player host is omnipotent in its match (08, H09): it decides every
+outcome. What it cannot do, under this profile, is make a player's input
+disappear without the player being able to prove it. Implemented by the Halo
+fork (`port/linux/src/p2p_evidence.c`) and audited by `crates/fpp-audit`.
+
+- **Frames.** A player's frame for a tick is what it sent the host on a
+  reliable channel in that tick, prefixed with `units:u8`: how many
+  *accountable units* it carries (Halo: hit reports). Reliable delivery
+  means the host cannot claim a frame was lost.
+- **Epochs.** `EPOCH_TICKS` ticks (Halo: 150, five seconds). The player
+  signs one InputCommit per epoch over its frames (§7.4) and sends it on the
+  session's reliable channel (§7.7). The host rebuilds each player's frames
+  from what arrived.
+- **Checkpoint per epoch** (§8.1), signed with the instance key the P2P
+  handshake announced, after a grace for late commits. Per player, an input
+  leaf: the commit's digest if its frames are exactly those that arrived
+  (else none), and the applied bitset of the ticks whose frames arrived.
+  Events: one **outcome** per unit the host decided this epoch:
+
+  ```text
+  Outcome = 'O' ‖ slot:u16 ‖ tick:u32 ‖ unit:u16 ‖ outcome:u8 ‖ reason:u8   (little-endian)
+  outcome: 1 applied · 2 rejected (reason: title-defined code)
+  ```
+
+  The host sends every player a **package**: `len:u32 ‖ signed Checkpoint ‖
+  n:u16 ‖ n × (slot:u16 ‖ acked:u8 ‖ digest:32 ‖ applied) ‖ m:u16 ‖ m ×
+  event`, so each can check the roots.
+- **Bundle.** Every machine appends to a file: `"FPPB1\n"`, then records
+  `type:u8 ‖ len:u32 ‖ body`: 1 meta (version, role, match, slot, session
+  key, instance key, epoch ticks), 2 own frame (`tick:u32 ‖ payload`), 3
+  commit, 4 Checkpoint package, 5 received frame (host: `slot ‖ tick ‖
+  payload`), 6 roster (host: `slot ‖ session key`).
+
+**Audit** (`fpp-audit bundle...`). From one player's bundle: its commits
+verify, chain and cover exactly its frames; each Checkpoint verifies under
+the announced key, chains, and its leaves and events match its roots;
+the host acknowledged each commit and marked every frame applied; every
+unit has an outcome. From several bundles: no epoch has two different
+Checkpoints (equivocation). A host that silently drops a player's hits is
+caught from that player's bundle alone.
+
+**Limits.** An outcome's truth (a hit recorded as dealt and not dealt, or
+rejected for a false reason) needs re-simulation (§8.4) with the title's
+engine and data. Frames later than the grace are not applied; under extreme
+lag the auditor reports them as denied, which is a note for appeal, not a
+verdict. The host still sees every player's frames.
+
 ## 9. Enforcement plane
 
 ```cddl
