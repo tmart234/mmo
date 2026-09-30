@@ -118,8 +118,7 @@ async fn admit_game_server(
 
     // 3) The build. With TPM 2.0 evidence it is what the kernel measured
     //    (a registered build, F06), not what the GS says; a VS with a Build
-    //    Registry admits nothing else. Without, the self-reported sw_hash
-    //    against the allowlist (empty = dev mode).
+    //    Registry admits nothing else (without one: development).
     let tpm2 = match &jr.tpm2 {
         Some(evidence) => Some(
             crate::tpm2::appraise_join(
@@ -137,36 +136,7 @@ async fn admit_game_server(
         }
         None => None,
     };
-    let measured_build = tpm2.as_ref().is_some_and(|a| a.build.is_some());
-    if !measured_build
-        && !ctx.config.sw_hash_allowlist.is_empty()
-        && !ctx.config.sw_hash_allowlist.contains(&jr.sw_hash)
-    {
-        bail!(
-            "sw_hash {} is not in the VS allowlist",
-            hex::encode(jr.sw_hash)
-        );
-    }
-
-    // 4) TPM quote: covers this connection's challenge and this exact
-    //    JoinRequest, from an enrolled (or, in dev mode, pinned) key.
-    let tpm = crate::attest::appraise_join_quote(
-        &ctx.config,
-        &challenge,
-        &join_bytes,
-        jr.tpm_quote.as_ref(),
-    )
-    .context("TPM quote appraisal failed")?;
-    if tpm.is_some() {
-        let enrolled = if ctx.config.trusted_ak_keys.is_empty() {
-            "dev mode: attestation key not enrolled, pinned for this session"
-        } else {
-            "enrolled attestation key"
-        };
-        println!("[VS] TPM quote verified ({enrolled})");
-    }
-
-    // 5) TPM 2.0: credential activation proves the AK that signed the quote
+    // 4) TPM 2.0: credential activation proves the AK that signed the quote
     //    is in the TPM whose EK the manufacturer certified.
     if let Some(admission) = &tpm2 {
         send_msg_continue(&mut send, &admission.challenge)
@@ -205,12 +175,9 @@ async fn admit_game_server(
             last_seen_ms: now_ms(),
             revoked: false,
             last_checkpoint: None,
-            tpm,
-            recent_sars: Default::default(),
             next_slot: 0,
         },
     );
-    crate::metrics::ACTIVE_SESSIONS.inc();
 
     let sig_vs: Sig = sign(ctx.vs_sk.as_ref(), &session_id).to_vec();
     let ja = JoinAccept {

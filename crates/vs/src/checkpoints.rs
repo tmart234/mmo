@@ -1,6 +1,5 @@
 // crates/vs/src/checkpoints.rs
-//! Receive one signed Checkpoint per epoch (04 §8.1), replacing the
-//! Heartbeat + TranscriptDigest pair. Each must be signed by the instance
+//! Receive one signed Checkpoint per epoch (04 §8.1). Each must be signed by the instance
 //! key certified in this session's SARs, be for this session's match, and
 //! extend the `prev` chain epoch by epoch. Anything else is misbehavior and
 //! revokes the instance. Verified Checkpoints are kept as evidence (files
@@ -15,9 +14,7 @@ use fpp_types::{Digest, MatchId};
 use fpp_wire::Checkpoint;
 use quinn::Connection;
 
-use crate::attest::appraise_reattest_quote;
 use crate::ctx::VsCtx;
-use crate::metrics::{CHECKPOINTS_TOTAL, TPM_VERIFICATIONS_TOTAL};
 
 /// Check a Checkpoint against the session's instance key and chain.
 /// Returns its epoch and digest.
@@ -82,7 +79,6 @@ pub fn spawn_checkpoint_listener(conn: &Connection, ctx: VsCtx, session_id: [u8;
             if s.revoked {
                 continue;
             }
-            let timer = crate::metrics::CHECKPOINT_LATENCY.start_timer();
             let (epoch, digest) = match verify_checkpoint(
                 &submit.checkpoint,
                 &s.instance_pub,
@@ -95,27 +91,7 @@ pub fn spawn_checkpoint_listener(conn: &Connection, ctx: VsCtx, session_id: [u8;
                     continue;
                 }
             };
-            if let Some(quote) = &submit.tpm_quote {
-                let r = appraise_reattest_quote(
-                    &ctx.config,
-                    &session_id,
-                    u64::from(epoch),
-                    quote,
-                    submit.quote_sar_seq,
-                    s.tpm.as_ref(),
-                    &s.recent_sars,
-                );
-                let label = if r.is_ok() { "success" } else { "failed" };
-                TPM_VERIFICATIONS_TOTAL.with_label_values(&[label]).inc();
-                if let Err(e) = r {
-                    ctx.revoke(&session_id, &format!("TPM re-attestation failed: {e:#}"));
-                    continue;
-                }
-                println!("[VS] TPM re-attestation OK (epoch {epoch})");
-            }
-            timer.observe_duration();
             store(&session_id, epoch, &submit.checkpoint);
-            CHECKPOINTS_TOTAL.inc();
             if let Some(mut s) = ctx.sessions.get_mut(&session_id) {
                 s.last_checkpoint = Some((epoch, digest));
                 s.last_seen_ms = common::crypto::now_ms();

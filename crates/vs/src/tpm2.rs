@@ -284,7 +284,6 @@ mod tests {
                 game_addr,
                 sig_gs: sign(&gs_key, &to_sign).to_vec(),
                 gs_pub: gs_key.verifying_key().to_bytes(),
-                tpm_quote: None,
                 tpm2: (gs != Gs::NoEvidence).then_some(evidence),
             };
             if gs == Gs::NoEvidence {

@@ -24,7 +24,6 @@ fn spend_coins_idempotency_detects_replay() {
         OpResult {
             processed_at_ms: 1000,
             success: true,
-            balance_after: Some(90),
         },
     );
 
@@ -52,7 +51,6 @@ fn different_clients_can_use_same_op_id() {
         OpResult {
             processed_at_ms: 1000,
             success: true,
-            balance_after: Some(100),
         },
     );
 
@@ -83,7 +81,6 @@ fn lru_eviction_allows_reuse_after_many_ops() {
             OpResult {
                 processed_at_ms: i,
                 success: true,
-                balance_after: None,
             },
         );
     }
@@ -124,7 +121,6 @@ fn failed_operations_are_also_cached() {
         OpResult {
             processed_at_ms: 1000,
             success: false, // Operation failed
-            balance_after: None,
         },
     );
 

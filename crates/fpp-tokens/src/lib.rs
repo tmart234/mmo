@@ -497,9 +497,8 @@ impl Payload for SessionAdmissionToken {
 
 // ------------------------------------------------------------------ SAR
 
-/// §6.3: liveness service → game server → clients. Successor of the
-/// prototype's PlayTicket: hash-chained, short-lived, bound to the server's
-/// keys.
+/// §6.3: liveness service → game server → clients: hash-chained,
+/// short-lived, bound to the server's keys.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServerAttestationResult {
     pub iss: String,

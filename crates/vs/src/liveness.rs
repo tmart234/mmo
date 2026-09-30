@@ -1,6 +1,5 @@
 // crates/vs/src/liveness.rs
-//! Server Liveness role: issue the instance's SAR chain (04 §6.3), the
-//! successor of the PlayTicket loop. A SAR lives [`SAR_LIFETIME_S`]; one is
+//! Server Liveness role: issue the instance's SAR chain (04 §6.3). A SAR lives [`SAR_LIFETIME_S`]; one is
 //! issued every [`SAR_INTERVAL`]. Revocation is simply "stop issuing": the GS
 //! and its clients lapse within a few intervals.
 
@@ -12,9 +11,7 @@ use quinn::Connection;
 use std::time::Duration;
 use tokio::time::sleep;
 
-use crate::attest::RECENT_SARS;
 use crate::ctx::VsCtx;
-use crate::metrics::SARS_ISSUED_TOTAL;
 
 pub const SAR_INTERVAL: Duration = Duration::from_secs(2);
 pub const SAR_LIFETIME_S: u64 = 10;
@@ -75,13 +72,6 @@ pub fn spawn_sar_loop(conn: &Connection, ctx: VsCtx, session_id: [u8; 16]) {
                 prev,
             );
             prev = sar_link(&sar).expect("own SAR decodes");
-            // Remember it before sending: the GS may seed a TPM quote with it at once.
-            if let Some(mut s) = ctx.sessions.get_mut(&session_id) {
-                s.recent_sars.push_back((seq, sar.clone()));
-                while s.recent_sars.len() > RECENT_SARS {
-                    s.recent_sars.pop_front();
-                }
-            }
             let sent = async {
                 let mut uni = conn.open_uni().await?;
                 send_msg(&mut uni, &SarIssue { sar }).await
@@ -90,7 +80,6 @@ pub fn spawn_sar_loop(conn: &Connection, ctx: VsCtx, session_id: [u8; 16]) {
                 eprintln!("[VS] send SAR failed: {e:#}");
                 break;
             }
-            SARS_ISSUED_TOTAL.inc();
             seq += 1;
             sleep(SAR_INTERVAL).await;
         }

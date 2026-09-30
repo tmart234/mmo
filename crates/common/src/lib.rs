@@ -4,5 +4,4 @@ pub mod framing; // QUIC control links
 pub mod keys;
 pub mod pki;
 pub mod proto;
-pub mod retry;
 pub mod tpm;

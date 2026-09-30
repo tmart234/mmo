@@ -2,7 +2,6 @@
 #![no_main]
 
 use common::proto::JoinAccept;
-use common::tpm::{verify_quote, TpmQuote};
 use ed25519_dalek::SigningKey;
 use fpp_crypto::{Ed25519Signer, KeyRole, KeySet};
 use fpp_tokens::admission::{admit, AdmissionPolicy, Revocations};
@@ -20,19 +19,13 @@ fuzz_target!(|data: &[u8]| {
         keys.insert_ed25519(role, Ed25519Signer::new(SigningKey::from_bytes(&[seed; 32])).verifying_key());
     }
     let now = 1_790_000_000;
-    match selector % 4 {
+    match selector % 3 {
         0 => {
             if let Ok(ja) = bincode::deserialize::<JoinAccept>(body) {
                 let _ = gs_sim::admission::verify_join_accept(&vs, &ja);
             }
         }
         1 => {
-            if let Ok(q) = bincode::deserialize::<TpmQuote>(body) {
-                let _ = verify_quote(&q, &q.nonce, None);
-                let _ = verify_quote(&q, &[0; 32], Some(&q.pcr_values));
-            }
-        }
-        2 => {
             let _ = verify_ar(body, &keys, now);
             let _ = verify_sat(body, &keys, now);
             if let Ok(mut chain) = SarChain::start(body, &keys, now) {

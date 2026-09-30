@@ -75,15 +75,11 @@ vs --tpm-ek-roots tpm-manufacturers.pem \
   (`crates/attest-tpm/tests/swtpm.rs`, the admission test in
   `crates/vs/src/tpm2.rs`). CI installs swtpm and tpm2-tools and requires
   those tests (`FPP_REQUIRE_SWTPM=1`).
-- `gs-sim --enable-tpm` uses the prototype's simulated TPM (an Ed25519 key,
-  `common::tpm`): it exercises the join and re-attestation flow and proves
-  nothing about hardware. A VS with a Build Registry refuses it.
 
 ## Limits
 
-- Re-attestation during a session uses the simulated path only; a TPM 2.0
-  GS is appraised at join. Periodic re-quotes with the growing IMA log are
-  next.
+- TBD: re-attestation during a session. A GS is appraised at join;
+  periodic re-quotes with the growing IMA log are next.
 - Secure Boot's `dbx` (revoked boot components) is not appraised yet.
 - IMA measures a binary when it starts, not what a running process does
   to itself; runtime integrity for servers is the confidential-VM step

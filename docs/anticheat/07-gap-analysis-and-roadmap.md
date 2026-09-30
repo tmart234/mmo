@@ -33,7 +33,7 @@ because several **chain together**.
 | F17 | Low | `.gitignore` ignores `*.lock` while `Cargo.lock` is tracked. Lockfiles for binaries must be tracked for reproducible builds. | `.gitignore:23` | ✅ Fixed (P0) |
 | F18 | Info | Revocation state lives in three places. | `vs/src/ctx.rs:22`, `vs/src/enforcer.rs:33`, `gs-sim/src/state.rs:103` | Single subject-state model (P2) |
 | F19 | Info | GS client port is hard-coded to `127.0.0.1:50000`. | `crates/gs-sim/src/client_port.rs:78` | ✅ Fixed (P1): `--game-addr`, advertised to the VS in the signed JoinRequest and to clients by the Broker |
-| F21 | **Critical** | `verify_quote` checked a quote's signature with the attestation key *carried in the quote*. Anyone could sign a "quote" for any PCR values, including the configured baselines, with a key they made up; PCR baselines gave no assurance. | `crates/common/src/tpm.rs` `verify_quote` | ✅ Fixed for TPM 2.0: an AK counts only after credential activation against an EK certified by a pinned manufacturer root, at every join. The simulated path keeps `trusted_ak_keys` enrollment for development |
+| F21 | **Critical** | `verify_quote` checked a quote's signature with the attestation key *carried in the quote*. Anyone could sign a "quote" for any PCR values, including the configured baselines, with a key they made up; PCR baselines gave no assurance. | `crates/common/src/tpm.rs` `verify_quote` | ✅ Fixed for TPM 2.0: an AK counts only after credential activation against an EK certified by a pinned manufacturer root, at every join. The simulated TPM path is removed |
 | F20 | **High** | Vulnerable dependencies, hidden by the non-blocking audit (F16): quinn-proto remote DoS and memory exhaustion (RUSTSEC-2026-0037, -0185), rustls accepting TLS 1.3 handshake messages across encryption levels (RUSTSEC-2026-0285), rustls-webpki name-constraint and CRL flaws, aws-lc-sys X.509/PKCS7 bypasses, unsound `lru` used directly by gs-sim, protobuf recursion crash via prometheus 0.13, plus bytes, time and anyhow issues. | `Cargo.lock`, `crates/gs-sim/Cargo.toml`, `Cargo.toml` | ✅ Fixed (P0): lockfile updates, lru 0.18, prometheus 0.14; remaining ignores documented in `deny.toml` (bincode, until P1 replaces it) |
 
 ## 2. Requirements coverage
@@ -44,7 +44,7 @@ because several **chain together**.
 |------|--------|---------|
 | AUTH (server authority) | ◐ | Movement clamped server-side (`MAX_STEP`) and token-bucket rate limits. No tick model, no lag-comp bounds, no VRF, no determinism contract. |
 | INFO (information minimization) | ✗ | `WorldSnapshot.others` sends every player's position to every client: a built-in ESP. |
-| ATT (attestation) | ◐ | Game servers: real TPM 2.0 admission (EK chain, credential activation, quote, boot and IMA logs, a Build Registry of CI builds with provenance; F05/F06/F21), tested end to end against swtpm; re-attestation is still simulated-only. Freshness (F04) and self-asserted AKs (F21) fixed in the prototype. No client attestation yet, but player-hosted joins now carry an AR slot (04 §7.7). |
+| ATT (attestation) | ◐ | Game servers: real TPM 2.0 admission (EK chain, credential activation, quote, boot and IMA logs, a Build Registry of CI builds with provenance; F05/F06/F21), tested end to end against swtpm; re-attestation during a session is TBD (the simulated TPM path is removed). Freshness (F04) and self-asserted AKs (F21) fixed in the prototype. No client attestation yet, but player-hosted joins now carry an AR slot (04 §7.7). |
 | ID (identity) | ✗ | Self-generated client keys; no account, device, or ban-durable identity. |
 | PROTO (protocol/crypto) | ◐ | QUIC + Ed25519 are good foundations. Unverified TLS, bincode tuples, no domain separation or versioning, no PQ, no datagrams. |
 | EVD (evidence) | ◐ | Hash-chained receipts + notarization exist (good instinct). Linear chain, local files, no log or witnesses. |
@@ -88,7 +88,7 @@ crates/
 tools/  fuzz/  (cargo-fuzz targets for every decoder)
 ```
 
-Existing crates migrate: `common` → `fpp-*`, `gs-sim` + `gs-core` →
+Existing crates migrate: `common` → `fpp-*`, `gs-sim` →
 `gs-authority` + `gs-checkpoint`, `vs` → `svc-*` (split), `client-core` →
 `ia-core` + reference client, `client-bevy` stays as reference client.
 

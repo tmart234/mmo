@@ -4,7 +4,6 @@ use common::keys::ServiceKeys;
 use dashmap::DashMap;
 use ed25519_dalek::SigningKey;
 use fpp_types::Digest;
-use std::collections::VecDeque;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -33,11 +32,6 @@ pub struct Session {
     pub revoked: bool,
     /// Epoch and digest of the last verified Checkpoint (the `prev` chain).
     pub last_checkpoint: Option<(u32, Digest)>,
-    /// TPM attestation key and PCRs pinned at join; re-attestation must match.
-    pub tpm: Option<crate::attest::PinnedTpm>,
-    /// (seq, exact bytes) of the latest SARs issued, newest last (at most
-    /// `attest::RECENT_SARS`). Re-attestation quotes are seeded by one.
-    pub recent_sars: VecDeque<(u64, Vec<u8>)>,
     /// Next player slot the Broker hands out for this match.
     pub next_slot: u16,
 }
@@ -58,7 +52,6 @@ impl VsCtx {
         if let Some(mut s) = self.sessions.get_mut(session_id) {
             if !s.revoked {
                 s.revoked = true;
-                crate::metrics::REVOCATIONS_TOTAL.inc();
                 eprintln!(
                     "[VS] REVOKED session {}.. ({why}); no further SARs",
                     hex::encode(&session_id[..4])
