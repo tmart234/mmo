@@ -18,6 +18,8 @@ rand = { workspace = true }
 hex = { workspace = true }
 ed25519-dalek = { workspace = true }
 common = { path = "../common" }
+fpp-crypto = { path = "../fpp-crypto" }
+fpp-wire = { path = "../fpp-wire" }
 
 [[bin]]
 name = "fpp-cell"

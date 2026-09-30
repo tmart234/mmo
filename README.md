@@ -15,6 +15,10 @@ Client <-> GS <-> trust plane, speaking the Fair-Play Protocol (FPP v1).
   - **Broker** (`svc-broker`) takes an AR, applies the queue's tier floor,
     has Server Liveness reserve a slot on a live GS (over the cell's mutual
     TLS), and signs a **Session Admission Token (SAT)** for that match.
+  - **Revocation Feed** (`svc-revocation`) carries Enforcement's signed
+    revocation events (`fpp-enforce`) to the Broker and Server Liveness,
+    which relays them to game servers; every event is in the Transparency
+    Log first.
   - **Transparency Log** and its **witness** (`svc-log`, `svc-witness`).
 - **GS** – runs the match. Clients join over **fpp-session** (Noise over UDP,
   ADR-002): the GS shows its current SAR, checks `Admit{SAT, AR}`, applies
@@ -41,8 +45,11 @@ Flow:
    `SarUpdate` → client checks it → `Admit{SAT, AR}` → `Admitted{slot}`.
 5. **Play**: InputFrames (unreliable, redundant) per tick; InputCommit per
    epoch and SarUpdate / CheckpointHead messages on the reliable channel.
-6. **Revocation**: when SARs stop, the GS kicks everyone and clients drop
-   within 3 issue intervals, on their own.
+6. **Revocation**: Enforcement's event reaches the GS through the feed and
+   Server Liveness, and the GS removes the players it names (p99 well under
+   5 s, `make ci`). A revoked GS gets no more SARs: it kicks everyone, and
+   if it ignores that too its clients drop within 3 issue intervals, on
+   their own.
 
 > **Design and spec:** [`docs/anticheat/`](docs/anticheat/README.md): threat
 > model, requirements, architecture, protocol spec (FPP v1), ADRs and roadmap.

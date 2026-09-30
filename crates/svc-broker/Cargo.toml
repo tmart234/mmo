@@ -21,6 +21,7 @@ fpp-types      = { path = "../fpp-types" }
 fpp-crypto     = { path = "../fpp-crypto" }
 fpp-tokens     = { path = "../fpp-tokens" }
 fpp-svc        = { path = "../fpp-svc" }
+fpp-wire       = { path = "../fpp-wire" }
 
 [[bin]]
 name = "svc-broker"

@@ -1,5 +1,6 @@
-# One regional cell of the trust plane (development): Server Liveness, the
-# Verifier and the Broker, each in its own container with its own key.
+# One regional cell of the trust plane (development): the Transparency Log,
+# the Revocation Feed, Server Liveness, the Verifier and the Broker, each in
+# its own container with its own key; Enforcement's key in a tool container.
 # Each service mounts only its own directory of the cell (its signing seed,
 # cell identity and public TLS identity), the cell CA certificate, and the
 # shared directory where services publish their public keys. See README.md.
@@ -48,8 +49,53 @@ services:
           mv keys/$${s}_tls.key.der cell/$$s/public_tls.key.der
           chmod 600 cell/$$s/public_tls.key.der
         done
-        mkdir -p cell/public evidence cellca/liveness cellca/verifier cellca/broker cellca/public
+        mkdir -p cell/public evidence
+        for s in log revocation liveness verifier broker enforcement public; do mkdir -p cellca/$$s; done
         cp cell/ca.der cellca/
+
+  log:
+    <<: *service
+    networks:
+      cell:
+        ipv4_address: 172.30.0.13
+    command: >-
+      svc-log --cell /cell --bind 0.0.0.0:7201 --data /cell/log/data
+      --writers revocation,enforcement,liveness
+    volumes:
+      - {type: volume, source: state, target: /cell, read_only: true, volume: {subpath: cellca}}
+      - {type: volume, source: state, target: /cell/log, volume: {subpath: cell/log}}
+      - {type: volume, source: state, target: /cell/public, volume: {subpath: cell/public}}
+
+  revocation:
+    <<: *service
+    networks:
+      cell:
+        ipv4_address: 172.30.0.14
+    command: svc-revocation --cell /cell --bind 0.0.0.0:4460 --log 172.30.0.13:7201
+    volumes:
+      - {type: volume, source: state, target: /cell, read_only: true, volume: {subpath: cellca}}
+      - {type: volume, source: state, target: /cell/revocation, volume: {subpath: cell/revocation}}
+      - {type: volume, source: state, target: /cell/public, volume: {subpath: cell/public}}
+
+  # Enforcement's key, made once; its public half goes into the bundle.
+  enforcement-init:
+    <<: *service
+    restart: "no"
+    command: fpp-enforce --cell /cell init
+    volumes: &enforcement-volumes
+      - {type: volume, source: state, target: /cell, read_only: true, volume: {subpath: cellca}}
+      - {type: volume, source: state, target: /cell/enforcement, volume: {subpath: cell/enforcement}}
+      - {type: volume, source: state, target: /cell/public, volume: {subpath: cell/public}}
+
+  # Acting as Enforcement:
+  #   docker compose -f deploy/cell/docker-compose.yml run --rm enforce kick session:<hex>
+  enforce:
+    <<: *service
+    profiles: [tools]
+    restart: "no"
+    networks: [cell]
+    entrypoint: [fpp-enforce, --cell, /cell, --feed, "172.30.0.14:4460", --log, "172.30.0.13:7201"]
+    volumes: *enforcement-volumes
 
   liveness:
     <<: *service
@@ -60,7 +106,7 @@ services:
       - "4444:4444/udp"
     working_dir: /var/lib/fpp
     command: >-
-      svc-liveness --cell /cell --bind 0.0.0.0:4444 --rpc 0.0.0.0:4454
+      svc-liveness --cell /cell --bind 0.0.0.0:4444 --rpc 0.0.0.0:4454 --feed 172.30.0.14:4460
       --tls-cert /cell/liveness/public_tls.der --tls-key /cell/liveness/public_tls.key.der
     volumes:
       - {type: volume, source: state, target: /cell, read_only: true, volume: {subpath: cellca}}
@@ -91,18 +137,18 @@ services:
     ports:
       - "4446:4446/udp"
     command: >-
-      svc-broker --cell /cell --bind 0.0.0.0:4446 --liveness 172.30.0.10:4454
+      svc-broker --cell /cell --bind 0.0.0.0:4446 --liveness 172.30.0.10:4454 --feed 172.30.0.14:4460
       --tls-cert /cell/broker/public_tls.der --tls-key /cell/broker/public_tls.key.der
     volumes:
       - {type: volume, source: state, target: /cell, read_only: true, volume: {subpath: cellca}}
       - {type: volume, source: state, target: /cell/broker, volume: {subpath: cell/broker}}
       - {type: volume, source: state, target: /cell/public, volume: {subpath: cell/public}}
 
-  # Gathers the key bundle game servers and clients trust, once the three
-  # services have published their keys (retried until they have).
+  # Gathers the key bundle game servers and clients trust, once the
+  # services and Enforcement have published their keys (retried until they have).
   bundle:
     <<: *service
-    depends_on: [liveness, verifier, broker]
+    depends_on: [liveness, verifier, broker, enforcement-init]
     networks: [cell]
     command: fpp-cell bundle /cell /var/lib/fpp/keys/fpp_key_bundle.json
     volumes:

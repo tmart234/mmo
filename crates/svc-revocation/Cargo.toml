@@ -1,0 +1,33 @@
+[package]
+name = "svc-revocation"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "The Revocation Feed (04 §9): takes Enforcement-signed revocation events, logs each in the Transparency Log, and serves them to Brokers and Server Liveness; and fpp-enforce, which signs and publishes them"
+
+[dependencies]
+anyhow        = { workspace = true }
+tokio         = { workspace = true }
+clap          = { workspace = true }
+ed25519-dalek = { workspace = true }
+sha2          = { workspace = true }
+rand          = { workspace = true }
+hex           = { workspace = true }
+serde_json    = { workspace = true }
+fpp-crypto    = { path = "../fpp-crypto" }
+fpp-types     = { path = "../fpp-types" }
+fpp-wire      = { path = "../fpp-wire" }
+fpp-svc       = { path = "../fpp-svc" }
+svc-log       = { path = "../svc-log" }
+
+[[bin]]
+name = "svc-revocation"
+path = "src/bin/svc-revocation.rs"
+
+[[bin]]
+name = "fpp-enforce"
+path = "src/bin/fpp-enforce.rs"
+
+[dev-dependencies]
+fpp-log       = { path = "../fpp-log" }

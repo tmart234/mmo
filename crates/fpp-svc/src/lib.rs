@@ -15,9 +15,11 @@
 //! - [`keys`]: each service's own signing keys, and the public keys it
 //!   publishes in the cell.
 //! - [`api`]: the requests services make of each other.
+//! - [`follow`]: following the Revocation Feed.
 
 pub mod api;
 pub mod cell;
+pub mod follow;
 pub mod keys;
 pub mod mtls;
 pub mod rpc;

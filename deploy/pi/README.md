@@ -5,7 +5,7 @@ The home-lab topology for the Halo reference title
 
 | Board | Role | Runs |
 |-------|------|------|
-| Raspberry Pi Zero 2 W (quad Cortex-A53, 512 MB) | **The cell**: Server Liveness (GS admission, SAR chain, Checkpoints), the Verifier and the Broker, three processes under three users | `svc-liveness`, `svc-verifier`, `svc-broker` from this repo, aarch64 |
+| Raspberry Pi Zero 2 W (quad Cortex-A53, 512 MB) | **The cell**: the Transparency Log, the Revocation Feed, Server Liveness (GS admission, SAR chain, Checkpoints), the Verifier and the Broker, one process and one user each; Enforcement (`fpp-enforce`) as a sixth user | `svc-log`, `svc-revocation`, `svc-liveness`, `svc-verifier`, `svc-broker`, `fpp-enforce` from this repo, aarch64 |
 | Raspberry Pi 5 | **GS**: the dedicated Halo host (stage H5, not built yet) | the Halo port as a headless host, linked with `libfpp.a` for aarch64 |
 | Players' PCs, phones | **Clients** | the Halo port |
 
@@ -20,7 +20,7 @@ Cross-build from x86-64 with clang and the Debian/Ubuntu aarch64 sysroot:
 ```bash
 rustup target add aarch64-unknown-linux-gnu
 sudo apt-get install clang lld llvm libc6-dev-arm64-cross libgcc-13-dev-arm64-cross qemu-user-static
-make pi-cell          # target/aarch64-unknown-linux-gnu/release/{svc-liveness,svc-verifier,svc-broker,fpp-cell}
+make pi-cell          # target/aarch64-unknown-linux-gnu/release/{svc-*,fpp-cell,fpp-enforce}
 make pi-cell-smoke    # the full smoke test with these services, under qemu
 ```
 
@@ -37,7 +37,8 @@ cargo run -p tools --bin gen_keys     # keys/ and cell/
 | Files | Goes to |
 |-------|---------|
 | `cell/ca.der` | the Pi, readable by all three services |
-| `cell/<service>/` (`tls.der`, `tls.key.der`) and `keys/<service>_tls.der`, `keys/<service>_tls.key.der` | the Pi, readable only by that service's user (as `public_tls.*` in its directory) |
+| `cell/<service>/` (`tls.der`, `tls.key.der`), and for liveness, verifier and broker `keys/<service>_tls.der`, `keys/<service>_tls.key.der` | the Pi, readable only by that service's user (as `public_tls.*` in its directory) |
+| `cell/enforcement/` | the Pi, readable only by `fpp-enforcement` |
 | `keys/dev_ca.der` | every GS and client |
 | `keys/gs_tls.der`, `keys/gs_tls.key.der` | the GS |
 | `keys/fpp_key_bundle.json` | every GS and client: gather it on the Pi after the first start (§3) |
@@ -55,43 +56,58 @@ Use Raspberry Pi OS Lite (64-bit). Then:
 ```bash
 # from the PC
 R=target/aarch64-unknown-linux-gnu/release
-scp $R/svc-liveness $R/svc-verifier $R/svc-broker $R/fpp-cell pi@cell.local:/tmp/
+scp $R/svc-* $R/fpp-cell $R/fpp-enforce pi@cell.local:/tmp/
 scp -r cell keys deploy/pi pi@cell.local:/tmp/
 
 # on the Pi
-sudo install -m 0755 /tmp/svc-liveness /tmp/svc-verifier /tmp/svc-broker /tmp/fpp-cell /usr/local/bin/
+sudo install -m 0755 /tmp/svc-* /tmp/fpp-cell /tmp/fpp-enforce /usr/local/bin/
 sudo groupadd --system fpp
 sudo install -d -m 0755 /var/lib/fpp /var/lib/fpp/cell /var/lib/fpp/work /etc/fpp
 sudo install -d -g fpp -m 0775 /var/lib/fpp/cell/public
 sudo install -m 0644 /tmp/cell/ca.der /var/lib/fpp/cell/
-for s in liveness verifier broker; do
+for s in log revocation liveness verifier broker enforcement; do
   sudo useradd --system --gid fpp --home /var/lib/fpp/work/$s --shell /usr/sbin/nologin fpp-$s
   sudo install -d -o fpp-$s -g fpp -m 0700 /var/lib/fpp/cell/$s /var/lib/fpp/work/$s
   sudo install -o fpp-$s -g fpp -m 0600 /tmp/cell/$s/tls.der /tmp/cell/$s/tls.key.der /var/lib/fpp/cell/$s/
+done
+for s in liveness verifier broker; do
   sudo install -o fpp-$s -g fpp -m 0600 /tmp/keys/${s}_tls.der /var/lib/fpp/cell/$s/public_tls.der
   sudo install -o fpp-$s -g fpp -m 0600 /tmp/keys/${s}_tls.key.der /var/lib/fpp/cell/$s/public_tls.key.der
-  sudo install -m 0644 /tmp/pi/$s.env /etc/fpp/
 done
+for s in log revocation liveness verifier broker; do sudo install -m 0644 /tmp/pi/$s.env /etc/fpp/; done
 sudo install -m 0644 /tmp/pi/fpp@.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now systemd-time-wait-sync.service   # no RTC: wait for NTP
-sudo systemctl enable --now fpp@liveness fpp@verifier fpp@broker
+sudo -u fpp-enforcement fpp-enforce --cell /var/lib/fpp/cell init
+sudo systemctl enable --now fpp@log fpp@revocation fpp@liveness fpp@verifier fpp@broker
 journalctl -u 'fpp@*' -f
 
 # the key bundle for game servers and clients
 fpp-cell bundle /var/lib/fpp/cell /tmp/fpp_key_bundle.json
 ```
 
+Acting as Enforcement (the record goes into the Transparency Log, the
+event to the feed, and within seconds to every game server):
+
+```bash
+sudo -u fpp-enforcement fpp-enforce --cell /var/lib/fpp/cell --log 127.0.0.1:7201 \
+  kick session:<hex of the player's session key> --note "why"
+sudo -u fpp-enforcement fpp-enforce --cell /var/lib/fpp/cell --log 127.0.0.1:7201 \
+  kick gs:<hex of a game server instance>    # its SARs stop too
+```
+
 The services listen on UDP 4444 (Server Liveness, for game servers), 4445
-(Verifier) and 4446 (Broker), QUIC; the Broker reaches Server Liveness on
-127.0.0.1:4454. Give the board a fixed address (DHCP reservation), open
+(Verifier) and 4446 (Broker), QUIC; inside the board, the Broker reaches
+Server Liveness on 127.0.0.1:4454, both follow the Revocation Feed on
+127.0.0.1:4460, and the feed and Enforcement write to the Transparency Log
+on 127.0.0.1:7201. Give the board a fixed address (DHCP reservation), open
 4444 to the GS and 4445–4446 to players.
 
 Notes for this board:
 
 - **Clock.** SARs expire 10 s after issue. The Zero 2 W has no real-time
   clock, so the units wait for `time-sync.target`. Keep NTP on.
-- **Memory.** Each service is capped at 128 MB (`MemoryMax`). One cell
+- **Memory.** Each service is capped at 96 MB (`MemoryMax`). One cell
   serves a few home game servers easily.
 - **SD card.** Checkpoint evidence goes to
   `/var/lib/fpp/work/liveness/evidence/`, one small file per epoch per game

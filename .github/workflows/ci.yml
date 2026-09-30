@@ -70,7 +70,8 @@ jobs:
           make ffi-c-test-i686
 
   # One regional cell in containers (deploy/cell): the image builds, the
-  # three services start with their own keys, and the key bundle is gathered.
+  # services start with their own keys, the key bundle is gathered, and an
+  # Enforcement action goes through the feed into the Transparency Log.
   cell-containers:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -86,7 +87,9 @@ jobs:
             sleep 2
           done
           $compose ps -a bundle --format '{{.State}} {{.ExitCode}}' | grep -q '^exited 0$'
-          test "$($compose ps --status running --services | sort | tr '\n' ' ')" = "broker liveness verifier "
+          test "$($compose ps --status running --services | sort | tr '\n' ' ')" = "broker liveness log revocation verifier "
+          $compose run --rm enforce kick "session:$(printf '07%.0s' $(seq 32))" --note "CI"
+          $compose logs revocation | grep -q "log index"
           $compose logs
       - name: Stop the cell
         if: always()

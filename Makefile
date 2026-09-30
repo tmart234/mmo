@@ -13,7 +13,7 @@ endif
 
 # -------- Headless package set (what CI builds/tests) --------
 # Keep GUI crates (e.g., client-bevy) out of CI to avoid winit display issues.
-HEADLESS_PKGS := fpp-types fpp-wire fpp-crypto fpp-merkle fpp-tokens fpp-session fpp-ffi fpp-audit fpp-log fpp-svc svc-log attest-core attest-android attest-apple attest-tpm common client-core gs-sim svc-liveness svc-verifier svc-broker tools
+HEADLESS_PKGS := fpp-types fpp-wire fpp-crypto fpp-merkle fpp-tokens fpp-session fpp-ffi fpp-audit fpp-log fpp-svc svc-log attest-core attest-android attest-apple attest-tpm common client-core gs-sim svc-liveness svc-verifier svc-broker svc-revocation tools
 PKG_FLAGS := $(foreach p,$(HEADLESS_PKGS),-p $(p))
 
 # -------- Phonies --------
@@ -28,7 +28,7 @@ help:
 	@echo "  check              - fmt+clippy (headless crates only)"
 	@echo "  build-headless     - build headless crates (-p $(HEADLESS_PKGS))"
 	@echo "  test-headless      - cargo test for headless crates"
-	@echo "  test-stage         - test headless crates + run smoke (cell <-> GS <-> client)"
+	@echo "  test-stage         - test headless crates + run smoke (cell <-> GS <-> client) + revocation exit tests"
 	@echo "  interop            - check FPP golden vectors with the independent Python verifier"
 	@echo "  ffi-c-test         - C SDK conformance (x86_64); ffi-c-test-i686 for the Halo ABI"
 	@echo "  pi-cell            - cross-build the cell's services (and gen_keys, fpp-cell) for a Raspberry Pi (aarch64)"
@@ -72,6 +72,8 @@ test-stage: test-headless
 	@echo "Running smoke test (\`svc-liveness\`, \`svc-verifier\`, \`svc-broker\` + \`gs-sim --test-once\` + \`client-sim --smoke-test\`)..."
 	cargo run -p tools --bin gen_keys
 	cargo run -p tools --bin smoke
+	@echo "Revocation exit tests (kick p99 <= 5 s, denied admission, SAR lapse of a rogue GS)..."
+	cargo run -p tools --bin revocation_load
 
 # FPP v1 golden vectors, checked by the independent Python implementation.
 # (The Rust side is checked by crates/fpp-crypto/tests/golden.rs.)
@@ -170,12 +172,12 @@ PI_QEMU := qemu-aarch64-static
 PI_SYSROOT := /usr/aarch64-linux-gnu
 
 pi-cell:
-	$(PI_ENV) cargo build --release -p svc-liveness -p svc-verifier -p svc-broker -p fpp-svc -p tools --target $(PI_TARGET)
-	@echo "Cell for the Pi: target/$(PI_TARGET)/release/svc-{liveness,verifier,broker} (install: deploy/pi/README.md)"
+	$(PI_ENV) cargo build --release -p svc-liveness -p svc-verifier -p svc-broker -p svc-revocation -p svc-log -p fpp-svc -p tools --target $(PI_TARGET)
+	@echo "Cell for the Pi: target/$(PI_TARGET)/release/svc-{log,revocation,liveness,verifier,broker}, fpp-enforce (install: deploy/pi/README.md)"
 
 # The full smoke test with the services the Pi runs, emulated.
 pi-cell-smoke: pi-cell
-	cargo build -p gs-sim -p client-core -p tools
+	cargo build -p gs-sim -p client-core -p tools -p svc-revocation
 	cargo run -p tools --bin gen_keys
 	SMOKE_BIN_DIR=target/$(PI_TARGET)/release SMOKE_WRAPPER=$(PI_QEMU) SMOKE_STARTUP_MS=1500 \
 		QEMU_LD_PREFIX=$(PI_SYSROOT) cargo run -p tools --bin smoke

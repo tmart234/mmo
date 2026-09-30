@@ -14,9 +14,9 @@ pub type Sig = Vec<u8>;
 
 pub type OpId = [u8; 16];
 
-/// Version in `ChallengeRequest`; bump on any admission-flow change (5: the
-/// VS is split into Server Liveness, the Verifier and the Broker).
-pub const ADMISSION_VERSION: u32 = 5;
+/// Version in `ChallengeRequest`; bump on any admission-flow change (6:
+/// Server Liveness pushes revocation events to game servers).
+pub const ADMISSION_VERSION: u32 = 6;
 
 /// First message on a connection to a public service (Server Liveness, the
 /// Verifier, the Broker): asks for a single-use challenge.
@@ -104,11 +104,15 @@ pub struct JoinAccept {
     pub session_id: [u8; 16],
 }
 
-/// Server Liveness → GS: the next Server Attestation Result in this instance's chain
-/// (04 §6.3). Every ~2 s while blessed.
+/// Server Liveness → GS, one per unidirectional stream.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct SarIssue {
-    pub sar: Vec<u8>,
+pub enum ToGameServer {
+    /// The next Server Attestation Result in this instance's chain
+    /// (04 §6.3). Every ~2 s while blessed.
+    Sar(Vec<u8>),
+    /// A revocation event (04 §9, COSE signed by Enforcement), relayed from
+    /// the Revocation Feed; the GS checks the signature and applies it.
+    Revocation(Vec<u8>),
 }
 
 /// GS → Server Liveness: one signed Checkpoint per epoch (04 §8.1).

@@ -1,6 +1,7 @@
 //! The regional key bundle (04-protocol.md §4): the public keys of the
-//! Verifier (ARs), the Broker (SATs) and Server Liveness (SARs), which
-//! relying parties (clients, game servers) trust.
+//! Verifier (ARs), the Broker (SATs), Server Liveness (SARs) and
+//! Enforcement (revocation events), which relying parties (clients, game
+//! servers) trust.
 //!
 //! Each service makes its own signing key in its own cell directory and
 //! publishes only the public half (`fpp-svc`); `fpp-cell bundle` gathers
@@ -20,6 +21,7 @@ pub struct KeyBundle {
     pub verifier_ar: VerifyingKey,
     pub broker_sat: VerifyingKey,
     pub server_liveness: VerifyingKey,
+    pub enforcement: VerifyingKey,
 }
 
 impl KeyBundle {
@@ -28,6 +30,7 @@ impl KeyBundle {
         k.insert_ed25519(KeyRole::VerifierAr, self.verifier_ar);
         k.insert_ed25519(KeyRole::BrokerSat, self.broker_sat);
         k.insert_ed25519(KeyRole::ServerLiveness, self.server_liveness);
+        k.insert_ed25519(KeyRole::Enforcement, self.enforcement);
         k
     }
 
@@ -36,6 +39,7 @@ impl KeyBundle {
             "verifier_ar": hex::encode(self.verifier_ar.to_bytes()),
             "broker_sat": hex::encode(self.broker_sat.to_bytes()),
             "server_liveness": hex::encode(self.server_liveness.to_bytes()),
+            "enforcement": hex::encode(self.enforcement.to_bytes()),
         });
         let path = path.as_ref();
         std::fs::write(path, serde_json::to_string_pretty(&json)? + "\n")
@@ -61,6 +65,7 @@ impl KeyBundle {
             verifier_ar: key("verifier_ar")?,
             broker_sat: key("broker_sat")?,
             server_liveness: key("server_liveness")?,
+            enforcement: key("enforcement")?,
         })
     }
 }
@@ -77,6 +82,7 @@ mod tests {
             verifier_ar: key(1),
             broker_sat: key(2),
             server_liveness: key(3),
+            enforcement: key(4),
         };
         let dir = std::env::temp_dir().join(format!("bundle-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

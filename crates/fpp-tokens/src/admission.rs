@@ -5,6 +5,7 @@
 use crate::{verify_ar, verify_sat, AttestationResult, SessionAdmissionToken, Token, TokenError};
 use fpp_crypto::KeyResolver;
 use fpp_types::{BuildId, DeviceTier, Did, GsInstanceId, MatchId};
+use fpp_wire::{RevocationEvent, SubjectKind};
 use std::collections::HashSet;
 
 /// What this server accepts.
@@ -17,13 +18,45 @@ pub struct AdmissionPolicy {
     pub min_tier: DeviceTier,
 }
 
-/// Revocation cache, fed by the revocation feed (P2).
+/// Revocation cache, fed by the Revocation Feed (04 §9).
 #[derive(Clone, Debug, Default)]
 pub struct Revocations {
     pub token_ctis: HashSet<[u8; 16]>,
     pub devices: HashSet<Did>,
     pub accounts: HashSet<[u8; 32]>,
     pub builds: HashSet<BuildId>,
+    /// Session keys (`cnf`).
+    pub sessions: HashSet<[u8; 32]>,
+}
+
+impl Revocations {
+    /// Record an event's subject. Returns false for a subject kind this
+    /// cache does not hold (a game server instance).
+    pub fn add(&mut self, event: &RevocationEvent) -> bool {
+        let id = &event.subject_id;
+        let fixed32 = || <[u8; 32]>::try_from(id.as_slice()).ok();
+        match event.subject_kind {
+            SubjectKind::Account => fixed32().map(|a| self.accounts.insert(a)),
+            SubjectKind::Device => fixed32().map(|d| self.devices.insert(Did(d))),
+            SubjectKind::Session => fixed32().map(|k| self.sessions.insert(k)),
+            SubjectKind::Build => fixed32().map(|b| self.builds.insert(BuildId(b))),
+            SubjectKind::Sat => <[u8; 16]>::try_from(id.as_slice())
+                .ok()
+                .map(|c| self.token_ctis.insert(c)),
+            SubjectKind::GsInstance => None,
+        }
+        .is_some()
+    }
+
+    /// Whether a player admitted with these tokens is revoked.
+    pub fn covers(&self, sat: &SessionAdmissionToken, ar: &AttestationResult) -> bool {
+        self.token_ctis.contains(&sat.cti)
+            || self.token_ctis.contains(&ar.cti)
+            || self.devices.contains(&sat.did)
+            || self.accounts.contains(&sat.sub)
+            || self.sessions.contains(&sat.cnf)
+            || self.builds.contains(&ar.client_build)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -62,12 +95,7 @@ pub fn admit(
     if sat.cnf != *session_key {
         return Err((Token::Sat, TokenError::Binding));
     }
-    if revoked.token_ctis.contains(&sat.cti)
-        || revoked.token_ctis.contains(&ar.cti)
-        || revoked.devices.contains(&sat.did)
-        || revoked.accounts.contains(&sat.sub)
-        || revoked.builds.contains(&ar.client_build)
-    {
+    if revoked.covers(&sat, &ar) {
         return Err((Token::Sat, TokenError::Revoked));
     }
     Ok(Admitted { sat, ar })

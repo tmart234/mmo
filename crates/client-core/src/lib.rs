@@ -127,8 +127,17 @@ pub async fn request_admission(
     trust: &ClientTrust,
     queue: &str,
 ) -> Result<Credentials> {
-    let session_sk = SigningKey::generate(&mut OsRng);
-    let session = Ed25519Signer::new(session_sk);
+    let session = Ed25519Signer::new(SigningKey::generate(&mut OsRng));
+    request_admission_with(services, trust, queue, session).await
+}
+
+/// [`request_admission`] with a given session key.
+pub async fn request_admission_with(
+    services: &Services,
+    trust: &ClientTrust,
+    queue: &str,
+    session: Ed25519Signer,
+) -> Result<Credentials> {
     let session_pub = session.verifying_key().to_bytes();
     let keys = trust.keyset();
 

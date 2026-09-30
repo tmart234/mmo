@@ -20,8 +20,20 @@ path = "src/smoke.rs"
 name = "play"
 path = "src/play.rs"
 
+[[bin]]
+name = "revocation_load"
+path = "src/revocation_load.rs"
+
 [dependencies]
 ctrlc = { workspace = true }
 anyhow = { workspace = true }
 common = { path = "../common" }
 fpp-svc = { path = "../fpp-svc" }
+client-core = { path = "../client-core" }
+svc-revocation = { path = "../svc-revocation" }
+fpp-crypto = { path = "../fpp-crypto" }
+fpp-types = { path = "../fpp-types" }
+fpp-wire = { path = "../fpp-wire" }
+ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }

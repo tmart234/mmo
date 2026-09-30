@@ -49,6 +49,7 @@ impl ServiceKeys {
             verifier_ar: self.verifier.verifying_key(),
             broker_sat: self.broker.verifying_key(),
             server_liveness: self.liveness.verifying_key(),
+            enforcement: SigningKey::from_bytes(&[4; 32]).verifying_key(),
         }
     }
 }
@@ -60,6 +61,8 @@ struct Server {
     /// While true, the test liveness service keeps issuing SARs.
     feeding: Arc<AtomicBool>,
     checkpoints: mpsc::UnboundedReceiver<(u32, Vec<u8>)>,
+    /// Revocation events for the match (already verified, as gs-sim does).
+    revoke: mpsc::UnboundedSender<fpp_wire::RevocationEvent>,
     _stop: Arc<AtomicBool>,
 }
 
@@ -86,7 +89,16 @@ async fn start_server(keys: &Arc<ServiceKeys>, sar_noise_static: Option<[u8; 32]
     let (sar_tx, sar_rx) = watch::channel(None);
     let (cp_tx, checkpoints) = mpsc::unbounded_channel();
     let stop = Arc::new(AtomicBool::new(false));
-    tokio::spawn(game::run(socket, m, sar_rx, cp_tx, None, stop.clone()));
+    let (revoke, rev_rx) = mpsc::unbounded_channel();
+    tokio::spawn(game::run(
+        socket,
+        m,
+        sar_rx,
+        rev_rx,
+        cp_tx,
+        None,
+        stop.clone(),
+    ));
 
     let feeding = Arc::new(AtomicBool::new(true));
     let (keys, feed) = (keys.clone(), feeding.clone());
@@ -129,6 +141,7 @@ async fn start_server(keys: &Arc<ServiceKeys>, sar_noise_static: Option<[u8; 32]
         instance_pub,
         feeding,
         checkpoints,
+        revoke,
         _stop: stop,
     }
 }
@@ -322,4 +335,76 @@ async fn stolen_or_foreign_admission_tokens_are_refused() {
         end_of(r.err().unwrap()),
         SessionEnd::Rejected(Reason::SatInvalid as u16)
     );
+}
+
+/// Enforcement (04 §9): a revocation event removes the player it names, at
+/// once, and only that player; the named session cannot come back.
+#[tokio::test]
+async fn a_revocation_event_removes_the_player_it_names() {
+    use fpp_wire::{Action, RevocationEvent, Scope, SubjectKind};
+    let (keys, trust) = setup();
+    let s = start_server(&keys, None).await;
+    let a_seed = [0xa1u8; 32];
+    let a_key = Ed25519Signer::new(SigningKey::from_bytes(&a_seed));
+    let b_key = new_session();
+    let a_pub = a_key.verifying_key().to_bytes();
+    let mut a = GameClient::connect_with_grace(
+        credentials(&keys, &s, a_key, 0, MATCH),
+        &trust,
+        JOIN,
+        GRACE,
+    )
+    .await
+    .unwrap();
+    let mut b = GameClient::connect_with_grace(
+        credentials(&keys, &s, b_key, 1, MATCH),
+        &trust,
+        JOIN,
+        GRACE,
+    )
+    .await
+    .unwrap();
+    for _ in 0..5 {
+        a.step(&ClientCmd::Move { dx: 1.0, dy: 0.0 }).await.unwrap();
+        b.step(&ClientCmd::Move { dx: 1.0, dy: 0.0 }).await.unwrap();
+    }
+    let now = unix_s();
+    let event = RevocationEvent {
+        id: [1; 16],
+        subject_kind: SubjectKind::Session,
+        subject_id: a_pub.to_vec(),
+        action: Action::Kick,
+        scope: Scope::default(),
+        effective_at: now,
+        expires_at: None,
+        reason: Reason::PolicyKick as u16,
+        record: Digest::default(),
+    };
+    let sent = std::time::Instant::now();
+    s.revoke.send(event).unwrap();
+    let end = loop {
+        match a.step(&ClientCmd::Move { dx: 1.0, dy: 0.0 }).await {
+            Ok(_) => assert!(sent.elapsed() < Duration::from_secs(5), "not kicked"),
+            Err(e) => break end_of(e),
+        }
+    };
+    assert_eq!(end, SessionEnd::Kicked(Reason::PolicyKick as u16));
+    // the other player plays on
+    for _ in 0..30 {
+        b.step(&ClientCmd::Move { dx: 1.0, dy: 0.0 }).await.unwrap();
+    }
+    // and the revoked session is refused if it comes back with another slot
+    let again = credentials(
+        &keys,
+        &s,
+        Ed25519Signer::new(SigningKey::from_bytes(&a_seed)),
+        2,
+        MATCH,
+    );
+    let err = GameClient::connect_with_grace(again, &trust, JOIN, GRACE)
+        .await
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(end_of(err), SessionEnd::Rejected(Reason::Revoked as u16));
+    b.bye().await.unwrap();
 }

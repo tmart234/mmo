@@ -329,3 +329,237 @@ impl Payload for LogReceipt {
         })
     }
 }
+
+// ------------------------------------------------------------------ enforcement
+
+/// What a revocation is about (04 §9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SubjectKind {
+    /// A pseudonymous account (SAT `sub`).
+    Account = 0,
+    /// A device (DID).
+    Device = 1,
+    /// A session key (AR and SAT `cnf`).
+    Session = 2,
+    /// One SAT (`cti`).
+    Sat = 3,
+    /// A game server instance (`gs_instance_id`).
+    GsInstance = 4,
+    /// A client or server build.
+    Build = 5,
+}
+
+impl SubjectKind {
+    pub fn from_u64(v: u64) -> Option<Self> {
+        Some(match v {
+            0 => Self::Account,
+            1 => Self::Device,
+            2 => Self::Session,
+            3 => Self::Sat,
+            4 => Self::GsInstance,
+            5 => Self::Build,
+            _ => return None,
+        })
+    }
+
+    /// Length of a subject id of this kind.
+    pub fn id_len(self) -> usize {
+        match self {
+            Self::Sat => 16,
+            _ => 32,
+        }
+    }
+}
+
+/// What to do about it (04 §9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Action {
+    Kick = 0,
+    DenyAdmission = 1,
+    DowngradeTier = 2,
+    Segregate = 3,
+    Suspend = 4,
+    Ban = 5,
+    InvalidateMatch = 6,
+}
+
+impl Action {
+    pub fn from_u64(v: u64) -> Option<Self> {
+        Some(match v {
+            0 => Self::Kick,
+            1 => Self::DenyAdmission,
+            2 => Self::DowngradeTier,
+            3 => Self::Segregate,
+            4 => Self::Suspend,
+            5 => Self::Ban,
+            6 => Self::InvalidateMatch,
+            _ => return None,
+        })
+    }
+
+    /// Whether new admissions are refused.
+    pub fn denies_admission(self) -> bool {
+        matches!(self, Self::DenyAdmission | Self::Suspend | Self::Ban)
+    }
+
+    /// Whether players already in a match are removed (not only refused
+    /// admission from now on).
+    pub fn removes_players(self) -> bool {
+        matches!(
+            self,
+            Self::Kick | Self::Suspend | Self::Ban | Self::InvalidateMatch
+        )
+    }
+}
+
+/// Where an event applies; an empty list means everywhere.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Scope {
+    pub titles: Vec<String>,
+    pub queues: Vec<String>,
+    pub regions: Vec<String>,
+}
+
+impl Scope {
+    const MAX_ENTRIES: usize = 16;
+    const MAX_LEN: usize = 64;
+
+    fn to_value(&self) -> Value {
+        let list = |v: &[String]| Value::Array(v.iter().map(Value::text).collect());
+        let mut m = Vec::new();
+        for (k, v) in [
+            ("titles", &self.titles),
+            ("queues", &self.queues),
+            ("regions", &self.regions),
+        ] {
+            if !v.is_empty() {
+                m.push((Value::text(k), list(v)));
+            }
+        }
+        Value::Map(m)
+    }
+
+    fn from_value(v: &Value) -> Result<Self, WireError> {
+        const WHAT: &str = "Scope";
+        let m = MapView::new(v, WHAT)?;
+        let list = |name: &'static str| -> Result<Vec<String>, WireError> {
+            let Some(v) = m.get(&Value::text(name)) else {
+                return Ok(Vec::new());
+            };
+            let items = v.as_array().ok_or(WireError::Schema(WHAT, name))?;
+            if items.is_empty() || items.len() > Self::MAX_ENTRIES {
+                return Err(WireError::Schema(WHAT, name));
+            }
+            items
+                .iter()
+                .map(|i| {
+                    i.as_text()
+                        .filter(|t| !t.is_empty() && t.len() <= Self::MAX_LEN)
+                        .map(str::to_owned)
+                        .ok_or(WireError::Schema(WHAT, name))
+                })
+                .collect()
+        };
+        Ok(Self {
+            titles: list("titles")?,
+            queues: list("queues")?,
+            regions: list("regions")?,
+        })
+    }
+
+    /// Whether the event applies in `region`, for `queue` (a `None` is
+    /// "not known here": the scope does not narrow on it).
+    pub fn covers(&self, region: Option<&str>, queue: Option<&str>) -> bool {
+        let ok = |list: &[String], v: Option<&str>| {
+            list.is_empty() || v.is_none_or(|v| list.iter().any(|x| x == v))
+        };
+        ok(&self.regions, region) && ok(&self.queues, queue)
+    }
+}
+
+/// Enforcement → Revocation Feed → Brokers, Server Liveness, game servers
+/// (04 §9), signed with the Enforcement key. Idempotent by `id`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RevocationEvent {
+    pub id: [u8; 16],
+    pub subject_kind: SubjectKind,
+    /// [`SubjectKind::id_len`] bytes.
+    pub subject_id: Vec<u8>,
+    pub action: Action,
+    pub scope: Scope,
+    /// Unix seconds.
+    pub effective_at: u64,
+    pub expires_at: Option<u64>,
+    /// `fpp_types::Reason` code.
+    pub reason: u16,
+    /// SHA-256 of the enforcement record (in the Transparency Log).
+    pub record: Digest,
+}
+
+impl RevocationEvent {
+    /// In force at `now` (unix seconds).
+    pub fn in_force(&self, now: u64) -> bool {
+        now >= self.effective_at && self.expires_at.is_none_or(|e| now < e)
+    }
+}
+
+impl Payload for RevocationEvent {
+    const CTX: &'static str = ctx::REVOCATION;
+    const CONTENT_TYPE: &'static str = content_type::REVOCATION;
+
+    fn to_value(&self) -> Value {
+        let mut m = vec![
+            (Value::text("id"), Value::bytes(self.id.to_vec())),
+            (
+                Value::text("subject"),
+                text_map([
+                    ("kind", Value::Unsigned(self.subject_kind as u64)),
+                    ("id", Value::bytes(self.subject_id.clone())),
+                ]),
+            ),
+            (Value::text("action"), Value::Unsigned(self.action as u64)),
+            (Value::text("scope"), self.scope.to_value()),
+            (
+                Value::text("effective_at"),
+                Value::Unsigned(self.effective_at),
+            ),
+            (Value::text("reason"), Value::Unsigned(self.reason.into())),
+            (Value::text("record"), digest(&self.record)),
+        ];
+        if let Some(e) = self.expires_at {
+            m.push((Value::text("expires_at"), Value::Unsigned(e)));
+        }
+        Value::Map(m)
+    }
+
+    fn from_value(v: &Value) -> Result<Self, WireError> {
+        const WHAT: &str = "RevocationEvent";
+        let m = MapView::new(v, WHAT)?;
+        let subject = MapView::new(m.field("subject")?, WHAT)?;
+        let subject_kind = SubjectKind::from_u64(subject.u64("kind")?)
+            .ok_or(WireError::Schema(WHAT, "subject kind"))?;
+        let subject_id = subject.bytes("id")?.to_vec();
+        if subject_id.len() != subject_kind.id_len() {
+            return Err(WireError::Schema(WHAT, "subject id"));
+        }
+        let effective_at = m.u64("effective_at")?;
+        let expires_at = match m.get(&Value::text("expires_at")) {
+            None => None,
+            Some(v) => Some(v.as_u64().ok_or(WireError::Schema(WHAT, "expires_at"))?),
+        };
+        if expires_at.is_some_and(|e| e <= effective_at) {
+            return Err(WireError::Schema(WHAT, "expires_at <= effective_at"));
+        }
+        Ok(Self {
+            id: m.fixed("id")?,
+            subject_kind,
+            subject_id,
+            action: Action::from_u64(m.u64("action")?).ok_or(WireError::Schema(WHAT, "action"))?,
+            scope: Scope::from_value(m.field("scope")?)?,
+            effective_at,
+            expires_at,
+            reason: m.u16("reason")?,
+            record: Digest(m.fixed("record")?),
+        })
+    }
+}

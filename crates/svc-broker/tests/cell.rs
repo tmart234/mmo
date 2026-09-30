@@ -38,15 +38,19 @@ struct TestCell {
 async fn start(dir: &Path) -> TestCell {
     let _ = std::fs::remove_dir_all(dir);
     fpp_svc::cell::init(dir, &["liveness", "verifier", "broker"]).unwrap();
+    fpp_svc::keys::ed25519(dir, "enforcement", "enforcement.test").unwrap();
     let pki = DevPki::generate().unwrap();
     let (public, rpc) = (free_addr(), free_addr());
 
     let liveness = svc_liveness::start(
         dir,
         pki.service("liveness"),
-        public,
-        rpc,
-        vec!["broker".into()],
+        svc_liveness::Addrs {
+            public,
+            rpc,
+            callers: vec!["broker".into()],
+            feed: None,
+        },
         LivenessConfig::default(),
     )
     .unwrap();

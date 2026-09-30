@@ -17,7 +17,10 @@ use fpp_types::{DeviceTier, Did, ServerClass};
 use fpp_wire::cbor::{self, Value};
 use fpp_wire::cose::{alg, ProtectedHeader, Sign1};
 use fpp_wire::msg::frame_leaf_data;
-use fpp_wire::{AdmitPop, Checkpoint, InputCommit, InputLeaf, Payload};
+use fpp_wire::{
+    Action, AdmitPop, Checkpoint, InputCommit, InputLeaf, Payload, RevocationEvent, Scope,
+    SubjectKind,
+};
 use serde_json::{json, Value as Json};
 use sha2::{Digest as _, Sha256};
 use std::path::PathBuf;
@@ -131,6 +134,24 @@ fn sat_json(s: &SessionAdmissionToken) -> Json {
     })
 }
 
+fn revocation_json(r: &RevocationEvent) -> Json {
+    let mut scope = serde_json::Map::new();
+    for (k, v) in [
+        ("titles", &r.scope.titles),
+        ("queues", &r.scope.queues),
+        ("regions", &r.scope.regions),
+    ] {
+        if !v.is_empty() {
+            scope.insert(k.into(), json!(v));
+        }
+    }
+    json!({
+        "id": h(r.id), "subject_kind": r.subject_kind as u8, "subject_id": h(&r.subject_id),
+        "action": r.action as u8, "scope": scope, "effective_at": r.effective_at,
+        "expires_at": r.expires_at, "reason": r.reason, "record": h(r.record.0),
+    })
+}
+
 fn sar_json(s: &ServerAttestationResult) -> Json {
     json!({
         "iss": s.iss, "sub": h(s.sub.0), "iat": s.iat, "exp": s.exp, "cnf": h(s.cnf),
@@ -220,6 +241,13 @@ fn build() -> Json {
             0x13,
             KeyRole::ServerLiveness,
             "server_liveness",
+            true,
+        ),
+        key(
+            "enforcement",
+            0x14,
+            KeyRole::Enforcement,
+            "enforcement",
             true,
         ),
         key("unregistered", 0x7f, KeyRole::Session, "session", false),
@@ -499,11 +527,41 @@ fn build() -> Json {
         json!({"signer": "server-liveness", "prev_object": "sar/seq0"}),
     );
 
+    // ---- Enforcement (§9): a kick of one account, in one region, for a day.
+    let revocation = RevocationEvent {
+        id: *b"revocation-gold1",
+        subject_kind: SubjectKind::Account,
+        subject_id: sat.sub.to_vec(),
+        action: Action::Kick,
+        scope: Scope {
+            regions: vec!["eu-west".into()],
+            ..Scope::default()
+        },
+        effective_at: T0 + 100,
+        expires_at: Some(T0 + 100 + 86_400),
+        reason: fpp_types::Reason::PolicyKick as u16,
+        record: Digest(Sha256::digest(b"enforcement record").into()),
+    };
+    let revocation_cose = sign(&k("enforcement").signer, &revocation);
+    valid(
+        "revocation/kick-account",
+        "revocation",
+        &revocation_cose,
+        revocation_json(&revocation),
+        json!({"signer": "enforcement"}),
+    );
+
     // ---- Negative vectors: each must be rejected with this category.
     let mut reject = |name: &str, kind: &str, cose: Vec<u8>, category: &str| {
         objects.push(json!({"name": name, "type": kind, "expect": "reject", "category": category, "cose": h(cose)}));
     };
     let s0 = &k("session-slot0").signer;
+    reject(
+        "reject/revocation-signed-by-broker-key",
+        "revocation",
+        sign(&k("broker-sat").signer, &revocation),
+        "role",
+    );
     reject(
         "reject/checkpoint-signed-by-session-key",
         "checkpoint",
@@ -771,6 +829,7 @@ fn check_with_rust(v: &Json) {
             "verifier_ar" => KeyRole::VerifierAr,
             "broker_sat" => KeyRole::BrokerSat,
             "server_liveness" => KeyRole::ServerLiveness,
+            "enforcement" => KeyRole::Enforcement,
             other => panic!("role {other}"),
         };
         let pk: [u8; 32] = hex::decode(k["public"].as_str().unwrap())
@@ -796,6 +855,8 @@ fn check_with_rust(v: &Json) {
                     .map(|x| (sat_json(&x.payload), x.digest)),
                 "sar" => verify::<ServerAttestationResult>(&cose, &keyset)
                     .map(|x| (sar_json(&x.payload), x.digest)),
+                "revocation" => verify::<RevocationEvent>(&cose, &keyset)
+                    .map(|x| (revocation_json(&x.payload), x.digest)),
                 other => panic!("type {other}"),
             };
         match o["expect"].as_str().unwrap() {

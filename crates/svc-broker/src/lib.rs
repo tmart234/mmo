@@ -10,7 +10,9 @@
 //! are draining, and the Broker reconnects on the next request.
 //!
 //! Queues carry a tier floor (03 §4.4): `open` admits everyone; `verified`
-//! requires D2.
+//! requires D2. Accounts, devices, session keys and builds that Enforcement
+//! denied admission (or suspended, or banned) are refused (`Revoked`),
+//! from the Revocation Feed.
 
 use anyhow::{anyhow, Context, Result};
 use common::admission::accept_challenge;
@@ -22,6 +24,7 @@ use fpp_crypto::{Ed25519Signer, KeyRole, KeySet};
 use fpp_svc::api::liveness::{Placement, Request, Response};
 use fpp_tokens::{instance_id, verify_ar, SessionAdmissionToken};
 use fpp_types::{DeviceTier, MatchId, Reason};
+use fpp_wire::{RevocationEvent, SubjectKind};
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
@@ -32,6 +35,8 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 pub const BROKER_ISS: &str = "broker.dev";
+/// The region this cell serves (revocation scopes name it).
+pub const REGION: &str = "dev";
 pub const POLICY_VER: u64 = 1;
 pub const SAT_LIFETIME_S: u64 = 3600;
 /// How long the Broker waits on Server Liveness, per attempt.
@@ -110,6 +115,14 @@ pub struct Broker {
     verifier_key: Mutex<Option<VerifyingKey>>,
     pub liveness: LivenessLink,
     pub deadline: Duration,
+    /// Events from the Revocation Feed that deny admission.
+    denials: std::sync::Mutex<Vec<RevocationEvent>>,
+}
+
+/// The dev account id of a session key (the SAT's `sub`: there is no
+/// account system yet).
+pub fn account_of(session_pub: &[u8; 32]) -> [u8; 32] {
+    tagged_hash("mmo/dev-acct", session_pub)
 }
 
 fn tagged_hash(tag: &str, data: &[u8]) -> [u8; 32] {
@@ -134,7 +147,53 @@ impl Broker {
             verifier_key: Mutex::new(None),
             liveness,
             deadline: common::admission::DEFAULT_DEADLINE,
+            denials: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Take one event from the Revocation Feed.
+    pub fn on_revocation(&self, event: RevocationEvent) {
+        if event.action.denies_admission() {
+            self.denials.lock().expect("denials lock").push(event);
+        }
+    }
+
+    /// Whether Enforcement denied this AR's subjects admission to `queue` now.
+    fn denied(&self, ar: &fpp_tokens::AttestationResult, queue: &str, now: u64) -> bool {
+        let account = account_of(&ar.cnf);
+        let mut denials = self.denials.lock().expect("denials lock");
+        denials.retain(|e| e.expires_at.is_none_or(|x| x > now));
+        denials.iter().any(|e| {
+            e.effective_at <= now + fpp_tokens::SKEW_S
+                && e.scope.covers(Some(REGION), Some(queue))
+                && match e.subject_kind {
+                    SubjectKind::Account => e.subject_id == account,
+                    SubjectKind::Device => e.subject_id == ar.did.0,
+                    SubjectKind::Session => e.subject_id == ar.cnf,
+                    SubjectKind::Build => e.subject_id == ar.client_build.0,
+                    SubjectKind::Sat | SubjectKind::GsInstance => false,
+                }
+        })
+    }
+
+    /// Follow the feed at `feed` as `identity`, once Enforcement's key is
+    /// published in the cell.
+    pub async fn follow(self: Arc<Self>, identity: fpp_svc::Identity, feed: std::net::SocketAddr) {
+        let key = loop {
+            match fpp_svc::PublicKeys::read(&self.cell, "enforcement")
+                .ok()
+                .and_then(|p| VerifyingKey::from_bytes(&p.ed25519).ok())
+            {
+                Some(k) => break k,
+                None => tokio::time::sleep(Duration::from_secs(1)).await,
+            }
+        };
+        let mut keys = KeySet::default();
+        keys.insert_ed25519(KeyRole::Enforcement, key);
+        fpp_svc::follow::follow(identity, feed, keys, move |event, _| {
+            self.on_revocation(event)
+        })
+        .await
     }
 
     async fn verifier_keys(&self) -> Result<KeySet> {
@@ -185,6 +244,9 @@ impl Broker {
         if ar.tier < min {
             return refuse(Reason::TierInsufficient);
         }
+        if self.denied(&ar, &req.queue, now) {
+            return refuse(Reason::Revoked);
+        }
         let Some(p) = self.liveness.place().await else {
             return refuse(Reason::ServerDraining);
         };
@@ -193,7 +255,7 @@ impl Broker {
         let sat = SessionAdmissionToken {
             iss: BROKER_ISS.into(),
             // No account system yet: a per-key pseudonym.
-            sub: tagged_hash("mmo/dev-acct", &ar.cnf),
+            sub: account_of(&ar.cnf),
             aud: instance_id(&p.instance_pub),
             iat: now,
             exp: now + SAT_LIFETIME_S,

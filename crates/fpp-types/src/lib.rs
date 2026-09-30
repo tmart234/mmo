@@ -49,6 +49,7 @@ pub mod content_type {
     pub const SAT: &str = "application/fpp-sat+cwt";
     pub const SAR: &str = "application/fpp-sar+cwt";
     pub const LOG_RECEIPT: &str = "application/fpp-log-receipt+cbor";
+    pub const REVOCATION: &str = "application/fpp-revocation+cbor";
 }
 
 macro_rules! fixed_id {
