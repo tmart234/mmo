@@ -1207,11 +1207,8 @@ pub unsafe extern "C" fn fpp_ar_verify(
         let raw = unsafe { input(verifier_keys, 32 * verifier_key_count) }?;
         let session: [u8; 32] = unsafe { fixed(session_public_key) }?;
         let mut keys = KeySet::default();
-        for key in raw.chunks_exact(32) {
-            keys.insert_ed25519(
-                KeyRole::VerifierAr,
-                verifying_key(key.try_into().expect("32 bytes"))?,
-            );
+        for key in raw.as_chunks::<32>().0 {
+            keys.insert_ed25519(KeyRole::VerifierAr, verifying_key(*key)?);
         }
         let result = fpp_tokens::verify_ar(ar, &keys, now_s).map_err(|e| match e {
             fpp_tokens::TokenError::Verify(v) => FppStatus::from(v),
