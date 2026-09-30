@@ -13,7 +13,9 @@
 //                    Apple App Attest) -> device tier
 // - liveness.rs    : SAR chain per game server
 // - checkpoints.rs : Checkpoint verification and evidence storage
-// - attest.rs      : TPM quote appraisal
+// - attest.rs      : TPM quote appraisal (the prototype's simulated TPM)
+// - tpm2.rs        : TPM 2.0 evidence: EK chain, quote, logs, Build
+//                    Registry, credential activation (attest-tpm)
 // - watchdog.rs    : revoke when Checkpoints stop
 
 mod admission;
@@ -24,6 +26,7 @@ mod checkpoints;
 mod ctx;
 mod liveness;
 mod metrics;
+mod tpm2;
 mod watchdog;
 
 use anyhow::{Context, Result};
@@ -75,6 +78,22 @@ struct Opts {
     /// production.
     #[arg(long)]
     apple_allow_development: bool,
+
+    /// TPM manufacturers' root certificates (PEM bundle): a game server's
+    /// TPM 2.0 evidence counts only with an EK certificate chaining to one.
+    #[arg(long)]
+    tpm_ek_roots: Option<PathBuf>,
+    /// Build Registry (`sha256sum` lines: hash, label) of the GS builds CI
+    /// made with signed provenance. With one, a game server is admitted
+    /// only if the kernel measured one of these at `--gs-program` (F06).
+    #[arg(long)]
+    build_registry: Option<PathBuf>,
+    /// Where the GS binary is installed, as the kernel's IMA log names it.
+    #[arg(long, default_value = common::config::DEFAULT_GS_PROGRAM_PATH)]
+    gs_program: String,
+    /// Require the measured-boot log to show Secure Boot on.
+    #[arg(long)]
+    require_secure_boot: bool,
 }
 
 #[tokio::main]
@@ -87,7 +106,30 @@ async fn main() -> Result<()> {
 
     // Load (or create) VS signing key
     let (vs_sk_raw, _vs_pk_raw) = load_or_make_keys(&opts.vs_sk, &opts.vs_pk)?;
-    let mut ctx = VsCtx::new(Arc::new(vs_sk_raw));
+    let mut config = common::config::VsConfig {
+        gs_program_path: opts.gs_program.clone(),
+        require_secure_boot: opts.require_secure_boot,
+        ..Default::default()
+    };
+    tpm2::load_options(
+        &mut config,
+        opts.tpm_ek_roots.as_deref(),
+        opts.build_registry.as_deref(),
+    )?;
+    println!(
+        "[VS] game servers: {} TPM manufacturer root(s); Build Registry {}",
+        config.tpm_ek_roots.len(),
+        if config.build_registry.is_empty() {
+            "off (self-reported builds accepted: dev only)".to_string()
+        } else {
+            format!(
+                "{} build(s) at {}",
+                config.build_registry.len(),
+                config.gs_program_path
+            )
+        }
+    );
+    let mut ctx = VsCtx::new_with_config(Arc::new(vs_sk_raw), config);
     let status = opts
         .android_status
         .as_ref()

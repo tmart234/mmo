@@ -43,10 +43,6 @@ pub struct Session {
 }
 
 impl VsCtx {
-    pub fn new(vs_sk: Arc<SigningKey>) -> Self {
-        Self::new_with_config(vs_sk, VsConfig::default())
-    }
-
     pub fn new_with_config(vs_sk: Arc<SigningKey>, config: VsConfig) -> Self {
         let keys = Arc::new(ServiceKeys::derive(&vs_sk.to_bytes()));
         Self {

@@ -9,8 +9,8 @@ use common::{
     framing::{recv_msg, send_msg, send_msg_continue},
     keys::KeyBundle,
     proto::{
-        AttestChallenge, ChallengeRequest, CheckpointSubmit, JoinAccept, JoinRequest, PeerRole,
-        SarIssue, Sig,
+        AttestChallenge, ChallengeRequest, CheckpointSubmit, CredentialChallenge,
+        CredentialResponse, JoinAccept, JoinRequest, PeerRole, SarIssue, Sig,
     },
     tpm::{join_quote_nonce, reattest_quote_nonce, SimulatedTpm, TpmProvider},
 };
@@ -71,6 +71,27 @@ struct Opts {
     #[arg(long)]
     enable_tpm: bool,
 
+    /// A real TPM 2.0, through tpm2-tools (`TPM2TOOLS_TCTI`; default the
+    /// kernel's resource manager): the EK certificate, a quote over the VS's
+    /// challenge, the boot and IMA logs, and credential activation. The VS
+    /// then knows this binary's build from the kernel's measurement, not
+    /// from the binary (F06).
+    #[arg(long)]
+    tpm2: bool,
+    /// PCRs to quote with `--tpm2`.
+    #[arg(long, value_delimiter = ',', default_value = "0,1,2,3,4,5,6,7,10")]
+    tpm2_pcrs: Vec<u8>,
+    /// Intermediate CA certificates (PEM) between the EK certificate and
+    /// the manufacturer's root, if the TPM does not store them.
+    #[arg(long)]
+    tpm2_ek_intermediates: Option<PathBuf>,
+    /// The firmware's measured-boot log (none if missing).
+    #[arg(long, default_value = gs_sim::tpm2::BOOT_LOG)]
+    boot_log: PathBuf,
+    /// The kernel's IMA log (none if missing).
+    #[arg(long, default_value = gs_sim::tpm2::IMA_LOG)]
+    ima_log: PathBuf,
+
     /// Pinned VS key for JoinAccept.
     #[arg(long, default_value = "keys/vs_ed25519.pub")]
     vs_pk: String,
@@ -117,6 +138,30 @@ async fn main() -> Result<()> {
         None
     };
 
+    let tpm2 = if opts.tpm2 {
+        let intermediates = match &opts.tpm2_ek_intermediates {
+            Some(path) => {
+                let pem = std::fs::read_to_string(path).context("read --tpm2-ek-intermediates")?;
+                attest_core::x509::pem_certificates(&pem)
+                    .map_err(|e| anyhow!("--tpm2-ek-intermediates: {e}"))?
+            }
+            None => Vec::new(),
+        };
+        let t = gs_sim::tpm2::Tpm2::open(gs_sim::tpm2::Tpm2Options {
+            tcti: None,
+            workdir: std::env::temp_dir().join(format!("gs-sim-tpm2-{}", std::process::id())),
+            pcrs: opts.tpm2_pcrs.clone(),
+            ek_intermediates: intermediates,
+            boot_log: Some(opts.boot_log.clone()),
+            ima_log: Some(opts.ima_log.clone()),
+        })
+        .context("TPM 2.0 (--tpm2)")?;
+        println!("[GS] TPM 2.0: EK certificate and attestation key ready");
+        Some(t)
+    } else {
+        None
+    };
+
     // Bind the game port first: we advertise it in the JoinRequest.
     let game_addr: SocketAddr = opts.game_addr.parse().context("bad --game-addr")?;
     let socket = tokio::net::UdpSocket::bind(game_addr)
@@ -153,7 +198,7 @@ async fn main() -> Result<()> {
     send_msg_continue(
         &mut jsend,
         &ChallengeRequest {
-            version: 2,
+            version: common::proto::ADMISSION_VERSION,
             role: PeerRole::GameServer,
         },
     )
@@ -179,8 +224,25 @@ async fn main() -> Result<()> {
         sig_gs,
         gs_pub: gs_pk_long.to_bytes(),
         tpm_quote,
+        tpm2: match &tpm2 {
+            Some(t) => Some(
+                t.evidence(&join_quote_nonce(&challenge.nonce, &to_sign))
+                    .context("TPM 2.0 evidence")?,
+            ),
+            None => None,
+        },
     };
-    send_msg(&mut jsend, &jr).await?;
+    if let Some(t) = &tpm2 {
+        // credential activation: the VS's secret, which only this TPM opens
+        send_msg_continue(&mut jsend, &jr).await?;
+        let credential: CredentialChallenge = recv_msg(&mut jrecv)
+            .await
+            .context("recv CredentialChallenge (the VS refused the TPM evidence?)")?;
+        let secret = t.activate(&credential)?;
+        send_msg(&mut jsend, &CredentialResponse { secret }).await?;
+    } else {
+        send_msg(&mut jsend, &jr).await?;
+    }
     let ja: JoinAccept = recv_msg(&mut jrecv).await?;
     admission::verify_join_accept(&pinned_vs, &ja)?;
     let session_id = ja.session_id;

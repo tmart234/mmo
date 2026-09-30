@@ -38,6 +38,7 @@ fpp-types     = { path = "../fpp-types" }
 fpp-wire      = { path = "../fpp-wire" }
 fpp-crypto    = { path = "../fpp-crypto" }
 fpp-merkle    = { path = "../fpp-merkle" }
+attest-core   = { path = "../attest-core" }
 fpp-tokens    = { path = "../fpp-tokens" }
 fpp-session   = { path = "../fpp-session" }
 

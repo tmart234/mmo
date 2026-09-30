@@ -1,0 +1,84 @@
+name: GS release
+
+# The game server builds a Verifier admits (finding F06): built here, from
+# main, never on an operator's machine, with signed SLSA build provenance
+# (GitHub artifact attestations, Sigstore), and published as a release with
+# its Build Registry line.
+#
+# An operator deploys the release's gs-sim binary as is, to
+# /opt/fpp/gs-sim (the VS's --gs-program), and checks its provenance first:
+#
+#   gh attestation verify gs-sim-x86_64-linux --repo tmart234/mmo
+#
+# The VS's --build-registry is the registry lines of the releases it accepts
+# (build-registry.txt of each): the kernel measures the binary before it
+# runs (IMA), and the VS admits a GS only if that hash is one of them.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/gs-release.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: gs-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: |
+          cargo build --release --locked -p gs-sim
+          mkdir dist
+          cp target/release/gs-sim dist/gs-sim-x86_64-linux
+
+      - name: Build Registry line
+        id: registry
+        run: |
+          short="${GITHUB_SHA:0:12}"
+          hash="$(sha256sum dist/gs-sim-x86_64-linux | cut -d' ' -f1)"
+          echo "$hash  gs-sim x86_64-linux $short (run $GITHUB_RUN_NUMBER)" > dist/build-registry.txt
+          cat dist/build-registry.txt
+          echo "short=$short" >> "$GITHUB_OUTPUT"
+
+      # SLSA build provenance: which repository, commit, workflow and run
+      # made this binary, signed with the workflow's identity
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/gs-sim-x86_64-linux
+
+      - name: Release
+        env:
+          SHORT: ${{ steps.registry.outputs.short }}
+        run: |
+          {
+            echo "gs-sim built by CI from $GITHUB_SHA ([run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID))."
+            echo
+            echo "Check its provenance before deploying: \`gh attestation verify gs-sim-x86_64-linux --repo $GITHUB_REPOSITORY\`"
+            echo
+            echo "Build Registry line (for the VS's --build-registry):"
+            echo
+            echo '```'
+            cat dist/build-registry.txt
+            echo '```'
+          } > notes.md
+          gh release create "gs-$SHORT" dist/gs-sim-x86_64-linux dist/build-registry.txt \
+            --target "$GITHUB_SHA" --title "gs-sim $SHORT" --notes-file notes.md --latest=false

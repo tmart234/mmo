@@ -764,6 +764,7 @@ name = "gs-sim"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "attest-core",
  "bincode",
  "clap",
  "common",

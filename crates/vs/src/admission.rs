@@ -19,15 +19,14 @@ use crate::watchdog::spawn_watchdog;
 
 use common::{
     crypto::{join_request_sign_bytes, now_ms, sign, verify},
-    framing::{recv_msg, send_msg, send_msg_continue},
+    framing::{recv_msg, recv_msg_max, send_msg, send_msg_continue, MAX_JOIN_FRAME},
     proto::{
-        AttestChallenge, ChallengeRequest, ClientAdmissionRequest, JoinAccept, JoinRequest,
-        PeerRole, Sig,
+        AttestChallenge, ChallengeRequest, ClientAdmissionRequest, CredentialResponse, JoinAccept,
+        JoinRequest, PeerRole, Sig,
     },
 };
 
-/// Version in `ChallengeRequest`; bump on any admission-flow change.
-pub const ADMISSION_VERSION: u32 = 2;
+pub use common::proto::ADMISSION_VERSION;
 
 /// Admit one peer. Game servers stay connected (SARs out, Checkpoints in);
 /// clients get their tokens and leave.
@@ -67,11 +66,11 @@ pub async fn admit_and_run(connecting: quinn::Incoming, ctx: VsCtx) -> Result<()
             Ok(())
         }
         PeerRole::GameServer => {
-            let jr: JoinRequest = timeout(deadline, recv_msg(&mut recv))
+            let jr: JoinRequest = timeout(deadline, recv_msg_max(&mut recv, MAX_JOIN_FRAME))
                 .await
                 .map_err(|_| anyhow!("admission timed out after {} ms", deadline.as_millis()))?
                 .context("recv JoinRequest")?;
-            admit_game_server(conn, send, jr, challenge, ctx).await
+            admit_game_server(conn, send, recv, jr, challenge, ctx).await
         }
     }
 }
@@ -79,6 +78,7 @@ pub async fn admit_and_run(connecting: quinn::Incoming, ctx: VsCtx) -> Result<()
 async fn admit_game_server(
     conn: Connection,
     mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
     jr: JoinRequest,
     challenge: [u8; 32],
     ctx: VsCtx,
@@ -116,8 +116,30 @@ async fn admit_game_server(
         bail!("JoinRequest timestamp skew too large: {skew} ms");
     }
 
-    // 3) Build allowlist (empty = dev mode).
-    if !ctx.config.sw_hash_allowlist.is_empty()
+    // 3) The build. With TPM 2.0 evidence it is what the kernel measured
+    //    (a registered build, F06), not what the GS says; a VS with a Build
+    //    Registry admits nothing else. Without, the self-reported sw_hash
+    //    against the allowlist (empty = dev mode).
+    let tpm2 = match &jr.tpm2 {
+        Some(evidence) => Some(
+            crate::tpm2::appraise_join(
+                &ctx.config,
+                &challenge,
+                &join_bytes,
+                &jr.sw_hash,
+                evidence,
+                (now_ms() / 1000) as i64,
+            )
+            .context("TPM 2.0 appraisal failed")?,
+        ),
+        None if !ctx.config.build_registry.is_empty() => {
+            bail!("TPM 2.0 evidence required: the VS admits registered builds only, as the kernel measured them")
+        }
+        None => None,
+    };
+    let measured_build = tpm2.as_ref().is_some_and(|a| a.build.is_some());
+    if !measured_build
+        && !ctx.config.sw_hash_allowlist.is_empty()
         && !ctx.config.sw_hash_allowlist.contains(&jr.sw_hash)
     {
         bail!(
@@ -144,6 +166,33 @@ async fn admit_game_server(
         println!("[VS] TPM quote verified ({enrolled})");
     }
 
+    // 5) TPM 2.0: credential activation proves the AK that signed the quote
+    //    is in the TPM whose EK the manufacturer certified.
+    if let Some(admission) = &tpm2 {
+        send_msg_continue(&mut send, &admission.challenge)
+            .await
+            .context("send CredentialChallenge")?;
+        let answer: CredentialResponse = timeout(deadline_of(&ctx), recv_msg(&mut recv))
+            .await
+            .map_err(|_| anyhow!("credential activation timed out"))?
+            .context("recv CredentialResponse")?;
+        crate::tpm2::check_activation(admission, &answer.secret)?;
+        println!(
+            "[VS] TPM 2.0: EK ..{} certified and its AK activated; secure boot {:?}; build {}",
+            hex::encode(&admission.ek_digest[28..]),
+            admission.secure_boot,
+            admission
+                .build
+                .as_ref()
+                .map(|(hash, label)| format!("{label} ({})", hex::encode(&hash[..6])))
+                .unwrap_or_else(|| "not checked (no Build Registry)".into())
+        );
+    }
+    let sw_hash = tpm2
+        .as_ref()
+        .and_then(|a| a.build.as_ref().map(|(hash, _)| *hash))
+        .unwrap_or(jr.sw_hash);
+
     let mut session_id = [0u8; 16];
     OsRng.fill_bytes(&mut session_id);
     ctx.sessions.insert(
@@ -152,7 +201,7 @@ async fn admit_game_server(
             instance_pub: jr.ephemeral_pub,
             noise_static: jr.noise_static,
             game_addr: jr.game_addr.clone(),
-            sw_hash: jr.sw_hash,
+            sw_hash,
             last_seen_ms: now_ms(),
             revoked: false,
             last_checkpoint: None,
@@ -175,6 +224,10 @@ async fn admit_game_server(
     spawn_checkpoint_listener(&conn, ctx.clone(), session_id);
     spawn_watchdog(&conn, ctx, session_id);
     Ok(())
+}
+
+fn deadline_of(ctx: &VsCtx) -> Duration {
+    Duration::from_millis(ctx.config.admission_timeout_ms)
 }
 
 #[cfg(test)]

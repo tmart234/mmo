@@ -130,7 +130,7 @@ pub async fn request_admission(
     send_msg_continue(
         &mut send,
         &ChallengeRequest {
-            version: 2,
+            version: common::proto::ADMISSION_VERSION,
             role: PeerRole::Client,
         },
     )

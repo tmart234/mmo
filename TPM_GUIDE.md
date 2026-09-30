@@ -1,341 +1,93 @@
-# TPM (Trusted Platform Module) Integration Guide
+# TPM Guide: Admitting a Game Server by Its Hardware and Its Build
 
-> **Status (2026-09):** this guide describes the prototype. The VS now
-> issues a single-use challenge per join and binds the quote to it (F04), and
-> re-attestation quotes are seeded by a recent VS ticket signature. Quotes must
-> come from an enrolled attestation key (`VsConfig.trusted_ak_keys`) or, in dev
-> mode, the key pinned at join (F21; before this any self-made key passed).
-> Still missing: EK certificate chains and AK credential activation, parsing of
-> real `TPMS_ATTEST` quotes (only simulated Ed25519 AKs verify), and a measured
-> `sw_hash` (F05, F06 in
-> [docs/anticheat/07-gap-analysis-and-roadmap.md](docs/anticheat/07-gap-analysis-and-roadmap.md)).
-> The replacement is Verifier-side appraisal of platform evidence
-> ([docs/anticheat/03-architecture.md](docs/anticheat/03-architecture.md) §5.1),
-> which also covers client devices and their tiers (§4.4).
+A game server (GS) is admitted by the Validation Server (VS) with evidence
+from its TPM 2.0. The GS never vouches for itself: the TPM manufacturer
+vouches for the TPM, the TPM vouches for what was measured, and the kernel
+measured the GS binary before it ran. The VS checks all of it
+(`crates/attest-tpm`, `crates/vs/src/tpm2.rs`); the design is in
+[docs/anticheat/10-attestation-and-secure-boot.md](docs/anticheat/10-attestation-and-secure-boot.md)
+§5, the findings it closes (F05, F06, F21) in
+[docs/anticheat/07-gap-analysis-and-roadmap.md](docs/anticheat/07-gap-analysis-and-roadmap.md).
 
-This guide explains how to use TPM attestation in the MMO protocol for hardware-rooted trust.
-
-## Overview
-
-TPM provides **hardware-based attestation** that proves:
-1. **Code Integrity:** The GS binary hasn't been modified
-2. **Configuration Integrity:** The GS configuration is authentic
-3. **Runtime Integrity:** The GS hasn't been tampered with during execution
-
-## Architecture
-
-### **PCR (Platform Configuration Register) Usage:**
-
-| PCR | Purpose | Measurement |
-|-----|---------|-------------|
-| 0 | Code Measurement | SHA256(GS binary) |
-| 1 | Configuration | SHA256(GS ID string) |
-| 2-23 | Reserved | Future use (DLC hashes, player data, etc.) |
-
-### **Attestation Flow:**
+## What the VS checks at admission
 
 ```text
-┌─────────────┐                    ┌──────────────┐
-│     GS      │                    │      VS      │
-└──────┬──────┘                    └──────┬───────┘
-       │                                  │
-       │ 1. Boot: Extend PCRs             │
-       │    PCR[0] = SHA256(binary)       │
-       │    PCR[1] = SHA256(gs_id)        │
-       │                                  │
-       │ 2. JoinRequest + TpmQuote        │
-       ├─────────────────────────────────>│
-       │    {pcr_values, nonce, sig}      │
-       │                                  │
-       │                         3. Verify:│
-       │                       - Signature │
-       │                       - PCR[0]    │
-       │                       - PCR[1]    │
-       │                       - Nonce     │
-       │                                  │
-       │ 4. JoinAccept (if valid)         │
-       │<─────────────────────────────────┤
-       │                                  │
-       │ 5. Heartbeat (every 2s)          │
-       │    + TpmQuote (every 10th)       │
-       ├─────────────────────────────────>│
-       │                                  │
+GS (gs-sim --tpm2, tpm2-tools)                         VS
+  ChallengeRequest ─────────────────────────────────►
+                   ◄──────────────────────────────── AttestChallenge (fresh nonce)
+  JoinRequest + Tpm2Evidence ───────────────────────► 1. EK certificate → manufacturer root (--tpm-ek-roots)
+    EK public + certificate chain                        2. quote: AK is a restricted TPM signing key; signature;
+    AK public                                               nonce = H(challenge, this JoinRequest); PCR digest
+    quote (TPMS_ATTEST + signature)                      3. boot log replays to the quoted PCRs; Secure Boot
+    PCR values                                              (--require-secure-boot)
+    boot log, IMA log                                    4. IMA log replays to PCR 10; the binary the kernel
+                                                            measured at --gs-program is in --build-registry,
+                                                            and the GS's own sw_hash names the same build
+                   ◄──────────────────────────────── CredentialChallenge (secret sealed to the EK, for the AK's Name)
+  TPM2_ActivateCredential
+  CredentialResponse (secret) ──────────────────────► 5. only the TPM holding that EK and that AK opens it
+                   ◄──────────────────────────────── JoinAccept, then SARs
 ```
 
-## Usage
+Step 5 is what makes step 2 mean anything: without it, anyone could make a
+key with the right attributes in software and "quote" whatever they like.
 
-### **Development (Simulated TPM):**
+## Running it
+
+**The GS machine** needs a TPM 2.0, tpm2-tools 5, and an IMA policy that
+measures executables with SHA-256 (kernel command line
+`ima_policy=tcb ima_hash=sha256`, or a custom policy with
+`measure func=BPRM_CHECK`). Install the GS binary from a CI release (below)
+at `/opt/fpp/gs-sim`, then:
 
 ```bash
-# Start GS with simulated TPM
-cargo run --bin gs-sim -- --enable-tpm
-
-# Output:
-# [GS] initializing simulated TPM for attestation
-# [GS] generating TPM attestation quote (PCRs 0,1)
+gs-sim --tpm2 --vs vs.example:4444
+#   --tpm2-pcrs 0,1,2,3,4,5,6,7,10   (default)
+#   --tpm2-ek-intermediates ca.pem   (if the TPM's NV does not hold them)
+#   TPM2TOOLS_TCTI=device:/dev/tpmrm0 (the default)
 ```
 
-**Simulated TPM features:**
-- ✅ Full PCR bank (0-23)
-- ✅ Ed25519 signing (software key)
-- ✅ Quote generation
-- ⚠️ No hardware root of trust (testing only!)
-
-### **Production (Hardware TPM 2.0):**
-
-**Prerequisites:**
-```bash
-# Install TPM 2.0 tools
-sudo apt-get install tpm2-tools tpm2-abrmd
-
-# Verify TPM is available
-tpm2_pcrread
-
-# Check EK certificate
-tpm2_nvread 0x1c00002
-```
-
-**Hardware TPM integration** (TODO):
-```rust
-// Future implementation using tpm2-tss
-use tpm2_tss::*;
-
-pub struct HardwareTpm {
-    context: ESYS_CONTEXT,
-    ak_handle: ESYS_TR,
-}
-
-impl TpmProvider for HardwareTpm {
-    fn quote(&self, pcr_indices: &[PcrIndex], nonce: &[u8; 32]) -> Result<TpmQuote> {
-        // Call TPM2_Quote() via tpm2-tss
-        // ...
-    }
-}
-```
-
-## TPM Quote Structure
-
-```rust
-pub struct TpmQuote {
-    /// PCR values at time of quote
-    pub pcr_values: HashMap<PcrIndex, PcrValue>,
-
-    /// Nonce from verifier (prevents replay)
-    pub nonce: [u8; 32],
-
-    /// TPM signature over (pcr_values || nonce)
-    /// Simulated: Ed25519 (64 bytes)
-    /// Hardware: RSA-2048 or ECC-P256
-    pub signature: Vec<u8>,
-
-    /// Attestation Key public key
-    pub ak_pub: Vec<u8>,
-
-    /// Endorsement Key certificate (hardware only)
-    pub ek_cert: Option<Vec<u8>>,
-}
-```
-
-## Verification (VS Side)
-
-**Current Status:** ⏳ Not yet implemented (VS accepts quotes but doesn't verify)
-
-**Planned Verification Steps:**
-
-```rust
-// crates/vs/src/admission.rs
-fn verify_join_request_tpm(jr: &JoinRequest) -> Result<()> {
-    let Some(ref quote) = jr.tpm_quote else {
-        return Ok(()); // TPM optional
-    };
-
-    // 1. Verify signature
-    let ak_pub = parse_attestation_key(&quote.ak_pub)?;
-    let message = bincode::serialize(&(&quote.pcr_values, &quote.nonce))?;
-    verify_signature(&ak_pub, &message, &quote.signature)?;
-
-    // 2. Check nonce matches JoinRequest nonce
-    let mut expected_nonce = [0u8; 32];
-    expected_nonce[..16].copy_from_slice(&jr.nonce);
-    if quote.nonce != expected_nonce {
-        bail!("TPM quote nonce mismatch");
-    }
-
-    // 3. Verify PCR[0] matches sw_hash
-    let pcr0 = quote.pcr_values.get(&0)
-        .ok_or_else(|| anyhow!("PCR[0] missing from quote"))?;
-
-    // PCR[0] should be: SHA256(0 || sw_hash)
-    // (because PCRs start at 0, first extend is SHA256(0^32 || data))
-    let expected_pcr0 = {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update([0u8; 32]); // Initial PCR value
-        hasher.update(jr.sw_hash);
-        let result: [u8; 32] = hasher.finalize().into();
-        result
-    };
-
-    if pcr0 != &expected_pcr0 {
-        bail!("PCR[0] mismatch: binary hash doesn't match TPM measurement");
-    }
-
-    // 4. Verify EK certificate chain (hardware TPM only)
-    if let Some(ref ek_cert) = quote.ek_cert {
-        verify_ek_certificate_chain(ek_cert)?;
-    }
-
-    Ok(())
-}
-```
-
-## Testing
-
-### **Test Simulated TPM:**
+**The VS**:
 
 ```bash
-# Run tests
-cargo test -p common tpm
-
-# Expected output:
-# test tpm::tests::test_simulated_tpm_quote ... ok
-# test tpm::tests::test_pcr_extension ... ok
-# test tpm::tests::test_deterministic_tpm ... ok
+vs --tpm-ek-roots tpm-manufacturers.pem \
+   --build-registry build-registry.txt \
+   --gs-program /opt/fpp/gs-sim \
+   --require-secure-boot
 ```
 
-### **Test Quote Generation:**
+- `--tpm-ek-roots`: the root certificates of the TPM manufacturers you
+  accept (Infineon, STMicroelectronics, Nuvoton, Intel PTT, AMD fTPM
+  publish theirs), as one PEM bundle. Fetch them from the manufacturers,
+  not from a machine you are appraising.
+- `--build-registry`: `sha256sum` lines of the GS builds you accept. Each
+  CI release (`.github/workflows/gs-release.yml`) publishes the binary, its
+  signed SLSA build provenance, and its line (`build-registry.txt`). Check
+  the provenance before adding a line:
+  `gh attestation verify gs-sim-x86_64-linux --repo tmart234/mmo`.
+- With a Build Registry, a GS without TPM 2.0 evidence is refused: its own
+  `sw_hash` proves nothing.
 
-```rust
-use common::tpm::{SimulatedTpm, TpmProvider};
+## Development without a TPM
 
-let mut tpm = SimulatedTpm::new();
+- `swtpm` gives a real TPM 2.0 (libtpms) in software. `gs_sim::tpm2::swtpm`
+  starts one with an EK certificate from a CA of its own, as the tests do
+  (`crates/attest-tpm/tests/swtpm.rs`, the admission test in
+  `crates/vs/src/tpm2.rs`). CI installs swtpm and tpm2-tools and requires
+  those tests (`FPP_REQUIRE_SWTPM=1`).
+- `gs-sim --enable-tpm` uses the prototype's simulated TPM (an Ed25519 key,
+  `common::tpm`): it exercises the join and re-attestation flow and proves
+  nothing about hardware. A VS with a Build Registry refuses it.
 
-// Extend PCR 0 with binary hash
-let binary_hash = [0x42; 32];
-tpm.extend_pcr(0, &binary_hash).unwrap();
+## Limits
 
-// Generate quote
-let nonce = [0x99; 32];
-let quote = tpm.quote(&[0, 1], &nonce).unwrap();
-
-assert_eq!(quote.nonce, nonce);
-assert!(quote.pcr_values.contains_key(&0));
-assert!(!quote.signature.is_empty());
-```
-
-### **Test Quote Verification:**
-
-```rust
-use common::tpm::verify_quote;
-
-// Verify quote matches expected values
-let expected_pcrs = HashMap::from([(0, pcr0_value)]);
-verify_quote(&quote, &nonce, Some(&expected_pcrs)).unwrap();
-```
-
-## Security Considerations
-
-### **Simulated TPM (Development):**
-- ⚠️ **NO hardware root of trust**
-- ⚠️ Software key can be extracted
-- ⚠️ PCRs can be manipulated
-- ✅ Good for protocol testing
-- ✅ CI/CD integration
-
-### **Hardware TPM (Production):**
-- ✅ Hardware-protected signing key
-- ✅ Tamper-resistant PCRs
-- ✅ EK certificate from manufacturer
-- ✅ Secure boot chain verification
-- ⚠️ Requires physical TPM chip
-
-### **Attack Mitigations:**
-
-| Attack | Mitigation |
-|--------|-----------|
-| **Replay Attack** | Nonce in quote (VS generates fresh nonce) |
-| **Binary Modification** | PCR[0] verification against sw_hash |
-| **Configuration Tampering** | PCR[1] verification against expected GS ID |
-| **Quote Forgery** | Signature verification with AK public key |
-| **AK Key Substitution** | EK certificate chain validation (hardware) |
-
-## Roadmap
-
-### **Phase 1: Foundation** ✅
-- [x] TPM abstraction layer (`TpmProvider` trait)
-- [x] Simulated TPM implementation
-- [x] Protocol integration (JoinRequest, Heartbeat)
-- [x] GS sends TPM quotes
-
-### **Phase 2: Verification** ⏳
-- [ ] VS quote signature verification
-- [ ] PCR value validation
-- [ ] Nonce checking
-- [ ] Integration tests
-
-### **Phase 3: Hardware** 📅
-- [ ] Hardware TPM implementation (tpm2-tss)
-- [ ] EK certificate chain validation
-- [ ] Sealed storage for GS secrets
-- [ ] Performance benchmarking
-
-### **Phase 4: Advanced** 📅
-- [ ] Client-side TPM attestation
-- [ ] Multi-PCR policies (require PCRs 0+1+2)
-- [ ] TPM-based key derivation
-- [ ] Remote attestation protocol (RATS)
-
-## Performance
-
-### **Simulated TPM:**
-- Quote generation: ~100 μs
-- PCR extend: ~50 μs
-- Memory: ~4 KB (24 PCRs × 32 bytes + keys)
-
-### **Hardware TPM 2.0:**
-- Quote generation: ~50-200 ms (hardware dependent)
-- PCR extend: ~10-50 ms
-- Memory: Minimal (handled by TPM chip)
-
-**Recommendation:** Generate TPM quotes **only when needed**:
-- Always in JoinRequest
-- Every 10th heartbeat (not every heartbeat)
-- On configuration change
-
-## Troubleshooting
-
-### **"TPM not available"**
-```bash
-# Check TPM device
-ls -l /dev/tpm*
-
-# Check kernel module
-lsmod | grep tpm
-
-# Load module if needed
-sudo modprobe tpm_tis
-```
-
-### **"PCR read failed"**
-```bash
-# Check TPM resource manager
-sudo systemctl status tpm2-abrmd
-
-# Direct PCR read
-tpm2_pcrread sha256:0,1
-```
-
-### **"Quote verification failed"**
-- Check nonce matches
-- Verify PCR values are extended in correct order
-- Ensure AK public key format is correct
-
-## References
-
-- TPM 2.0 Spec: https://trustedcomputinggroup.org/resource/tpm-library-specification/
-- tpm2-tss library: https://github.com/tpm2-software/tpm2-tss
-- Remote Attestation: https://datatracker.ietf.org/doc/draft-ietf-rats-architecture/
-
----
-
-**Status:** ✅ Simulated TPM ready for testing | ⏳ Hardware TPM pending | ⏳ VS verification pending
+- Re-attestation during a session uses the simulated path only; a TPM 2.0
+  GS is appraised at join. Periodic re-quotes with the growing IMA log are
+  next.
+- Secure Boot's `dbx` (revoked boot components) is not appraised yet.
+- IMA measures a binary when it starts, not what a running process does
+  to itself; runtime integrity for servers is the confidential-VM step
+  (P5), and every GS is still held to account by its Checkpoints
+  (`fpp-audit`).
+- A Raspberry Pi 5 has no measured boot; with a TPM HAT it can still give
+  a quote and an IMA log (no Secure Boot claim).

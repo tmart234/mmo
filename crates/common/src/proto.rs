@@ -16,6 +16,10 @@ pub type OpId = [u8; 16];
 
 pub use crate::tpm::TpmQuote;
 
+/// Version in `ChallengeRequest`; bump on any admission-flow change (3: a
+/// GS's `JoinRequest.tpm2` and credential activation).
+pub const ADMISSION_VERSION: u32 = 3;
+
 /// Who is opening a control connection to the VS.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerRole {
@@ -43,7 +47,9 @@ pub struct AttestChallenge {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct JoinRequest {
     pub gs_id: String,
-    /// Hash of the GS binary (build identity; self-reported until P3, F06).
+    /// Hash of the GS binary, as the GS reports it. Self-reported, so worth
+    /// nothing alone (F06): with `tpm2` evidence the VS takes the build from
+    /// the kernel's measurement instead, and refuses a report that differs.
     pub sw_hash: [u8; 32],
     pub t_unix_ms: u64,
     pub nonce: [u8; 16],
@@ -57,7 +63,46 @@ pub struct JoinRequest {
     /// Signature by the GS long-term key over `join_request_sign_bytes`.
     pub sig_gs: Sig,
     pub gs_pub: [u8; 32],
+    /// The prototype's simulated TPM quote.
     pub tpm_quote: Option<TpmQuote>,
+    /// A real TPM 2.0's evidence (attest-tpm): the quote covers
+    /// `join_quote_nonce(challenge, join_request_sign_bytes)`. The VS answers
+    /// with a [`CredentialChallenge`] before `JoinAccept`.
+    pub tpm2: Option<Tpm2Evidence>,
+}
+
+/// A TPM 2.0's evidence for admission, as the TPM and kernel produced it.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct Tpm2Evidence {
+    /// `TPM2B_PUBLIC` of the Endorsement Key, and its certificate chain
+    /// (leaf first; to a manufacturer root the VS pins).
+    pub ek_public: Vec<u8>,
+    pub ek_chain: Vec<Vec<u8>>,
+    /// `TPM2B_PUBLIC` of the Attestation Key that signed the quote.
+    pub ak_public: Vec<u8>,
+    /// `TPMS_ATTEST` and `TPMT_SIGNATURE`.
+    pub attest: Vec<u8>,
+    pub signature: Vec<u8>,
+    /// The quoted PCRs' values (SHA-256 bank).
+    pub pcrs: std::collections::BTreeMap<u8, Vec<u8>>,
+    /// The firmware's measured-boot log and the kernel's IMA log.
+    pub boot_log: Option<Vec<u8>>,
+    pub ima_log: Option<Vec<u8>>,
+}
+
+/// VS → GS, when the JoinRequest carries `tpm2`: a secret only the TPM with
+/// that EK can open, and only for that AK (credential activation). Contents
+/// of `TPM2B_ID_OBJECT` and `TPM2B_ENCRYPTED_SECRET`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct CredentialChallenge {
+    pub id_object: Vec<u8>,
+    pub encrypted_secret: Vec<u8>,
+}
+
+/// GS → VS: what `TPM2_ActivateCredential` gave.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct CredentialResponse {
+    pub secret: Vec<u8>,
 }
 
 /// VS → GS after admitting it.
