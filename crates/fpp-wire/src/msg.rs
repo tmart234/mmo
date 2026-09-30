@@ -291,3 +291,42 @@ impl Payload for AdmitPop {
         })
     }
 }
+
+/// The Transparency Log's promise to include a leaf within `mmd_s` of
+/// `timestamp` (04 §8.2). A log that breaks it is provably at fault: the
+/// receipt is signed, and its tree heads are public.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogReceipt {
+    /// SHA-256 of the log's public key.
+    pub log_id: Digest,
+    /// RFC 9162 leaf hash of the entry.
+    pub leaf_hash: Digest,
+    /// Unix seconds.
+    pub timestamp: u64,
+    /// Maximum merge delay, seconds.
+    pub mmd_s: u64,
+}
+
+impl Payload for LogReceipt {
+    const CTX: &'static str = ctx::LOG_RECEIPT;
+    const CONTENT_TYPE: &'static str = content_type::LOG_RECEIPT;
+
+    fn to_value(&self) -> Value {
+        text_map([
+            ("log_id", digest(&self.log_id)),
+            ("leaf_hash", digest(&self.leaf_hash)),
+            ("timestamp", Value::Unsigned(self.timestamp)),
+            ("mmd_s", Value::Unsigned(self.mmd_s)),
+        ])
+    }
+
+    fn from_value(v: &Value) -> Result<Self, WireError> {
+        let m = MapView::new(v, "LogReceipt")?;
+        Ok(Self {
+            log_id: Digest(m.fixed("log_id")?),
+            leaf_hash: Digest(m.fixed("leaf_hash")?),
+            timestamp: m.u64("timestamp")?,
+            mmd_s: m.u64("mmd_s")?,
+        })
+    }
+}

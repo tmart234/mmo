@@ -23,6 +23,9 @@ use fpp_wire::{Payload, WireError};
 use sha2::{Digest as _, Sha256};
 use std::collections::HashMap;
 
+#[cfg(feature = "s1h")]
+pub mod hybrid;
+
 /// What a key is for (04-protocol.md §4). Each role may sign only its contexts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum KeyRole {
@@ -86,6 +89,22 @@ pub fn key_digest(public: &VerifyingKey) -> Digest {
 /// `kid`: the key digest truncated to 16 bytes.
 pub fn kid(public: &VerifyingKey) -> Kid {
     Kid(key_digest(public).0[..16].try_into().expect("16 bytes"))
+}
+
+/// `COSE_Key` for an ML-DSA-65 public key (draft-ietf-cose-dilithium):
+/// `{1: 7 (AKP), 3: -49 (ML-DSA-65), -1: pub}`.
+pub fn cose_key_ml_dsa(public: &[u8]) -> Value {
+    Value::Map(vec![
+        (Value::int(1), Value::int(7)),
+        (Value::int(3), Value::int(fpp_wire::cose::alg::ML_DSA_65)),
+        (Value::int(-1), Value::bytes(public.to_vec())),
+    ])
+}
+
+/// `kid` of an ML-DSA-65 key.
+pub fn ml_dsa_kid(public: &[u8]) -> Kid {
+    let enc = cbor::encode(&cose_key_ml_dsa(public)).expect("COSE_Key keys are unique");
+    Kid(Sha256::digest(enc)[..16].try_into().expect("16 bytes"))
 }
 
 /// SHA-256 of a signed object's exact bytes: the link used in `prev` chains
@@ -176,14 +195,28 @@ pub struct VerificationKey {
     pub key: VerifyingKey,
 }
 
+/// A hybrid (FPP-S1H) key: both halves, one role.
+#[derive(Clone, Debug)]
+pub struct HybridKey {
+    pub role: KeyRole,
+    pub ed: VerifyingKey,
+    pub ml: Vec<u8>,
+    pub ml_kid: Kid,
+}
+
 pub trait KeyResolver {
     fn resolve(&self, kid: &Kid) -> Option<&VerificationKey>;
+    /// A hybrid key by the `kid` of its Ed25519 half.
+    fn resolve_hybrid(&self, _ed_kid: &Kid) -> Option<&HybridKey> {
+        None
+    }
 }
 
 /// Known keys by `kid` (in production: loaded from the signed regional key bundle).
 #[derive(Clone, Debug, Default)]
 pub struct KeySet {
     keys: HashMap<Kid, VerificationKey>,
+    hybrid: HashMap<Kid, HybridKey>,
 }
 
 impl KeySet {
@@ -201,9 +234,32 @@ impl KeySet {
     }
 }
 
+impl KeySet {
+    /// Register a hybrid key (roles that require FPP-S1H). Returns the
+    /// `kid`s of its Ed25519 and ML-DSA halves.
+    pub fn insert_hybrid(&mut self, role: KeyRole, ed: VerifyingKey, ml: Vec<u8>) -> (Kid, Kid) {
+        let ed_kid = kid(&ed);
+        let ml_kid = ml_dsa_kid(&ml);
+        self.hybrid.insert(
+            ed_kid,
+            HybridKey {
+                role,
+                ed,
+                ml,
+                ml_kid,
+            },
+        );
+        (ed_kid, ml_kid)
+    }
+}
+
 impl KeyResolver for KeySet {
     fn resolve(&self, kid: &Kid) -> Option<&VerificationKey> {
         self.keys.get(kid)
+    }
+
+    fn resolve_hybrid(&self, ed_kid: &Kid) -> Option<&HybridKey> {
+        self.hybrid.get(ed_kid)
     }
 }
 

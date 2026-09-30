@@ -15,7 +15,8 @@ ed25519-dalek = "2.2"
 common = { path = "../crates/common" }
 gs-sim = { path = "../crates/gs-sim" }
 fpp-wire = { path = "../crates/fpp-wire" }
-fpp-crypto = { path = "../crates/fpp-crypto" }
+fpp-crypto = { path = "../crates/fpp-crypto", features = ["s1h"] }
+fpp-log = { path = "../crates/fpp-log" }
 fpp-session = { path = "../crates/fpp-session" }
 fpp-tokens = { path = "../crates/fpp-tokens" }
 fpp-types = { path = "../crates/fpp-types" }
@@ -48,6 +49,13 @@ bench = false
 [[bin]]
 name = "p2p_recv"
 path = "fuzz_targets/p2p_recv.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "log_parse"
+path = "fuzz_targets/log_parse.rs"
 test = false
 doc = false
 bench = false

@@ -42,10 +42,18 @@ jobs:
           restore-keys: |
             cargo-${{ runner.os }}-
 
+      # The Transparency Log is checked against Go's golang.org/x/mod/sumdb
+      # (interop/go/tlog, run by fpp-log's tests)
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: false
+
       - name: Run CI-lite (fmt, clippy, build, test, smoke)
         run: make ci
         env:
           STRICT_SMOKE: "1"
+          FPP_REQUIRE_GO: "1"
 
       # The Halo: CE port (first reference title) is 32-bit x86: keep the C SDK
       # building and conforming for that ABI.
@@ -86,6 +94,6 @@ jobs:
           PY
       - name: Fuzz (60 s per target)
         run: |
-          for target in wire_decode verify_untrusted fpp_decode p2p_recv; do
+          for target in wire_decode verify_untrusted fpp_decode p2p_recv log_parse; do
             cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$target" -- -max_total_time=60 -rss_limit_mb=2048
           done
