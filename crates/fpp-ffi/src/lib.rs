@@ -57,6 +57,14 @@ pub enum FppStatus {
     /// An external signer's callback failed, or returned a signature that
     /// does not verify under its public key (`fpp_signer_external`).
     SignerFailed = 19,
+    /// Tokens (`fpp_ar_verify`): past `exp` (with the §13 skew).
+    TokenExpired = 20,
+    /// `iat` in the future (with the §13 skew).
+    TokenNotYetValid = 21,
+    /// Bound (`cnf`) to another session key than the one proven.
+    TokenBinding = 22,
+    /// Valid, but the device tier is below the minimum asked for.
+    TokenTier = 23,
     /// P2P sessions (`fpp_p2p_*`): why a datagram was dropped or a call
     /// refused. Drop the datagram and carry on; none of these is fatal.
     /// Not a packet of this protocol, or too large.
@@ -243,6 +251,10 @@ pub extern "C" fn fpp_status_str(status: c_int) -> *const c_char {
         17 => b"signature: verification failed\0",
         18 => b"schema: payload fields invalid\0",
         19 => b"signer: the external key did not sign\0",
+        20 => b"token: expired\0",
+        21 => b"token: not yet valid\0",
+        22 => b"token: bound to another session key\0",
+        23 => b"token: device tier below the minimum\0",
         30 => b"p2p: malformed or oversized packet\0",
         31 => b"p2p: unknown session\0",
         32 => b"p2p: replayed or too old\0",
@@ -1108,6 +1120,124 @@ pub unsafe extern "C" fn fpp_verify_checkpoint(
                 roster_n: c.roster_n,
                 digest: v.digest.0,
             };
+        }
+        Ok(())
+    })
+}
+
+// ------------------------------------------------------------------ Attestation Results
+
+/// `FppArInfo.features` bits: a feature the Verifier reported true.
+pub const FPP_FEATURE_SECURE_BOOT: u32 = 1 << 0;
+pub const FPP_FEATURE_MEASURED_BOOT: u32 = 1 << 1;
+pub const FPP_FEATURE_HVCI: u32 = 1 << 2;
+pub const FPP_FEATURE_VBS: u32 = 1 << 3;
+pub const FPP_FEATURE_IOMMU: u32 = 1 << 4;
+pub const FPP_FEATURE_RUNTIME_REPORT: u32 = 1 << 5;
+pub const FPP_FEATURE_KEY_IN_HW: u32 = 1 << 6;
+pub const FPP_FEATURE_STRONG_INTEGRITY: u32 = 1 << 7;
+pub const FPP_FEATURE_APP_ATTESTED: u32 = 1 << 8;
+pub const FPP_FEATURE_STRONGBOX: u32 = 1 << 9;
+
+/// Fields of a verified Attestation Result (04-protocol.md §6.1).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct FppArInfo {
+    /// Device tier, 0..3 (D0..D3).
+    pub tier: u8,
+    /// `FPP_FEATURE_*` bits.
+    pub features: u32,
+    pub iat: u64,
+    pub exp: u64,
+    pub policy_ver: u64,
+    pub did: [u8; 32],
+    pub client_build: [u8; 32],
+    pub cti: [u8; 16],
+    /// NUL-terminated, e.g. "windows", "android", "ios".
+    pub platform: [u8; 33],
+}
+
+fn feature_bits(f: &fpp_tokens::Features) -> u32 {
+    [
+        (f.secure_boot, FPP_FEATURE_SECURE_BOOT),
+        (f.measured_boot, FPP_FEATURE_MEASURED_BOOT),
+        (f.hvci, FPP_FEATURE_HVCI),
+        (f.vbs, FPP_FEATURE_VBS),
+        (f.iommu, FPP_FEATURE_IOMMU),
+        (f.runtime_report, FPP_FEATURE_RUNTIME_REPORT),
+        (f.key_in_hw, FPP_FEATURE_KEY_IN_HW),
+        (f.strong_integrity, FPP_FEATURE_STRONG_INTEGRITY),
+        (f.app_attested, FPP_FEATURE_APP_ATTESTED),
+        (f.strongbox, FPP_FEATURE_STRONGBOX),
+    ]
+    .iter()
+    .filter(|(on, _)| *on == Some(true))
+    .fold(0, |bits, (_, bit)| bits | bit)
+}
+
+/// Appraise a joiner's Attestation Result where it is admitted (a game
+/// server, or a player host with a trust policy): signed by one of
+/// `verifier_key_count` 32-byte Verifier public keys at `verifier_keys`,
+/// valid at `now_s` (Unix seconds, ±60 s), bound to `session_public_key`
+/// (the key the joiner proved in the handshake: `FppP2pEvent.key`), and of
+/// tier `minimum_tier` or above. Fills `*info` (if not NULL) whenever the
+/// token verifies, so a caller refusing on `FPP_STATUS_TOKEN_TIER` can say
+/// which tier it had.
+///
+/// # Safety
+/// `ar` valid for `len` bytes; `verifier_keys` valid for
+/// `32 * verifier_key_count` bytes; `session_public_key` valid for 32 bytes;
+/// `info` NULL or valid for a write.
+#[no_mangle]
+pub unsafe extern "C" fn fpp_ar_verify(
+    ar: *const u8,
+    len: usize,
+    verifier_keys: *const u8,
+    verifier_key_count: usize,
+    session_public_key: *const u8,
+    now_s: u64,
+    minimum_tier: u8,
+    info: *mut FppArInfo,
+) -> FppStatus {
+    guard(|| {
+        let ar = unsafe { input(ar, len) }?;
+        if ar.is_empty() || verifier_key_count == 0 || verifier_key_count > 64 || minimum_tier > 3 {
+            return Err(FppStatus::InvalidArgument);
+        }
+        let raw = unsafe { input(verifier_keys, 32 * verifier_key_count) }?;
+        let session: [u8; 32] = unsafe { fixed(session_public_key) }?;
+        let mut keys = KeySet::default();
+        for key in raw.as_chunks::<32>().0 {
+            keys.insert_ed25519(KeyRole::VerifierAr, verifying_key(*key)?);
+        }
+        let result = fpp_tokens::verify_ar(ar, &keys, now_s).map_err(|e| match e {
+            fpp_tokens::TokenError::Verify(v) => FppStatus::from(v),
+            fpp_tokens::TokenError::Expired => FppStatus::TokenExpired,
+            fpp_tokens::TokenError::NotYetValid => FppStatus::TokenNotYetValid,
+            _ => FppStatus::Schema,
+        })?;
+        if result.cnf != session {
+            return Err(FppStatus::TokenBinding);
+        }
+        if let Some(info) = unsafe { info.as_mut() } {
+            let mut platform = [0u8; 33];
+            let name = result.platform.as_bytes();
+            let n = name.len().min(32);
+            platform[..n].copy_from_slice(&name[..n]);
+            *info = FppArInfo {
+                tier: result.tier as u8,
+                features: feature_bits(&result.features),
+                iat: result.iat,
+                exp: result.exp,
+                policy_ver: result.policy_ver,
+                did: result.did.0,
+                client_build: result.client_build.0,
+                cti: result.cti,
+                platform,
+            };
+        }
+        if (result.tier as u8) < minimum_tier {
+            return Err(FppStatus::TokenTier);
         }
         Ok(())
     })

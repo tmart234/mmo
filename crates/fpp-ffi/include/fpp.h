@@ -11,6 +11,27 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// `FppArInfo.features` bits: a feature the Verifier reported true.
+#define FPP_FEATURE_SECURE_BOOT (1 << 0)
+
+#define FPP_FEATURE_MEASURED_BOOT (1 << 1)
+
+#define FPP_FEATURE_HVCI (1 << 2)
+
+#define FPP_FEATURE_VBS (1 << 3)
+
+#define FPP_FEATURE_IOMMU (1 << 4)
+
+#define FPP_FEATURE_RUNTIME_REPORT (1 << 5)
+
+#define FPP_FEATURE_KEY_IN_HW (1 << 6)
+
+#define FPP_FEATURE_STRONG_INTEGRITY (1 << 7)
+
+#define FPP_FEATURE_APP_ATTESTED (1 << 8)
+
+#define FPP_FEATURE_STRONGBOX (1 << 9)
+
 // Largest datagram the SDK produces or accepts (no IP fragmentation).
 #define FPP_P2P_MAX_PACKET 1452
 
@@ -53,6 +74,14 @@ typedef enum FppStatus {
   // An external signer's callback failed, or returned a signature that
   // does not verify under its public key (`fpp_signer_external`).
   FPP_STATUS_SIGNER_FAILED = 19,
+  // Tokens (`fpp_ar_verify`): past `exp` (with the §13 skew).
+  FPP_STATUS_TOKEN_EXPIRED = 20,
+  // `iat` in the future (with the §13 skew).
+  FPP_STATUS_TOKEN_NOT_YET_VALID = 21,
+  // Bound (`cnf`) to another session key than the one proven.
+  FPP_STATUS_TOKEN_BINDING = 22,
+  // Valid, but the device tier is below the minimum asked for.
+  FPP_STATUS_TOKEN_TIER = 23,
   // P2P sessions (`fpp_p2p_*`): why a datagram was dropped or a call
   // refused. Drop the datagram and carry on; none of these is fatal.
   // Not a packet of this protocol, or too large.
@@ -166,6 +195,22 @@ typedef struct FppCheckpointInfo {
   uint32_t roster_n;
   uint8_t digest[32];
 } FppCheckpointInfo;
+
+// Fields of a verified Attestation Result (04-protocol.md §6.1).
+typedef struct FppArInfo {
+  // Device tier, 0..3 (D0..D3).
+  uint8_t tier;
+  // `FPP_FEATURE_*` bits.
+  uint32_t features;
+  uint64_t iat;
+  uint64_t exp;
+  uint64_t policy_ver;
+  uint8_t did[32];
+  uint8_t client_build[32];
+  uint8_t cti[16];
+  // NUL-terminated, e.g. "windows", "android", "ios".
+  uint8_t platform[33];
+} FppArInfo;
 
 // One event. Variable-size fields go into the caller's data buffer; the
 // `*_len` fields say how to split it.
@@ -454,6 +499,28 @@ enum FppStatus fpp_verify_checkpoint(const uint8_t *object,
                                      size_t len,
                                      const uint8_t *instance_public_key,
                                      struct FppCheckpointInfo *info);
+
+// Appraise a joiner's Attestation Result where it is admitted (a game
+// server, or a player host with a trust policy): signed by one of
+// `verifier_key_count` 32-byte Verifier public keys at `verifier_keys`,
+// valid at `now_s` (Unix seconds, ±60 s), bound to `session_public_key`
+// (the key the joiner proved in the handshake: `FppP2pEvent.key`), and of
+// tier `minimum_tier` or above. Fills `*info` (if not NULL) whenever the
+// token verifies, so a caller refusing on `FPP_STATUS_TOKEN_TIER` can say
+// which tier it had.
+//
+// # Safety
+// `ar` valid for `len` bytes; `verifier_keys` valid for
+// `32 * verifier_key_count` bytes; `session_public_key` valid for 32 bytes;
+// `info` NULL or valid for a write.
+enum FppStatus fpp_ar_verify(const uint8_t *ar,
+                             size_t len,
+                             const uint8_t *verifier_keys,
+                             size_t verifier_key_count,
+                             const uint8_t *session_public_key,
+                             uint64_t now_s,
+                             uint8_t minimum_tier,
+                             struct FppArInfo *info);
 
 // Generate a static X25519 key pair (the host's identity for its invites).
 // `private_out` and `public_out`: 32 bytes each. Keep the private key secret;
