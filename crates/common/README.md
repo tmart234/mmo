@@ -1,13 +1,11 @@
 # common
 
-Shared types and utilities used across the workspace.
+What the prototype's processes share:
 
-- **proto/**: wire models (tickets, inputs, snapshots, receipts).
-- **crypto/**: helpers (e.g., `client_input_sign_bytes`, time).
-- **framing/**: TCP length-prefix helpers and (future) header/seq defs.
-
-
-
-Quick check
-```bash
-cargo test -p common
+- `proto`: control-link messages (QUIC, bincode-framed);
+- `framing`: length-prefixed frames with size limits;
+- `pki`: the dev CA, TLS identities, and TLS 1.3 / QUIC configs (FPP-T1);
+- `keys`: service keys and the public key bundle;
+- `crypto`: signing helpers and time;
+- `config`: the VS's configuration;
+- `tpm`: the join-quote nonce.

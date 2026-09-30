@@ -20,11 +20,13 @@ Client <-> GS <-> VS, speaking the Fair-Play Protocol (FPP v1).
 Flow:
 1. **GS join** (QUIC control link, TLS 1.3 with X25519MLKEM768): VS challenge →
    `JoinRequest` signed by the GS long-term key, binding its instance key,
-   game-port key and address (plus a TPM quote over the challenge) →
-   `JoinAccept`.
+   game-port key and address → `JoinAccept`. With a TPM 2.0 (`gs-sim
+   --tpm2`) it also carries a quote over the challenge, the boot and IMA
+   logs and the EK certificate, and the VS runs credential activation and
+   checks the build the kernel measured (`TPM_GUIDE.md`).
 2. **Liveness**: VS → GS a new SAR every 2 s (`exp = iat + 10 s`); GS → VS a
-   signed Checkpoint every epoch. No Checkpoint, a bad one, or a failed TPM
-   re-attestation revokes the GS: SARs stop.
+   signed Checkpoint every epoch. No Checkpoint, or a bad one, revokes the
+   GS: SARs stop.
 3. **Client admission** (QUIC control link): VS challenge → session-key proof →
    AR (tier D0 until platform evidence is appraised, P3) + SAT for the match,
    refused where the queue's tier floor is higher (e.g. `verified`).

@@ -20,9 +20,6 @@ pub struct OpResult {
     pub processed_at_ms: u64,
     /// Whether the operation succeeded
     pub success: bool,
-    /// Balance after operation (if applicable) - used for idempotent response
-    #[allow(dead_code)]
-    pub balance_after: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -120,14 +117,13 @@ mod tests {
             OpResult {
                 processed_at_ms: 1000,
                 success: true,
-                balance_after: Some(100),
             },
         );
 
         // Second check: should return the result (replay detected)
         let result = runtime.check_idempotency(&client_pub, &op_id);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().balance_after, Some(100));
+        assert!(result.unwrap().success);
     }
 
     #[test]
@@ -144,7 +140,6 @@ mod tests {
             OpResult {
                 processed_at_ms: 1000,
                 success: true,
-                balance_after: Some(100),
             },
         );
 

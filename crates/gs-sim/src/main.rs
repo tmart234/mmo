@@ -12,7 +12,7 @@ use common::{
         AttestChallenge, ChallengeRequest, CheckpointSubmit, CredentialChallenge,
         CredentialResponse, JoinAccept, JoinRequest, PeerRole, SarIssue, Sig,
     },
-    tpm::{join_quote_nonce, reattest_quote_nonce, SimulatedTpm, TpmProvider},
+    tpm::join_quote_nonce,
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use fpp_crypto::Ed25519Signer;
@@ -29,16 +29,10 @@ use rand::{rngs::OsRng, RngCore};
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
     path::PathBuf,
-    sync::{atomic::AtomicBool, Arc, Mutex},
+    sync::{atomic::AtomicBool, Arc},
     time::Duration,
 };
-use tokio::sync::{mpsc, watch, Mutex as TokioMutex};
-
-/// (seq, exact bytes) of the newest verified SAR, for seeding TPM quotes.
-type LatestSar = Arc<Mutex<Option<(u64, Vec<u8>)>>>;
-
-/// Re-attest with the TPM every this many Checkpoints.
-const TPM_REATTEST_EPOCHS: u32 = 10;
+use tokio::sync::{mpsc, watch};
 
 #[derive(Parser, Debug)]
 struct Opts {
@@ -65,11 +59,6 @@ struct Opts {
     gs_sk: String,
     #[arg(long, default_value = "keys/gs_ed25519.pub")]
     gs_pk: String,
-
-    /// Simulated TPM: quote at join (bound to the VS challenge) and
-    /// re-attest every few Checkpoints (seeded by a recent SAR).
-    #[arg(long)]
-    enable_tpm: bool,
 
     /// A real TPM 2.0, through tpm2-tools (`TPM2TOOLS_TCTI`; default the
     /// kernel's resource manager): the EK certificate, a quote over the VS's
@@ -123,20 +112,6 @@ async fn main() -> Result<()> {
 
     let exe = std::env::current_exe()?;
     let sw_hash = file_sha256(&exe)?;
-
-    let tpm: Option<Arc<TokioMutex<SimulatedTpm>>> = if opts.enable_tpm {
-        let mut tpm = SimulatedTpm::new();
-        tpm.extend_pcr(0, &sw_hash).context("extend PCR 0")?;
-        tpm.extend_pcr(1, opts.gs_id.as_bytes())
-            .context("extend PCR 1")?;
-        println!(
-            "[GS] simulated TPM: PCR0=sw_hash, PCR1=gs_id ({})",
-            opts.gs_id
-        );
-        Some(Arc::new(TokioMutex::new(tpm)))
-    } else {
-        None
-    };
 
     let tpm2 = if opts.tpm2 {
         let intermediates = match &opts.tpm2_ek_intermediates {
@@ -204,15 +179,6 @@ async fn main() -> Result<()> {
     )
     .await?;
     let challenge: AttestChallenge = recv_msg(&mut jrecv).await.context("recv AttestChallenge")?;
-    let tpm_quote = match &tpm {
-        Some(t) => Some(
-            t.lock()
-                .await
-                .quote(&[0, 1], &join_quote_nonce(&challenge.nonce, &to_sign))
-                .context("join TPM quote")?,
-        ),
-        None => None,
-    };
     let jr = JoinRequest {
         gs_id: opts.gs_id.clone(),
         sw_hash,
@@ -223,7 +189,6 @@ async fn main() -> Result<()> {
         game_addr: opts.game_addr.clone(),
         sig_gs,
         gs_pub: gs_pk_long.to_bytes(),
-        tpm_quote,
         tpm2: match &tpm2 {
             Some(t) => Some(
                 t.evidence(&join_quote_nonce(&challenge.nonce, &to_sign))
@@ -250,10 +215,8 @@ async fn main() -> Result<()> {
 
     // ---- SAR chain from the VS: verified, and must certify our own keys.
     let (sar_tx, sar_rx) = watch::channel::<Option<Vec<u8>>>(None);
-    let latest_sar: LatestSar = Arc::new(Mutex::new(None));
     {
         let conn = conn.clone();
-        let latest = latest_sar.clone();
         let keyset = keyset.clone();
         tokio::spawn(async move {
             let mut chain: Option<SarChain> = None;
@@ -282,8 +245,6 @@ async fn main() -> Result<()> {
                     eprintln!("[GS] rejected SAR from VS: {e}; stopping");
                     break;
                 }
-                let seq = chain.as_ref().map(|c| c.current().seq).unwrap_or(0);
-                *latest.lock().unwrap() = Some((seq, issue.sar.clone()));
                 if sar_tx.send(Some(issue.sar)).is_err() {
                     break;
                 }
@@ -292,35 +253,13 @@ async fn main() -> Result<()> {
         });
     }
 
-    // ---- Checkpoints to the VS (with periodic TPM re-attestation).
+    // ---- Checkpoints to the VS.
     let (cp_tx, mut cp_rx) = mpsc::unbounded_channel::<(u32, Vec<u8>)>();
     {
         let conn = conn.clone();
         tokio::spawn(async move {
-            while let Some((epoch, checkpoint)) = cp_rx.recv().await {
-                let seeded = latest_sar.lock().unwrap().clone();
-                let (tpm_quote, quote_sar_seq) = match (&tpm, seeded) {
-                    (Some(t), Some((seq, sar)))
-                        if epoch % TPM_REATTEST_EPOCHS == TPM_REATTEST_EPOCHS - 1 =>
-                    {
-                        let nonce = reattest_quote_nonce(&session_id, u64::from(epoch), &sar);
-                        match t.lock().await.quote(&[0, 1], &nonce) {
-                            Ok(q) => {
-                                println!(
-                                    "[GS] TPM re-attestation with checkpoint {epoch} (SAR #{seq})"
-                                );
-                                (Some(q), seq)
-                            }
-                            Err(_) => (None, 0),
-                        }
-                    }
-                    _ => (None, 0),
-                };
-                let submit = CheckpointSubmit {
-                    checkpoint,
-                    tpm_quote,
-                    quote_sar_seq,
-                };
+            while let Some((_epoch, checkpoint)) = cp_rx.recv().await {
+                let submit = CheckpointSubmit { checkpoint };
                 let sent = async {
                     let mut uni = conn.open_uni().await?;
                     send_msg(&mut uni, &submit).await

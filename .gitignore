@@ -26,8 +26,8 @@ target
 # per-crate keys/ directories.
 crates/*/keys/
 
-# Runtime output of vs/gs-sim (evidence and ledger logs)
-da_log/
+# Runtime output of gs-sim (the match ledger)
+ledger/
 
 # Python bytecode (interop checkers)
 __pycache__/

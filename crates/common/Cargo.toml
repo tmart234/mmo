@@ -7,10 +7,8 @@ publish.workspace = true
 
 [dependencies]
 anyhow           = { workspace = true }
-thiserror        = { workspace = true }
 
 tokio            = { workspace = true }
-futures          = { workspace = true }
 quinn            = { workspace = true }
 rustls           = { workspace = true }
 rcgen            = { workspace = true }

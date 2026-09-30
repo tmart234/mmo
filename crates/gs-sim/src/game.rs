@@ -402,7 +402,6 @@ impl Match {
                         crate::state::OpResult {
                             processed_at_ms: now_ms,
                             success: true,
-                            balance_after: None,
                         },
                     );
                     self.ledger_out.push(format!(

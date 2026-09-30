@@ -5,9 +5,9 @@
 use common::framing::{decode_frame, MAX_CONTROL_FRAME};
 use common::proto::{
     AttestChallenge, ChallengeRequest, CheckpointSubmit, ClientAdmission, ClientAdmissionRequest,
-    ClientCmd, JoinAccept, JoinRequest, SarIssue, WorldSnapshot,
+    ClientCmd, CredentialChallenge, CredentialResponse, JoinAccept, JoinRequest, SarIssue,
+    WorldSnapshot,
 };
-use common::tpm::TpmQuote;
 use libfuzzer_sys::fuzz_target;
 
 fn decode<T: serde::de::DeserializeOwned>(body: &[u8]) {
@@ -19,7 +19,7 @@ fuzz_target!(|data: &[u8]| {
     let Some((&selector, body)) = data.split_first() else {
         return;
     };
-    match selector % 11 {
+    match selector % 12 {
         0 => decode::<JoinRequest>(body),
         1 => decode::<JoinAccept>(body),
         2 => decode::<ChallengeRequest>(body),
@@ -30,6 +30,7 @@ fuzz_target!(|data: &[u8]| {
         7 => decode::<ClientAdmission>(body),
         8 => decode::<ClientCmd>(body),
         9 => decode::<WorldSnapshot>(body),
-        _ => decode::<TpmQuote>(body),
+        10 => decode::<CredentialChallenge>(body),
+        _ => decode::<CredentialResponse>(body),
     }
 });

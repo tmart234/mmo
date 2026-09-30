@@ -13,7 +13,7 @@ endif
 
 # -------- Headless package set (what CI builds/tests) --------
 # Keep GUI crates (e.g., client-bevy) out of CI to avoid winit display issues.
-HEADLESS_PKGS := fpp-types fpp-wire fpp-crypto fpp-merkle fpp-tokens fpp-session fpp-ffi fpp-audit fpp-log fpp-svc svc-log attest-core attest-android attest-apple attest-tpm common client-core gs-core gs-sim vs tools
+HEADLESS_PKGS := fpp-types fpp-wire fpp-crypto fpp-merkle fpp-tokens fpp-session fpp-ffi fpp-audit fpp-log fpp-svc svc-log attest-core attest-android attest-apple attest-tpm common client-core gs-sim vs tools
 PKG_FLAGS := $(foreach p,$(HEADLESS_PKGS),-p $(p))
 
 # -------- Phonies --------
@@ -180,7 +180,7 @@ pi-vs-smoke: pi-vs
 	SMOKE_VS_BIN=target/$(PI_TARGET)/release/vs SMOKE_VS_WRAPPER=$(PI_QEMU) SMOKE_VS_STARTUP_MS=1500 \
 		QEMU_LD_PREFIX=$(PI_SYSROOT) cargo run -p tools --bin smoke
 
-# libfpp.a for the Pi 5 host loader (LP64 aarch64; the game itself is ILP32,
+# libfpp.a for the Pi 5 host loader (LP64 aarch64; the itself is ILP32,
 # docs/anticheat/08 §8), checked as ffi-c-test checks the x86 builds.
 ffi-c-test-aarch64:
 	$(PI_ENV) cargo build -p fpp-ffi --target $(PI_TARGET)

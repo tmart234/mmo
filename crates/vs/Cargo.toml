@@ -7,21 +7,14 @@ publish.workspace = true
 
 [dependencies]
 anyhow        = { workspace = true }
-thiserror     = { workspace = true }
 tokio         = { workspace = true }
-futures       = { workspace = true }
 quinn         = { workspace = true }
-rustls        = { workspace = true }
 clap          = { workspace = true }
-serde         = { workspace = true }
-bincode       = { workspace = true }
 dashmap       = { workspace = true }
 ed25519-dalek = { workspace = true }
 sha2          = { workspace = true }
 rand          = { workspace = true }
 hex           = { workspace = true }
-prometheus    = { workspace = true }
-lazy_static   = { workspace = true }
 
 common        = { path = "../common" }
 fpp-types     = { path = "../fpp-types" }

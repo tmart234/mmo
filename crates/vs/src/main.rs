@@ -13,19 +13,16 @@
 //                    Apple App Attest) -> device tier
 // - liveness.rs    : SAR chain per game server
 // - checkpoints.rs : Checkpoint verification and evidence storage
-// - attest.rs      : TPM quote appraisal (the prototype's simulated TPM)
 // - tpm2.rs        : TPM 2.0 evidence: EK chain, quote, logs, Build
 //                    Registry, credential activation (attest-tpm)
 // - watchdog.rs    : revoke when Checkpoints stop
 
 mod admission;
 mod appraisal;
-mod attest;
 mod broker;
 mod checkpoints;
 mod ctx;
 mod liveness;
-mod metrics;
 mod tpm2;
 mod watchdog;
 
@@ -100,10 +97,6 @@ struct Opts {
 async fn main() -> Result<()> {
     let opts = Opts::parse();
 
-    // Initialize Prometheus metrics
-    metrics::register_metrics();
-    println!("[VS] Prometheus metrics initialized");
-
     // Load (or create) VS signing key
     let (vs_sk_raw, _vs_pk_raw) = load_or_make_keys(&opts.vs_sk, &opts.vs_pk)?;
     let mut config = common::config::VsConfig {
@@ -165,7 +158,6 @@ async fn main() -> Result<()> {
     let identity = common::pki::ServerIdentity::load(&opts.tls_cert, &opts.tls_key)?;
     let (endpoint, _local_addr) = make_endpoint(&opts.bind, &identity)?;
     println!("[VS] listening on {}", opts.bind);
-    println!("[VS] Metrics available via metrics::gather_metrics()");
 
     loop {
         let incoming_opt = endpoint.accept().await; // Option<Incoming>

@@ -7,12 +7,12 @@
 // - GS: fpp-session game port, §7.2 admission, InputFrames, InputCommits,
 //   signed Checkpoints, CheckpointHeads, SarUpdates
 // - client: admission, join, play, SAR chain, tier floor of the `verified` queue
-// - TPM: join quote bound to the VS challenge, re-attestation seeded by a SAR
 //
 // 1. Ensure dev keys exist. 2. Spawn VS. 3. Spawn gs-sim --test-once.
 // 4. Run a client that must be refused the `verified` queue, then
-//    client-sim --smoke-test. 5. Wait for gs-sim, kill VS. 6. Repeat with
-//    the simulated TPM. Any failure fails the run (LENIENT_SMOKE=1 only warns).
+//    client-sim --smoke-test. 5. Wait for gs-sim, kill VS. Any failure
+//    fails the run (LENIENT_SMOKE=1 only warns). Admission with a real TPM
+//    2.0 is tested end to end against swtpm in vs/src/tpm2.rs.
 //
 // SMOKE_VS_BIN runs another VS binary, SMOKE_VS_WRAPPER runs it through a
 // command (`make pi-vs-smoke`: the aarch64 VS for a Raspberry Pi under
@@ -134,13 +134,9 @@ fn assert_recent_ledger_has_move() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run a single smoke test pass with optional TPM enabled.
-fn run_smoke_pass(enable_tpm: bool) -> Result<(bool, bool)> {
-    let pass_name = if enable_tpm {
-        "TPM-enabled"
-    } else {
-        "standard"
-    };
+/// Run the smoke pass: (clients ok, gs ok).
+fn run_smoke_pass() -> Result<(bool, bool)> {
+    let pass_name = "smoke";
     println!(
         "\n[SMOKE] ========== Starting {} pass ==========",
         pass_name
@@ -170,14 +166,10 @@ fn run_smoke_pass(enable_tpm: bool) -> Result<(bool, bool)> {
         .unwrap_or(200);
     thread::sleep(Duration::from_millis(startup_ms));
 
-    // 2. Spawn GS (with or without TPM)
+    // 2. Spawn GS
     let gs_bin = bin_path("gs-sim");
     let mut gs_cmd = Command::new(&gs_bin);
     gs_cmd.args(["--vs", "127.0.0.1:4444", "--test-once", "--test-secs", "12"]);
-
-    if enable_tpm {
-        gs_cmd.arg("--enable-tpm");
-    }
 
     let mut gs_child = gs_cmd
         .stdout(Stdio::inherit())
@@ -233,8 +225,8 @@ fn main() -> Result<()> {
     // 1. Make sure VS signing keys exist.
     ensure_vs_keys()?;
 
-    // 2. Run standard smoke test (without TPM)
-    let (client_ok, gs_ok) = run_smoke_pass(false)?;
+    // 2. Run the smoke pass
+    let (client_ok, gs_ok) = run_smoke_pass()?;
 
     // 3. Check ledger
     match assert_recent_ledger_has_move() {
@@ -248,32 +240,17 @@ fn main() -> Result<()> {
         }
     }
 
-    // 4. Run TPM-enabled smoke test (unless SKIP_TPM_TEST is set)
-    let (tpm_client_ok, tpm_gs_ok) = if std::env::var("SKIP_TPM_TEST").is_err() {
-        // Small delay between passes
-        thread::sleep(Duration::from_millis(500));
-        run_smoke_pass(true)?
-    } else {
-        println!("[SMOKE] Skipping TPM test (SKIP_TPM_TEST is set)");
-        (true, true)
-    };
-
     // 5. Summary
     println!("\n[SMOKE] ========== Summary ==========");
     println!(
-        "[SMOKE] Standard pass: client={}, gs={}",
+        "[SMOKE] client={}, gs={}",
         if client_ok { "OK" } else { "FAIL" },
         if gs_ok { "OK" } else { "FAIL" }
-    );
-    println!(
-        "[SMOKE] TPM pass: client={}, gs={}",
-        if tpm_client_ok { "OK" } else { "FAIL" },
-        if tpm_gs_ok { "OK" } else { "FAIL" }
     );
 
     // 6. Exit policy
     let strict = std::env::var("LENIENT_SMOKE").is_err();
-    let all_ok = client_ok && gs_ok && tpm_client_ok && tpm_gs_ok;
+    let all_ok = client_ok && gs_ok;
 
     if strict && !all_ok {
         std::process::exit(1);

@@ -138,8 +138,7 @@ impl InputLeaf {
     }
 }
 
-/// GS-instance-signed commitment per match per epoch (§8.1). Replaces the
-/// prototype's former Heartbeat + TranscriptDigest pair with one object.
+/// GS-instance-signed commitment per match per epoch (§8.1).
 ///
 /// Every Merkle root is signed together with its leaf count: RFC 9162
 /// inclusion proofs do not authenticate the tree size on their own.

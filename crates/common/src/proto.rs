@@ -14,11 +14,9 @@ pub type Sig = Vec<u8>;
 
 pub type OpId = [u8; 16];
 
-pub use crate::tpm::TpmQuote;
-
-/// Version in `ChallengeRequest`; bump on any admission-flow change (3: a
-/// GS's `JoinRequest.tpm2` and credential activation).
-pub const ADMISSION_VERSION: u32 = 3;
+/// Version in `ChallengeRequest`; bump on any admission-flow change (4: the
+/// simulated TPM quote and re-attestation fields are gone).
+pub const ADMISSION_VERSION: u32 = 4;
 
 /// Who is opening a control connection to the VS.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,8 +61,6 @@ pub struct JoinRequest {
     /// Signature by the GS long-term key over `join_request_sign_bytes`.
     pub sig_gs: Sig,
     pub gs_pub: [u8; 32],
-    /// The prototype's simulated TPM quote.
-    pub tpm_quote: Option<TpmQuote>,
     /// A real TPM 2.0's evidence (attest-tpm): the quote covers
     /// `join_quote_nonce(challenge, join_request_sign_bytes)`. The VS answers
     /// with a [`CredentialChallenge`] before `JoinAccept`.
@@ -116,20 +112,16 @@ pub struct JoinAccept {
 }
 
 /// VS → GS: the next Server Attestation Result in this instance's chain
-/// (successor of the PlayTicket, 04 §6.3). Every ~2 s while blessed.
+/// (04 §6.3). Every ~2 s while blessed.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SarIssue {
     pub sar: Vec<u8>,
 }
 
-/// GS → VS: one signed Checkpoint per epoch (04 §8.1), replacing the
-/// Heartbeat + TranscriptDigest pair. Optionally carries a TPM
-/// re-attestation quote seeded by the SAR with sequence `quote_sar_seq`.
+/// GS → VS: one signed Checkpoint per epoch (04 §8.1).
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CheckpointSubmit {
     pub checkpoint: Vec<u8>,
-    pub tpm_quote: Option<TpmQuote>,
-    pub quote_sar_seq: u64,
 }
 
 // ---------------------------------------------------------------- client <-> VS

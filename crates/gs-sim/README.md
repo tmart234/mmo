@@ -1,20 +1,14 @@
 # gs-sim
 
-Authoritative game server (simulator):
+The reference game server. It joins the VS, keeps its SAR chain, serves one
+match to clients over `fpp-session`, and signs one Checkpoint per epoch.
 
-- Accepts client connections, validates **PlayTicket** + **signatures**.
-- Pipes verified inputs into `gs-core::Runner`.
-- Emits **WorldSnapshot** (authoritative state).
-- Heartbeats to VS and expects a **ProtectedReceipt** (VS signs transcript tip).
-- Supports multiple clients (one task per accept).
-- Maintains a rolling **`receipt_tip`**
-- Clamps movement server-side (anti-speedhack).
-
-Current status
-- ✅ Ticket pinning (hash-chained, short-lived) with rollover grace
-- ✅ Signed client inputs, nonce ordering, movement clamp
-- ✅ Rolling receipt_tip + ProtectedReceipt loop with VS
-- ✅ Heartbeat re-attestation (sw_hash)
-- ✅ Multi-client shared state map.
-- ⏳ Sequence window & token buckets (edge guards).
-- ⏳ AOI/LOS replication.
+- **Admission:** a challenge, then a `JoinRequest`. With `--tpm2`, the
+  request carries TPM 2.0 evidence: the EK certificate, a quote over the
+  challenge, and the boot and IMA logs. The VS then checks the build as the
+  kernel measured it, and runs credential activation (`src/tpm2.rs`,
+  `TPM_GUIDE.md`).
+- **Match (`src/game.rs`):** §7.2 admission of clients (SAT, AR, AdmitPop),
+  InputFrames and InputCommits, host-side movement clamps, CheckpointHeads
+  and SarUpdates to clients, and the match ledger (`ledger/`, JSON lines).
+- **Blessing:** the match stops when the SAR chain lapses.
