@@ -1,12 +1,15 @@
 //! Certificates and verified TLS configuration for every QUIC link.
 //!
-//! Every connection in the workspace (client -> GS, GS -> VS) verifies the
-//! server's certificate chain against a pinned CA. There is no
-//! "skip verification" path. For local development, `DevPki::generate()`
-//! makes a CA plus server certificates for the VS (`vs.dev`) and the GS
-//! client port (`localhost`), and `gen_keys` writes them under `keys/`.
-//! In production the CA is the publisher's game-server CA
-//! (docs/anticheat/04-protocol.md §7.1).
+//! Every connection in the workspace (client -> Verifier, Broker, GS;
+//! GS -> Server Liveness) verifies the server's certificate chain against a
+//! pinned CA. There is no "skip verification" path. For local development,
+//! `DevPki::generate()` makes a CA plus one certificate per public service
+//! (`<service>.dev`, each with its own key) and one for the GS client port
+//! (`localhost`), and `gen_keys` writes them under `keys/`. In production
+//! the CA is the publisher's (docs/anticheat/04-protocol.md §7.1).
+//!
+//! These are the public endpoints. Services talk to each other inside their
+//! cell over mutual TLS with the cell's own CA (`fpp-svc`).
 
 use anyhow::{anyhow, Context, Result};
 use rcgen::{
@@ -16,16 +19,30 @@ use rcgen::{
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::{fs, path::Path, sync::Arc};
 
-/// TLS server name the GS uses when dialing the VS.
-pub const VS_SERVER_NAME: &str = "vs.dev";
+/// The trust-plane services with public endpoints: Server Liveness (game
+/// servers join it), the Verifier and the Broker (clients).
+pub const PUBLIC_SERVICES: [&str; 3] = ["liveness", "verifier", "broker"];
+
+/// TLS server name of a public service (`liveness.dev`, ...).
+pub fn server_name(service: &str) -> String {
+    format!("{service}.dev")
+}
+
 /// TLS server name clients use when dialing a GS client port.
 pub const GS_SERVER_NAME: &str = "localhost";
 
 pub const DEFAULT_CA_CERT: &str = "keys/dev_ca.der";
-pub const DEFAULT_VS_TLS_CERT: &str = "keys/vs_tls.der";
-pub const DEFAULT_VS_TLS_KEY: &str = "keys/vs_tls.key.der";
 pub const DEFAULT_GS_TLS_CERT: &str = "keys/gs_tls.der";
 pub const DEFAULT_GS_TLS_KEY: &str = "keys/gs_tls.key.der";
+
+/// Default certificate and key files of a public service
+/// (`keys/<service>_tls.der`, `keys/<service>_tls.key.der`).
+pub fn default_tls_files(service: &str) -> (String, String) {
+    (
+        format!("keys/{service}_tls.der"),
+        format!("keys/{service}_tls.key.der"),
+    )
+}
 
 /// A server certificate (DER) and its PKCS#8 private key (DER).
 #[derive(Clone)]
@@ -44,10 +61,11 @@ impl ServerIdentity {
     }
 }
 
-/// Development PKI: one CA and the two server identities it signs.
+/// Development PKI: one CA and the server identities it signs.
 pub struct DevPki {
     pub ca_cert_der: Vec<u8>,
-    pub vs: ServerIdentity,
+    /// One per [`PUBLIC_SERVICES`], in that order.
+    pub services: Vec<(String, ServerIdentity)>,
     pub gs: ServerIdentity,
 }
 
@@ -59,22 +77,39 @@ impl DevPki {
         ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
         let ca = Certificate::from_params(ca_params).context("generate dev CA")?;
 
+        let services = PUBLIC_SERVICES
+            .iter()
+            .map(|s| Ok((s.to_string(), server_identity(&ca, &server_name(s), false)?)))
+            .collect::<Result<_>>()?;
         Ok(Self {
             ca_cert_der: ca.serialize_der().context("serialize dev CA")?,
-            vs: server_identity(&ca, VS_SERVER_NAME, false)?,
+            services,
             gs: server_identity(&ca, GS_SERVER_NAME, true)?,
         })
     }
 
-    /// Write the CA certificate and both server identities into `dir`
+    /// The identity of public service `name`.
+    pub fn service(&self, name: &str) -> &ServerIdentity {
+        &self
+            .services
+            .iter()
+            .find(|(s, _)| s == name)
+            .unwrap_or_else(|| panic!("no public service {name}"))
+            .1
+    }
+
+    /// Write the CA certificate and every server identity into `dir`
     /// using the default file names. The CA private key is not written.
     pub fn write_to(&self, dir: impl AsRef<Path>) -> Result<()> {
         let dir = dir.as_ref();
         fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
         let file = |default: &str| dir.join(Path::new(default).file_name().expect("file name"));
         fs::write(file(DEFAULT_CA_CERT), &self.ca_cert_der)?;
-        fs::write(file(DEFAULT_VS_TLS_CERT), &self.vs.cert_der)?;
-        fs::write(file(DEFAULT_VS_TLS_KEY), &self.vs.key_der)?;
+        for (name, id) in &self.services {
+            let (cert, key) = default_tls_files(name);
+            fs::write(file(&cert), &id.cert_der)?;
+            fs::write(file(&key), &id.key_der)?;
+        }
         fs::write(file(DEFAULT_GS_TLS_CERT), &self.gs.cert_der)?;
         fs::write(file(DEFAULT_GS_TLS_KEY), &self.gs.key_der)?;
         Ok(())
@@ -85,15 +120,16 @@ impl DevPki {
 /// Returns whether new files were written.
 pub fn ensure_dev_pki(dir: impl AsRef<Path>) -> Result<bool> {
     let dir = dir.as_ref();
-    let present = [
-        DEFAULT_CA_CERT,
-        DEFAULT_VS_TLS_CERT,
-        DEFAULT_VS_TLS_KEY,
-        DEFAULT_GS_TLS_CERT,
-        DEFAULT_GS_TLS_KEY,
-    ]
-    .iter()
-    .all(|f| {
+    let mut files = vec![
+        DEFAULT_CA_CERT.to_string(),
+        DEFAULT_GS_TLS_CERT.to_string(),
+        DEFAULT_GS_TLS_KEY.to_string(),
+    ];
+    for s in PUBLIC_SERVICES {
+        let (cert, key) = default_tls_files(s);
+        files.extend([cert, key]);
+    }
+    let present = files.iter().all(|f| {
         dir.join(Path::new(f).file_name().expect("file name"))
             .exists()
     });

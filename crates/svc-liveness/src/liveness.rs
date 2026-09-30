@@ -1,4 +1,3 @@
-// crates/vs/src/liveness.rs
 //! Server Liveness role: issue the instance's SAR chain (04 §6.3). A SAR lives [`SAR_LIFETIME_S`]; one is
 //! issued every [`SAR_INTERVAL`]. Revocation is simply "stop issuing": the GS
 //! and its clients lapse within a few intervals.
@@ -11,7 +10,7 @@ use quinn::Connection;
 use std::time::Duration;
 use tokio::time::sleep;
 
-use crate::ctx::VsCtx;
+use crate::ctx::Ctx;
 
 pub const SAR_INTERVAL: Duration = Duration::from_secs(2);
 pub const SAR_LIFETIME_S: u64 = 10;
@@ -23,7 +22,7 @@ pub fn now_s() -> u64 {
 
 /// Build and sign the next SAR for a session.
 pub fn issue(
-    ctx: &VsCtx,
+    ctx: &Ctx,
     instance_pub: &[u8; 32],
     noise_static: &[u8; 32],
     sw_hash: &[u8; 32],
@@ -46,10 +45,10 @@ pub fn issue(
         prev,
         vrf_pub: None,
     };
-    fpp_crypto::sign(&ctx.keys.liveness, &sar)
+    fpp_crypto::sign(&*ctx.key, &sar)
 }
 
-pub fn spawn_sar_loop(conn: &Connection, ctx: VsCtx, session_id: [u8; 16]) {
+pub fn spawn_sar_loop(conn: &Connection, ctx: Ctx, session_id: [u8; 16]) {
     let conn = conn.clone();
     tokio::spawn(async move {
         let mut seq = 0u64;
@@ -58,7 +57,7 @@ pub fn spawn_sar_loop(conn: &Connection, ctx: VsCtx, session_id: [u8; 16]) {
         while let Some(s) = ctx.sessions.get(&session_id).map(|s| s.clone()) {
             if s.revoked {
                 eprintln!(
-                    "[VS] SAR loop ending for session {}.. (revoked)",
+                    "[liveness] SAR loop ending for session {}.. (revoked)",
                     hex::encode(&session_id[..4])
                 );
                 break;
@@ -77,7 +76,7 @@ pub fn spawn_sar_loop(conn: &Connection, ctx: VsCtx, session_id: [u8; 16]) {
                 send_msg(&mut uni, &SarIssue { sar }).await
             };
             if let Err(e) = sent.await {
-                eprintln!("[VS] send SAR failed: {e:#}");
+                eprintln!("[liveness] send SAR failed: {e:#}");
                 break;
             }
             seq += 1;

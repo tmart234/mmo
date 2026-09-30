@@ -14,39 +14,32 @@ pub type Sig = Vec<u8>;
 
 pub type OpId = [u8; 16];
 
-/// Version in `ChallengeRequest`; bump on any admission-flow change (4: the
-/// simulated TPM quote and re-attestation fields are gone).
-pub const ADMISSION_VERSION: u32 = 4;
+/// Version in `ChallengeRequest`; bump on any admission-flow change (5: the
+/// VS is split into Server Liveness, the Verifier and the Broker).
+pub const ADMISSION_VERSION: u32 = 5;
 
-/// Who is opening a control connection to the VS.
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PeerRole {
-    GameServer,
-    Client,
-}
-
-/// First message on a control connection: asks for a single-use challenge.
+/// First message on a connection to a public service (Server Liveness, the
+/// Verifier, the Broker): asks for a single-use challenge.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ChallengeRequest {
     pub version: u32,
-    pub role: PeerRole,
 }
 
-/// VS → peer: single-use nonce. A GS's join TPM quote must cover it (F04);
+/// Service → peer: single-use nonce. A GS's join TPM quote must cover it (F04);
 /// a client's session key signs it to prove possession.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct AttestChallenge {
     pub nonce: [u8; 32],
 }
 
-// ---------------------------------------------------------------- GS <-> VS
+// ---------------------------------------------------------------- GS <-> Server Liveness
 
-/// GS → VS during admission, after `AttestChallenge`.
+/// GS → Server Liveness during admission, after `AttestChallenge`.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct JoinRequest {
     pub gs_id: String,
     /// Hash of the GS binary, as the GS reports it. Self-reported, so worth
-    /// nothing alone (F06): with `tpm2` evidence the VS takes the build from
+    /// nothing alone (F06): with `tpm2` evidence Server Liveness takes the build from
     /// the kernel's measurement instead, and refuses a report that differs.
     pub sw_hash: [u8; 32],
     pub t_unix_ms: u64,
@@ -62,7 +55,7 @@ pub struct JoinRequest {
     pub sig_gs: Sig,
     pub gs_pub: [u8; 32],
     /// A real TPM 2.0's evidence (attest-tpm): the quote covers
-    /// `join_quote_nonce(challenge, join_request_sign_bytes)`. The VS answers
+    /// `join_quote_nonce(challenge, join_request_sign_bytes)`. Server Liveness answers
     /// with a [`CredentialChallenge`] before `JoinAccept`.
     pub tpm2: Option<Tpm2Evidence>,
 }
@@ -71,7 +64,7 @@ pub struct JoinRequest {
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct Tpm2Evidence {
     /// `TPM2B_PUBLIC` of the Endorsement Key, and its certificate chain
-    /// (leaf first; to a manufacturer root the VS pins).
+    /// (leaf first; to a manufacturer root Server Liveness pins).
     pub ek_public: Vec<u8>,
     pub ek_chain: Vec<Vec<u8>>,
     /// `TPM2B_PUBLIC` of the Attestation Key that signed the quote.
@@ -86,7 +79,7 @@ pub struct Tpm2Evidence {
     pub ima_log: Option<Vec<u8>>,
 }
 
-/// VS → GS, when the JoinRequest carries `tpm2`: a secret only the TPM with
+/// Server Liveness → GS, when the JoinRequest carries `tpm2`: a secret only the TPM with
 /// that EK can open, and only for that AK (credential activation). Contents
 /// of `TPM2B_ID_OBJECT` and `TPM2B_ENCRYPTED_SECRET`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -95,60 +88,81 @@ pub struct CredentialChallenge {
     pub encrypted_secret: Vec<u8>,
 }
 
-/// GS → VS: what `TPM2_ActivateCredential` gave.
+/// GS → Server Liveness: what `TPM2_ActivateCredential` gave.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct CredentialResponse {
     pub secret: Vec<u8>,
 }
 
-/// VS → GS after admitting it.
+/// Server Liveness → GS after admitting it. It needs no signature: it comes
+/// over TLS to the pinned Server Liveness certificate, and what blesses the
+/// GS is its SAR chain, under the Server Liveness key in the bundle (the GS
+/// checks each SAR certifies its own keys, and clients play only under one).
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct JoinAccept {
-    /// VS-minted session id; also the match id of the match this GS hosts.
+    /// Session id; also the match id of the match this GS hosts.
     pub session_id: [u8; 16],
-    /// VS signature binding this session_id to the GS.
-    pub sig_vs: Sig,
-    pub vs_pub: [u8; 32],
 }
 
-/// VS → GS: the next Server Attestation Result in this instance's chain
+/// Server Liveness → GS: the next Server Attestation Result in this instance's chain
 /// (04 §6.3). Every ~2 s while blessed.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SarIssue {
     pub sar: Vec<u8>,
 }
 
-/// GS → VS: one signed Checkpoint per epoch (04 §8.1).
+/// GS → Server Liveness: one signed Checkpoint per epoch (04 §8.1).
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CheckpointSubmit {
     pub checkpoint: Vec<u8>,
 }
 
-// ---------------------------------------------------------------- client <-> VS
+// ---------------------------------------------------------------- client <-> Verifier, Broker
 
-/// Client → VS after `AttestChallenge`: device evidence for the (stub)
-/// Verifier and an admission request for the (stub) Broker.
+/// Client → Verifier after `AttestChallenge`: a fresh session key and the
+/// device's platform evidence, for an Attestation Result.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ClientAdmissionRequest {
-    /// Ed25519 session key the AR and SAT will be bound to.
+pub struct EvidenceRequest {
+    /// Ed25519 session key the AR (and later the SAT) is bound to.
     pub session_pub: [u8; 32],
-    /// Session-key signature over `client_admission_sign_bytes` (proof of
-    /// possession, bound to the challenge).
+    /// Session-key signature over `evidence_request_sign_bytes` (proof of
+    /// possession, bound to the Verifier's challenge).
     #[serde(with = "BigArray")]
     pub pop_sig: [u8; 64],
     pub platform: String,
     pub client_build: [u8; 32],
-    pub queue: String,
-    /// Platform evidence (TPM quote, Play Integrity token, ...), opaque to
+    /// Platform evidence (Android key attestation, App Attest), opaque to
     /// everyone but the Verifier. Empty: no evidence (tier D0).
     pub evidence: Vec<u8>,
 }
 
-/// VS → client.
+/// Verifier → client.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum ClientAdmission {
+pub enum EvidenceAnswer {
+    /// The Attestation Result (evidence that fails appraisal still gets
+    /// one, at tier D0).
+    Ar(Vec<u8>),
+    Refused {
+        /// `fpp_types::Reason` code.
+        code: u16,
+    },
+}
+
+/// Client → Broker after `AttestChallenge`: an AR and a queue, for a match.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct MatchRequest {
+    pub ar: Vec<u8>,
+    pub queue: String,
+    /// Signature by the AR's session key (`cnf`) over
+    /// `match_request_sign_bytes`: the AR is used by the key it names, now.
+    #[serde(with = "BigArray")]
+    pub pop_sig: [u8; 64],
+}
+
+/// Broker → client.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum MatchAnswer {
     Granted {
-        ar: Vec<u8>,
         sat: Vec<u8>,
         /// The game server to join and its static key (checked against its SAR).
         gs_addr: String,

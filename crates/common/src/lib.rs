@@ -1,4 +1,4 @@
-pub mod config;
+pub mod admission;
 pub mod crypto;
 pub mod framing; // QUIC control links
 pub mod keys;

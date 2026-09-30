@@ -161,7 +161,7 @@ each needs from the `mmo` roadmap ([07](07-gap-analysis-and-roadmap.md) §4).
 | **H2 Host hardening** | Fix H01 and H02; turn every host rejection into a structured Signal (JSON log first) | H1 attacks rejected and flagged; no false rejects in a scripted-bot soak under `debug.network_latency` / `debug.network_loss` | ◐ Code done: H01 fixed by host authority with client reconciliation and a host input buffer; H02 by a structure ray from the shooter's recent positions to the hit; every rejection is a JSON Signal in `signals.jsonl` (network version 5, `port/linux/NETCODE.md`). ✅ Soak runner: `tools/network_soak.py` (honest bots under latency and loss must produce no Signal; H1 movement and wall-hit clients must be flagged/rejected), verdicts unit-tested. Open: running it with game data (needs a disc image) |
 | **H3 Transport** | Replace tunnel keying and sealing (H03–H05) with the SDK's P2P session (Noise IK); host static key in invites | An invite holder can no longer decrypt or impersonate another player (test) | ✅ Done on Linux and Windows: the fork's tunnel runs `fpp_p2p_*` sessions; the invite carries the host's X25519 key; signalling carries addresses only; hole punching by unauthenticated probes; identifier = hash of the session key, checked by the host. `tools/fpp_sdk.py` builds libfpp from a pinned commit of this repo. `tools/p2p_loopback_test.py` (CI) shows a forged host key gets no session. Android: no SDK target, internet play off. H05 remainder: signalling still uses the port's own SHA-256/ChaCha20 (addresses only) |
 | **H4 Evidence and audit** | InputCommits, host Checkpoints and a local evidence bundle; headless replay auditor; a determinism check of the distributed netcode across Linux, Windows and Android | The auditor flags the H1 cheating host; identical replays across platforms | ◐ Evidence recording done in the fork (halo-ce-pi #6): each client signs an InputCommit per 150-tick epoch over its hit reports with its session key; the host signs a Checkpoint per epoch with its instance key, acknowledging each commit, marking which frames it applied and listing an outcome per reported unit; each machine writes an evidence bundle (04 §8.5). ✅ `fpp-audit` (this repo) checks a bundle's signatures, chains, roots, acknowledgements and accounting, and finds a host that signed two Checkpoints for one epoch across players' bundles: the `debug.cheat_host_immunity` host's dropped hits show up as unaccounted units (tested with synthetic evidence through the fork's P2P loopback). Open: a re-simulating replay auditor and the determinism check (need game data) |
-| **H5 Verified playlists** | Dedicated headless host mode, Verifier + Broker + SAR from `mmo`, device tiers, segregated pools. Home-lab target: Pi 5 GS + Pi Zero 2 W VS (§8) | Tiered matchmaking in a staging deployment | P2, P3. ✅ VS for the Pi Zero 2 W (`make pi-vs`, `deploy/pi/`); ✅ SDK for aarch64 (`make ffi-c-test-aarch64`); ✅ trust admission in the fork: joiners present an Attestation Result bound to their P2P session key, the host admits by `network.minimum_tier` and refuses mixed tiers (`fpp_ar_verify`). Open: headless host mode with map rotation, SAR issuance for the GS |
+| **H5 Verified playlists** | Dedicated headless host mode, Verifier + Broker + SAR from `mmo`, device tiers, segregated pools. Home-lab target: Pi 5 GS + Pi Zero 2 W VS (§8) | Tiered matchmaking in a staging deployment | P2, P3. ✅ the cell (Server Liveness, Verifier, Broker) for the Pi Zero 2 W (`make pi-cell`, `deploy/pi/`); ✅ SDK for aarch64 (`make ffi-c-test-aarch64`); ✅ trust admission in the fork: joiners present an Attestation Result bound to their P2P session key, the host admits by `network.minimum_tier` and refuses mixed tiers (`fpp_ar_verify`). Open: headless host mode with map rotation, SAR issuance for the GS |
 | **H6 Anti-ESP** | Host-side relevance filtering in the distributed netcode | The radar client from H1 loses occluded players, with no visible pop-in at normal latency | ◐ Done in the fork (halo-ce-pi #7, `network.relevance`): each client is sent only the players its own could perceive (PVS clusters, 32-unit motion-tracker radius, teammates, objective carriers, the dead) with a 15-tick linger; a withheld player gets one hidden state with no position and no relayed input; ridden vehicles are filtered per client. Soak scenarios `radar` (the host withheld players) and `radar_open` (the attack works with the filter off). Residual: last position before withholding, players within 32 units or in PVS-visible clusters. Open: the in-game run (needs game data), a per-pair line test |
 
 H0–H2 need nothing from `mmo` and give immediate, visible wins. H3 is where
@@ -256,32 +256,36 @@ Linking notes, learned from the probe: link the static archive explicitly
 `libfpp.so` when both are present. Add `-ldl -lgcc_s` to the game's link line.
 The SDK uses no libm symbols, so it coexists with the port's `musl-math`.
 
-## 8. Hardware deployment: Pi 5 game server, Pi Zero 2 W VS
+## 8. Hardware deployment: Pi 5 game server, Pi Zero 2 W cell
 
 The home-lab target for H5: a Raspberry Pi 5 runs the dedicated Halo host
-(the GS), a Raspberry Pi Zero 2 W runs the VS, and players join from PCs and
-phones.
+(the GS), a Raspberry Pi Zero 2 W runs the trust plane's cell (Server
+Liveness, the Verifier and the Broker, three processes under three users),
+and players join from PCs and phones.
 
 ```text
- players (Linux/Windows/Android port)          Pi 5 (GS)                         Pi Zero 2 W (VS)
+ players (Linux/Windows/Android port)          Pi 5 (GS)                         Pi Zero 2 W (cell)
  ┌─────────────────────────┐  fpp-session  ┌──────────────────────────────┐ QUIC ┌───────────────────┐
- │ predicts own player      │◄────────────►│ headless Halo host            │◄────►│ vs (aarch64)      │
+ │ predicts own player      │◄────────────►│ headless Halo host            │◄────►│ svc-liveness:     │
  │ reconciles to the host   │  UDP, Noise  │  host authority (H2)          │ TLS  │ admission, SARs,  │
- │ checks the SAR chain     │              │  libfpp.a (aarch64) in loader │ 1.3  │ Checkpoints,      │
- │ signs InputCommits       │              │  Checkpoint per epoch         │      │ Verifier+Broker   │
- └─────────────────────────┘              └──────────────────────────────┘      └───────────────────┘
+ │ checks the SAR chain     │              │  libfpp.a (aarch64) in loader │ 1.3  │ Checkpoints       │
+ │ signs InputCommits       │              │  Checkpoint per epoch         │      │ svc-verifier (AR) │
+ └────────────┬────────────┘              └──────────────────────────────┘      │ svc-broker (SAT)  │
+              └───────────── admission (QUIC, TLS 1.3) ───────────────────────►└───────────────────┘
 ```
 
-### 8.1 VS on the Pi Zero 2 W ✅
+### 8.1 The cell on the Pi Zero 2 W ✅
 
-The VS cross-builds for `aarch64-unknown-linux-gnu` with clang, lld and the
-Debian aarch64 sysroot (`make pi-vs`). `make pi-vs-smoke` runs the full
-smoke test (both passes, including the simulated TPM) with that VS under
-`qemu-aarch64-static`, against the native `gs-sim` and `client-sim`: it
-passes. The binary is about 7 MB. `deploy/pi/` has the install steps and a
-hardened systemd unit. It waits for NTP, because the board has no real-time
-clock and SARs expire 10 s after issue. The GS dials the VS by IP address
-with the TLS name `vs.dev`, so the dev certificates need no change.
+The services cross-build for `aarch64-unknown-linux-gnu` with clang, lld
+and the Debian aarch64 sysroot (`make pi-cell`). `make pi-cell-smoke` runs
+the full smoke test with those services under `qemu-aarch64-static`,
+against the native `gs-sim` and `client-sim`. `deploy/pi/` has the install
+steps and a hardened systemd template (`fpp@liveness`, `fpp@verifier`,
+`fpp@broker`), each service under its own user with only its own key
+directory. The units wait for NTP, because the board has no real-time clock
+and SARs expire 10 s after issue. Game servers and clients dial the services
+by IP address with the TLS names `liveness.dev`, `verifier.dev` and
+`broker.dev`, so the dev certificates need no change.
 
 ### 8.2 Halo host on the Pi 5 (next)
 
@@ -299,7 +303,7 @@ adds a Linux host:
 | Dedicated host mode | Host a game from config with no local player (as `debug.network_test` hosts one without menus), keep the map rotation, and restart on game end. The engine has always had a host player, so a host without one needs testing. |
 | SDK | `libfpp.a` for aarch64 links into the LP64 host, not the ILP32 guest. The guest calls it through new host imports (`host_imports.list`), as it calls SDL on Android. `make ffi-c-test-aarch64` already passes the C conformance and P2P attack tests on this target. |
 | GS control link | A new `fpp_gs_*` API in `fpp-ffi` that wraps what `gs-sim` does (JoinRequest, SAR chain, Checkpoint per epoch) for C callers. The Halo host shows its SAR to joining clients, and the clients check the chain (§1.1). |
-| Attestation | A TPM 2.0 HAT on the Pi 5 (for example Infineon SLB 9672) gives the GS a real TPM for the join quote and re-attestation. That makes the VS's TPM appraisal findings (F04, F05) the next VS work. Without a HAT the GS stays at the simulated TPM, with no hardware assurance. |
+| Attestation | A TPM 2.0 HAT on the Pi 5 (for example Infineon SLB 9672) gives the GS a real TPM for the join quote and re-attestation. Server Liveness appraises it (`TPM_GUIDE.md`). Without a HAT the GS joins without TPM evidence, which a cell with a Build Registry refuses. |
 
 A Pi 5 has far more CPU than the Xbox the game was written for (a 733 MHz
 Pentium III), so a dedicated host for 16 players should not be

@@ -1,7 +1,6 @@
 //! Verifiers that consume attacker-controlled messages must never panic.
 #![no_main]
 
-use common::proto::JoinAccept;
 use ed25519_dalek::SigningKey;
 use fpp_crypto::{Ed25519Signer, KeyRole, KeySet};
 use fpp_tokens::admission::{admit, AdmissionPolicy, Revocations};
@@ -13,19 +12,13 @@ fuzz_target!(|data: &[u8]| {
     let Some((&selector, body)) = data.split_first() else {
         return;
     };
-    let vs = SigningKey::from_bytes(&[7; 32]).verifying_key();
     let mut keys = KeySet::default();
     for (seed, role) in [(0x11, KeyRole::VerifierAr), (0x12, KeyRole::BrokerSat), (0x13, KeyRole::ServerLiveness)] {
         keys.insert_ed25519(role, Ed25519Signer::new(SigningKey::from_bytes(&[seed; 32])).verifying_key());
     }
     let now = 1_790_000_000;
-    match selector % 3 {
+    match selector % 2 {
         0 => {
-            if let Ok(ja) = bincode::deserialize::<JoinAccept>(body) {
-                let _ = gs_sim::admission::verify_join_accept(&vs, &ja);
-            }
-        }
-        1 => {
             let _ = verify_ar(body, &keys, now);
             let _ = verify_sat(body, &keys, now);
             if let Ok(mut chain) = SarChain::start(body, &keys, now) {

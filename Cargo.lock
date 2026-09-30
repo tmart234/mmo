@@ -2068,7 +2068,6 @@ dependencies = [
  "fpp-wire",
  "gs-sim",
  "hex",
- "quinn",
  "rand 0.8.8",
  "tokio",
 ]
@@ -2938,6 +2937,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "common",
+ "ed25519-dalek",
+ "hex",
  "quinn",
  "rand 0.8.8",
  "rcgen",
@@ -3268,7 +3269,6 @@ dependencies = [
  "fpp-wire",
  "hex",
  "lru",
- "quinn",
  "rand 0.8.8",
  "sha2",
  "tokio",
@@ -5375,6 +5375,52 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
+name = "svc-broker"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "client-core",
+ "common",
+ "ed25519-dalek",
+ "fpp-crypto",
+ "fpp-svc",
+ "fpp-tokens",
+ "fpp-types",
+ "hex",
+ "quinn",
+ "rand 0.8.8",
+ "sha2",
+ "svc-liveness",
+ "svc-verifier",
+ "tokio",
+]
+
+[[package]]
+name = "svc-liveness"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "attest-core",
+ "attest-tpm",
+ "clap",
+ "common",
+ "dashmap",
+ "ed25519-dalek",
+ "fpp-crypto",
+ "fpp-svc",
+ "fpp-tokens",
+ "fpp-types",
+ "fpp-wire",
+ "gs-sim",
+ "hex",
+ "quinn",
+ "rand 0.8.8",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "svc-log"
 version = "0.1.0"
 dependencies = [
@@ -5388,6 +5434,29 @@ dependencies = [
  "fpp-types",
  "fpp-wire",
  "serde",
+ "tokio",
+]
+
+[[package]]
+name = "svc-verifier"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "attest-android",
+ "attest-apple",
+ "attest-core",
+ "clap",
+ "common",
+ "dashmap",
+ "ed25519-dalek",
+ "fpp-crypto",
+ "fpp-svc",
+ "fpp-tokens",
+ "fpp-types",
+ "hex",
+ "quinn",
+ "rand 0.8.8",
+ "sha2",
  "tokio",
 ]
 
@@ -5703,8 +5772,7 @@ dependencies = [
  "anyhow",
  "common",
  "ctrlc",
- "ed25519-dalek",
- "rand 0.8.8",
+ "fpp-svc",
 ]
 
 [[package]]
@@ -5968,31 +6036,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "vs"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "attest-android",
- "attest-apple",
- "attest-core",
- "attest-tpm",
- "clap",
- "common",
- "dashmap",
- "ed25519-dalek",
- "fpp-crypto",
- "fpp-tokens",
- "fpp-types",
- "fpp-wire",
- "gs-sim",
- "hex",
- "quinn",
- "rand 0.8.8",
- "sha2",
- "tokio",
-]
 
 [[package]]
 name = "wait-timeout"

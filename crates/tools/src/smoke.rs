@@ -1,81 +1,32 @@
-// crates/tools/src/smoke.rs
+// CI-lite / `make ci` smoke test of the whole FPP prototype, with the trust
+// plane as a cell of separate services (tools::cell):
 //
-// CI-lite / `make ci` smoke test of the whole FPP prototype:
-//
-// - VS: GS admission (challenge + JoinRequest), SAR chain, Checkpoint
-//   verification, stub Verifier (AR) and Broker (SAT) for clients
+// - Server Liveness: GS admission (challenge + JoinRequest), SAR chain,
+//   Checkpoint verification, placement for the Broker (cell mutual TLS)
+// - Verifier: the client's session key and evidence -> AR
+// - Broker: AR + queue -> SAT for a slot on a live GS
 // - GS: fpp-session game port, §7.2 admission, InputFrames, InputCommits,
 //   signed Checkpoints, CheckpointHeads, SarUpdates
 // - client: admission, join, play, SAR chain, tier floor of the `verified` queue
 //
-// 1. Ensure dev keys exist. 2. Spawn VS. 3. Spawn gs-sim --test-once.
-// 4. Run a client that must be refused the `verified` queue, then
-//    client-sim --smoke-test. 5. Wait for gs-sim, kill VS. Any failure
-//    fails the run (LENIENT_SMOKE=1 only warns). Admission with a real TPM
-//    2.0 is tested end to end against swtpm in vs/src/tpm2.rs.
+// 1. Ensure dev keys. 2. Start the cell and gather its key bundle.
+// 3. Spawn gs-sim --test-once. 4. Run a client that must be refused the
+//    `verified` queue, then client-sim --smoke-test. 5. Wait for gs-sim.
+// 6. Failure domains: with Server Liveness stopped, the Verifier and Broker
+//    still answer, and the Broker refuses (no live server) instead of
+//    failing. Any failure fails the run (LENIENT_SMOKE=1 only warns).
+//    Admission with a real TPM 2.0 is tested end to end against swtpm in
+//    svc-liveness/src/tpm2.rs.
 //
-// SMOKE_VS_BIN runs another VS binary, SMOKE_VS_WRAPPER runs it through a
-// command (`make pi-vs-smoke`: the aarch64 VS for a Raspberry Pi under
-// qemu-aarch64-static), and SMOKE_VS_STARTUP_MS waits longer for it.
+// SMOKE_BIN_DIR runs other builds of the services, SMOKE_WRAPPER runs them
+// through a command (`make pi-cell-smoke`: the aarch64 services for a
+// Raspberry Pi under qemu-aarch64-static), and SMOKE_STARTUP_MS waits
+// longer for each.
 
 use anyhow::{Context, Result};
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 use std::time::SystemTime;
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    process::{Command, Stdio},
-    thread,
-    time::Duration,
-};
-
-#[cfg(target_os = "windows")]
-const BIN_EXT: &str = ".exe";
-#[cfg(not(target_os = "windows"))]
-const BIN_EXT: &str = "";
-
-fn bin_path(bin: &str) -> PathBuf {
-    let tools_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = tools_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("could not locate workspace root");
-
-    workspace_root
-        .join("target")
-        .join("debug")
-        .join(format!("{bin}{BIN_EXT}"))
-}
-
-fn ensure_vs_keys() -> Result<()> {
-    let skp = PathBuf::from("keys/vs_ed25519.pk8");
-    let pkp = PathBuf::from("keys/vs_ed25519.pub");
-
-    if common::pki::ensure_dev_pki("keys").context("dev PKI")? {
-        println!("[SMOKE] generated dev PKI under keys/");
-    }
-
-    if skp.exists() && pkp.exists() {
-        return Ok(());
-    }
-
-    fs::create_dir_all("keys").context("mkdir keys")?;
-
-    let sk = SigningKey::generate(&mut OsRng);
-    let pk = sk.verifying_key();
-
-    fs::write(&skp, sk.to_bytes()).context("write vs_sk")?;
-    fs::write(&pkp, pk.to_bytes()).context("write vs_pk")?;
-
-    println!(
-        "[SMOKE] generated VS dev keys: {}, {}",
-        skp.display(),
-        pkp.display()
-    );
-
-    Ok(())
-}
+use std::{fs, path::PathBuf, process::Command, time::Duration};
+use tools::cell::{bin_path, ensure_dev_keys, Cell, Launch};
 
 fn newest_ledger_file(dir: &str) -> anyhow::Result<PathBuf> {
     let mut newest: Option<(SystemTime, PathBuf)> = None;
@@ -134,128 +85,91 @@ fn assert_recent_ledger_has_move() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run the smoke pass: (clients ok, gs ok).
-fn run_smoke_pass() -> Result<(bool, bool)> {
-    let pass_name = "smoke";
-    println!(
-        "\n[SMOKE] ========== Starting {} pass ==========",
-        pass_name
-    );
+/// Run the smoke pass: (clients ok, gs ok, failure domains ok).
+fn run_smoke_pass() -> Result<(bool, bool, bool)> {
+    println!("\n[SMOKE] ========== Starting smoke pass ==========");
 
-    // 1. Spawn VS (optionally another build, through a wrapper such as qemu)
-    let vs_bin = std::env::var_os("SMOKE_VS_BIN")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| bin_path("vs"));
-    let mut vs_cmd = match std::env::var_os("SMOKE_VS_WRAPPER") {
-        Some(wrapper) => {
-            let mut cmd = Command::new(wrapper);
-            cmd.arg(&vs_bin);
-            cmd
-        }
-        None => Command::new(&vs_bin),
-    };
-    let mut vs_child = vs_cmd
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .with_context(|| format!("spawn {:?}", vs_bin))?;
+    // 1. The cell: Server Liveness, Verifier, Broker; then the key bundle.
+    let mut cell = Cell::start(&Launch::from_env("debug"))?;
 
-    let startup_ms = std::env::var("SMOKE_VS_STARTUP_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(200);
-    thread::sleep(Duration::from_millis(startup_ms));
-
-    // 2. Spawn GS
-    let gs_bin = bin_path("gs-sim");
-    let mut gs_cmd = Command::new(&gs_bin);
-    gs_cmd.args(["--vs", "127.0.0.1:4444", "--test-once", "--test-secs", "12"]);
-
-    let mut gs_child = gs_cmd
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+    // 2. GS
+    let gs_bin = bin_path("gs-sim", "debug");
+    let mut gs_child = Command::new(&gs_bin)
+        .args([
+            "--liveness",
+            "127.0.0.1:4444",
+            "--test-once",
+            "--test-secs",
+            "12",
+        ])
         .spawn()
         .with_context(|| format!("spawn {:?}", gs_bin))?;
 
     // Clients retry until the GS has joined and signed its first Checkpoint.
-    thread::sleep(Duration::from_millis(500));
+    std::thread::sleep(Duration::from_millis(500));
 
     // 3. Clients: one that must be refused the `verified` queue (tier floor
     //    D2; this device has no evidence), then the smoke client.
-    let client_bin = bin_path("client-sim");
-    let refused = Command::new(&client_bin)
-        .args(["--queue", "verified", "--expect-refused"])
-        .status()
-        .with_context(|| format!("run {:?}", client_bin))?;
-    let client_status = Command::new(&client_bin)
-        .arg("--smoke-test")
-        .status()
-        .with_context(|| format!("run {:?}", client_bin))?;
-    let client_ok = client_status.success() && refused.success();
-    if client_ok {
-        println!("[SMOKE] {pass_name} pass: clients completed successfully.");
-    } else {
-        println!(
-            "[SMOKE] {pass_name} pass: client failed (smoke {:?}, verified-queue {:?})",
-            client_status.code(),
-            refused.code()
-        );
-    }
+    let client_bin = bin_path("client-sim", "debug");
+    let client = |args: &[&str]| {
+        Command::new(&client_bin)
+            .args(args)
+            .status()
+            .with_context(|| format!("run {:?}", client_bin))
+    };
+    let refused = client(&["--queue", "verified", "--expect-refused"])?;
+    let played = client(&["--smoke-test"])?;
+    let client_ok = played.success() && refused.success();
+    println!(
+        "[SMOKE] clients: smoke {:?}, verified-queue refusal {:?}",
+        played.code(),
+        refused.code()
+    );
 
-    // 4. Wait for GS
+    // 4. GS
     let gs_status = gs_child.wait().context("wait gs-sim")?;
-    if gs_status.success() {
-        println!("[SMOKE] {} pass: gs-sim completed successfully.", pass_name);
-    } else {
-        println!(
-            "[SMOKE] {} pass: gs-sim exited nonzero (status={:?})",
-            pass_name,
-            gs_status.code()
-        );
-    }
+    println!("[SMOKE] gs-sim: {:?}", gs_status.code());
 
-    // 5. Kill VS
-    let _ = vs_child.kill();
-    let _ = vs_child.wait();
+    // 5. Failure domains: Server Liveness down, the rest still serving.
+    cell.stop("liveness");
+    let without_liveness = client(&["--expect-refused"])?;
+    let domains_ok = without_liveness.success() && cell.check_running().is_ok();
+    println!(
+        "[SMOKE] with Server Liveness stopped: Verifier and Broker {}",
+        if domains_ok {
+            "still answer (refused: no live server)"
+        } else {
+            "FAILED"
+        }
+    );
+    drop(cell);
 
-    Ok((client_ok, gs_status.success()))
+    Ok((client_ok, gs_status.success(), domains_ok))
 }
 
 fn main() -> Result<()> {
-    // 1. Make sure VS signing keys exist.
-    ensure_vs_keys()?;
+    ensure_dev_keys()?;
+    let (client_ok, gs_ok, domains_ok) = run_smoke_pass()?;
 
-    // 2. Run the smoke pass
-    let (client_ok, gs_ok) = run_smoke_pass()?;
-
-    // 3. Check ledger
-    match assert_recent_ledger_has_move() {
-        Ok(_) => {}
-        Err(e) => {
-            if std::env::var("LENIENT_SMOKE").is_err() {
-                anyhow::bail!("ledger check failed: {e:#}");
-            } else {
-                eprintln!("[SMOKE] ledger check warning: {e:#}");
-            }
+    let strict = std::env::var("LENIENT_SMOKE").is_err();
+    if let Err(e) = assert_recent_ledger_has_move() {
+        if strict {
+            anyhow::bail!("ledger check failed: {e:#}");
         }
+        eprintln!("[SMOKE] ledger check warning: {e:#}");
     }
 
-    // 5. Summary
+    let ok = |b: bool| if b { "OK" } else { "FAIL" };
     println!("\n[SMOKE] ========== Summary ==========");
     println!(
-        "[SMOKE] client={}, gs={}",
-        if client_ok { "OK" } else { "FAIL" },
-        if gs_ok { "OK" } else { "FAIL" }
+        "[SMOKE] client={}, gs={}, failure-domains={}",
+        ok(client_ok),
+        ok(gs_ok),
+        ok(domains_ok)
     );
-
-    // 6. Exit policy
-    let strict = std::env::var("LENIENT_SMOKE").is_err();
-    let all_ok = client_ok && gs_ok;
-
-    if strict && !all_ok {
+    if strict && !(client_ok && gs_ok && domains_ok) {
         std::process::exit(1);
     }
-
     println!("[SMOKE] done.");
     Ok(())
 }

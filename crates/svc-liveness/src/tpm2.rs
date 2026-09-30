@@ -1,22 +1,21 @@
-// crates/vs/src/tpm2.rs
 //! Game-server admission with a real TPM 2.0 (findings F05, F06, F21), on
 //! `attest-tpm`. Pure functions; the network round trip is in
 //! `admission.rs`.
 //!
-//! 1. The EK certificate chains to a TPM manufacturer root the VS pins, and
+//! 1. The EK certificate chains to a TPM manufacturer root Server Liveness pins, and
 //!    certifies the EK the GS presents.
 //! 2. The quote verifies with the AK, over this connection's challenge and
 //!    this exact JoinRequest; the boot log (if any) and the IMA log replay
 //!    to the quoted PCRs.
 //! 3. The build: the program the kernel measured at `gs_program_path` is in
 //!    the Build Registry, and the GS's own `sw_hash` claims the same build.
-//! 4. Credential activation: the VS encrypts a fresh secret to the EK, for
+//! 4. Credential activation: Server Liveness encrypts a fresh secret to the EK, for
 //!    the AK's Name; only the TPM holding both can return it. This is what
 //!    makes the AK a genuine TPM's, so step 2's quote means something.
 
+use crate::config::LivenessConfig;
 use anyhow::{anyhow, bail, Context, Result};
 use attest_tpm::{appraise, make_credential, verify_ek, Evidence, Policy, Public, Registry};
-use common::config::VsConfig;
 use common::proto::{CredentialChallenge, Tpm2Evidence};
 use common::tpm::join_quote_nonce;
 use rand::{rngs::OsRng, RngCore};
@@ -26,7 +25,7 @@ use rand::{rngs::OsRng, RngCore};
 pub struct Tpm2Admission {
     /// SHA-256 of the EK public area: the machine's hardware identity.
     pub ek_digest: [u8; 32],
-    /// The build the kernel measured, and its registry label, when the VS
+    /// The build the kernel measured, and its registry label, when Server Liveness
     /// has a registry.
     pub build: Option<([u8; 32], String)>,
     pub secure_boot: Option<bool>,
@@ -34,7 +33,7 @@ pub struct Tpm2Admission {
     pub secret: Vec<u8>,
 }
 
-pub fn registry(cfg: &VsConfig) -> Registry {
+pub fn registry(cfg: &LivenessConfig) -> Registry {
     Registry {
         builds: cfg
             .build_registry
@@ -46,7 +45,7 @@ pub fn registry(cfg: &VsConfig) -> Registry {
 
 /// Steps 1–3, and the credential for step 4.
 pub fn appraise_join(
-    cfg: &VsConfig,
+    cfg: &LivenessConfig,
     challenge: &[u8; 32],
     join_sign_bytes: &[u8],
     claimed_sw_hash: &[u8; 32],
@@ -131,10 +130,10 @@ pub fn check_activation(admission: &Tpm2Admission, answer: &[u8]) -> Result<()> 
     Ok(())
 }
 
-/// Load the VS's TPM options: manufacturer roots (PEM bundle) and the Build
+/// Load the TPM options: manufacturer roots (PEM bundle) and the Build
 /// Registry (`sha256sum` lines).
 pub fn load_options(
-    cfg: &mut VsConfig,
+    cfg: &mut LivenessConfig,
     ek_roots: Option<&std::path::Path>,
     build_registry: Option<&std::path::Path>,
 ) -> Result<()> {
@@ -169,21 +168,17 @@ pub fn load_options(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ctx::VsCtx;
+    use crate::ctx::Ctx;
     use attest_tpm::ima::ima_ng_record;
     use common::crypto::{join_request_sign_bytes, now_ms, sign};
     use common::framing::{recv_msg, send_msg, send_msg_continue};
     use common::pki;
-    use common::proto::{
-        AttestChallenge, ChallengeRequest, CredentialResponse, JoinAccept, JoinRequest, PeerRole,
-        ADMISSION_VERSION,
-    };
+    use common::proto::{CredentialResponse, JoinAccept, JoinRequest};
     use ed25519_dalek::SigningKey;
     use gs_sim::tpm2::{swtpm::Swtpm, Tpm2, Tpm2Options};
     use sha2::{Digest, Sha256};
-    use std::sync::Arc;
 
-    const PROGRAM: &str = common::config::DEFAULT_GS_PROGRAM_PATH;
+    const PROGRAM: &str = crate::config::DEFAULT_GS_PROGRAM_PATH;
 
     fn available() -> bool {
         let found = gs_sim::tpm2::swtpm::available();
@@ -214,49 +209,35 @@ mod tests {
         GuessesSecret,
     }
 
-    /// One join against a VS with `config`: the VS's verdict, and the GS's
+    /// One join against Server Liveness with `config`: its verdict, and the GS's
     /// JoinAccept if admitted.
     async fn join(
-        config: VsConfig,
+        config: LivenessConfig,
         tpm: &Tpm2,
         running: [u8; 32],
         gs: Gs,
     ) -> (Result<()>, Option<JoinAccept>) {
         let dev = pki::DevPki::generate().unwrap();
         let server = quinn::Endpoint::server(
-            pki::quic_server_config(&dev.vs).unwrap(),
+            pki::quic_server_config(dev.service("liveness")).unwrap(),
             "127.0.0.1:0".parse().unwrap(),
         )
         .unwrap();
         let addr = server.local_addr().unwrap();
-        let ctx = VsCtx::new_with_config(Arc::new(SigningKey::from_bytes(&[3; 32])), config);
+        let ctx = Ctx::new(
+            fpp_crypto::Ed25519Signer::new(SigningKey::from_bytes(&[3; 32])),
+            config,
+        );
         let vs = tokio::spawn(async move {
             let incoming = server.accept().await.unwrap();
             let verdict = crate::admission::admit_and_run(incoming, ctx).await;
             (verdict, server)
         });
 
-        let client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-        let conn = client
-            .connect_with(
-                pki::quic_client_config(&dev.ca_cert_der).unwrap(),
-                addr,
-                pki::VS_SERVER_NAME,
-            )
-            .unwrap()
-            .await
-            .unwrap();
         let accepted = async {
-            let (mut send, mut recv) = conn.open_bi().await?;
-            send_msg_continue(
-                &mut send,
-                &ChallengeRequest {
-                    version: ADMISSION_VERSION,
-                    role: PeerRole::GameServer,
-                },
-            )
-            .await?;
-            let challenge: AttestChallenge = recv_msg(&mut recv).await?;
+            let o =
+                common::admission::request_challenge(&dev.ca_cert_der, addr, "liveness").await?;
+            let (mut send, mut recv, challenge) = (o.send, o.recv, o.challenge);
             let gs_key = SigningKey::from_bytes(&[8; 32]);
             let sw_hash = if gs == Gs::ClaimsOtherBuild {
                 sha256(b"another build")
@@ -273,7 +254,7 @@ mod tests {
             let to_sign = join_request_sign_bytes(
                 "gs-test", &sw_hash, now, &nonce, &instance, &noise, &game_addr,
             );
-            let evidence = tpm.evidence(&join_quote_nonce(&challenge.nonce, &to_sign))?;
+            let evidence = tpm.evidence(&join_quote_nonce(&challenge, &to_sign))?;
             let jr = JoinRequest {
                 gs_id: "gs-test".into(),
                 sw_hash,
@@ -332,10 +313,10 @@ mod tests {
         })
         .unwrap();
 
-        let config = VsConfig {
+        let config = LivenessConfig {
             tpm_ek_roots: pem(&swtpm.root_pem()),
             build_registry: vec![(good, "gs-sim 1.0 (CI build 42)".into())],
-            ..VsConfig::default()
+            ..LivenessConfig::default()
         };
 
         // an honest server: admitted
@@ -358,22 +339,22 @@ mod tests {
         assert!(accepted.is_none());
 
         // a build that is not registered
-        let unregistered = VsConfig {
+        let unregistered = LivenessConfig {
             build_registry: vec![([7; 32], "other".into())],
             ..config.clone()
         };
         let (verdict, _) = join(unregistered, &tpm, good, Gs::Honest).await;
         assert!(format!("{:#}", verdict.unwrap_err()).contains("not a registered build"));
 
-        // a TPM from a manufacturer the VS does not trust
+        // a TPM from a manufacturer Server Liveness does not trust
         let other_manufacturer = pki::DevPki::generate().unwrap().ca_cert_der;
-        let untrusted = VsConfig {
+        let untrusted = LivenessConfig {
             tpm_ek_roots: vec![other_manufacturer],
             ..config.clone()
         };
         let (verdict, _) = join(untrusted, &tpm, good, Gs::Honest).await;
         assert!(format!("{:#}", verdict.unwrap_err()).contains("EK certificate"));
-        let no_roots = VsConfig {
+        let no_roots = LivenessConfig {
             tpm_ek_roots: vec![],
             ..config.clone()
         };

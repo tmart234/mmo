@@ -2,7 +2,7 @@
 //! roadmap P3).
 //!
 //! The device generates a key in its TEE or StrongBox with
-//! `setAttestationChallenge(attest_challenge(vs_challenge, session_pub))`
+//! `setAttestationChallenge(attest_challenge(verifier_challenge, session_pub))`
 //! and sends the key's certificate chain. The leaf carries the
 //! KeyDescription extension (OID `1.3.6.1.4.1.11129.2.1.17`), written by the
 //! secure hardware. This crate checks:
@@ -231,7 +231,7 @@ pub fn parse_key_description(ext: &[u8]) -> Result<KeyDescription, AttestError> 
 
 /// Appraise an attested key's certificate chain (leaf first).
 ///
-/// `expected_challenge` is `attest_challenge(vs_challenge, session_pub)`.
+/// `expected_challenge` is `attest_challenge(verifier_challenge, session_pub)`.
 /// `now_yyyymm` is today's month for the patch-level check.
 pub fn appraise(
     chain: &[Vec<u8>],

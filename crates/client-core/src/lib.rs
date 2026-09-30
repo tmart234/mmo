@@ -1,9 +1,9 @@
 //! Reference client for the FPP prototype.
 //!
-//! 1. [`request_admission`]: over the QUIC control link to the VS (stub
-//!    Verifier + Broker), prove a fresh session key and receive an
-//!    Attestation Result, a Session Admission Token and the game server to
-//!    join (its address and static key).
+//! 1. [`request_admission`]: prove a fresh session key to the Verifier and
+//!    receive an Attestation Result; present it to the Broker and receive a
+//!    Session Admission Token and the game server to join (its address and
+//!    static key). Each is a separate service with its own key.
 //! 2. [`GameClient::connect`]: join the game server over fpp-session (Noise
 //!    IK to the key the Broker named), check its SAR binds that same key and
 //!    the SAT's audience, then present `Admit{SAT, AR}`.
@@ -16,13 +16,11 @@
 pub use anyhow::{anyhow, bail, Context, Result};
 
 use common::{
-    crypto::client_admission_sign_bytes,
-    framing::{recv_msg, send_msg, send_msg_continue},
+    admission::request_challenge,
+    crypto::{evidence_request_sign_bytes, match_request_sign_bytes},
+    framing::{recv_msg, send_msg},
     keys::KeyBundle,
-    proto::{
-        AttestChallenge, ChallengeRequest, ClientAdmission, ClientAdmissionRequest, ClientCmd,
-        PeerRole, WorldSnapshot,
-    },
+    proto::{ClientCmd, EvidenceAnswer, EvidenceRequest, MatchAnswer, MatchRequest, WorldSnapshot},
 };
 use ed25519_dalek::SigningKey;
 use fpp_crypto::{Ed25519Signer, KeySet, Signer as _};
@@ -57,7 +55,7 @@ pub enum SessionEnd {
     Kicked(u16),
     /// The server refused our admission.
     Rejected(u16),
-    /// The Broker refused to admit us.
+    /// The Verifier or the Broker refused to admit us.
     Refused(u16),
 }
 
@@ -69,7 +67,7 @@ impl std::fmt::Display for SessionEnd {
 
 impl std::error::Error for SessionEnd {}
 
-/// What the client trusts: the CA of the VS's TLS certificate and the
+/// What the client trusts: the CA of the services' TLS certificates and the
 /// regional key bundle (Verifier, Broker, Server Liveness keys).
 #[derive(Clone)]
 pub struct ClientTrust {
@@ -105,90 +103,104 @@ fn unix_s() -> u64 {
     common::crypto::now_ms() / 1000
 }
 
-/// Ask the VS for an AR and a SAT for `queue`, proving a fresh session key.
+/// Where a client asks for admission: the region's Verifier and Broker.
+#[derive(Clone, Copy, Debug)]
+pub struct Services {
+    pub verifier: SocketAddr,
+    pub broker: SocketAddr,
+}
+
+impl Default for Services {
+    /// A development cell on this machine.
+    fn default() -> Self {
+        Self {
+            verifier: "127.0.0.1:4445".parse().expect("addr"),
+            broker: "127.0.0.1:4446".parse().expect("addr"),
+        }
+    }
+}
+
+/// Ask the Verifier for an AR, then the Broker for a SAT for `queue`, with
+/// a fresh session key.
 pub async fn request_admission(
-    vs_addr: &str,
+    services: &Services,
     trust: &ClientTrust,
     queue: &str,
 ) -> Result<Credentials> {
     let session_sk = SigningKey::generate(&mut OsRng);
     let session = Ed25519Signer::new(session_sk);
     let session_pub = session.verifying_key().to_bytes();
+    let keys = trust.keyset();
 
-    let vs: SocketAddr = vs_addr.parse().context("bad VS address")?;
-    let bind: SocketAddr = if vs.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }.parse()?;
-    let endpoint = quinn::Endpoint::client(bind)?;
-    let conn = endpoint
-        .connect_with(
-            common::pki::quic_client_config(&trust.ca_der)?,
-            vs,
-            common::pki::VS_SERVER_NAME,
-        )?
-        .await
-        .context("QUIC connect to VS")?;
-    let (mut send, mut recv) = conn.open_bi().await?;
-    send_msg_continue(
-        &mut send,
-        &ChallengeRequest {
-            version: common::proto::ADMISSION_VERSION,
-            role: PeerRole::Client,
-        },
-    )
-    .await?;
-    let challenge: AttestChallenge = recv_msg(&mut recv).await.context("recv AttestChallenge")?;
-
+    // ---- Verifier: the session key and the device's evidence, for an AR.
+    let mut v = request_challenge(&trust.ca_der, services.verifier, "verifier").await?;
     let platform = std::env::consts::OS.to_string();
     let client_build = common::crypto::sha256(env!("CARGO_PKG_VERSION").as_bytes());
     let evidence = Vec::new(); // no platform evidence yet (P3): tier D0
-    let msg = client_admission_sign_bytes(
-        &challenge.nonce,
+    let msg = evidence_request_sign_bytes(
+        &v.challenge,
         &session_pub,
         &platform,
         &client_build,
-        queue,
         &evidence,
     );
     let pop_sig: [u8; 64] = session.sign(&msg).try_into().expect("64-byte signature");
     send_msg(
-        &mut send,
-        &ClientAdmissionRequest {
+        &mut v.send,
+        &EvidenceRequest {
             session_pub,
             pop_sig,
             platform,
             client_build,
-            queue: queue.into(),
             evidence,
         },
     )
     .await?;
-    let answer: ClientAdmission = recv_msg(&mut recv).await.context("recv ClientAdmission")?;
-    conn.close(0u32.into(), b"thanks");
-    let (ar, sat, gs_addr, gs_noise_static) = match answer {
-        ClientAdmission::Refused { code } => return Err(SessionEnd::Refused(code).into()),
-        ClientAdmission::Granted {
-            ar,
+    let answer: EvidenceAnswer = recv_msg(&mut v.recv).await.context("recv EvidenceAnswer")?;
+    v.conn.close(0u32.into(), b"thanks");
+    let ar = match answer {
+        EvidenceAnswer::Ar(ar) => ar,
+        EvidenceAnswer::Refused { code } => return Err(SessionEnd::Refused(code).into()),
+    };
+    let ar_claims = verify_ar(&ar, &keys, unix_s()).map_err(|e| anyhow!("AR: {e}"))?;
+    if ar_claims.cnf != session_pub || ar_claims.nonce != v.challenge {
+        bail!("AR is not for our session key and this request");
+    }
+
+    // ---- Broker: the AR, used by its key, for a match.
+    let mut b = request_challenge(&trust.ca_der, services.broker, "broker").await?;
+    let msg = match_request_sign_bytes(&b.challenge, &ar, queue);
+    let pop_sig: [u8; 64] = session.sign(&msg).try_into().expect("64-byte signature");
+    send_msg(
+        &mut b.send,
+        &MatchRequest {
+            ar: ar.clone(),
+            queue: queue.into(),
+            pop_sig,
+        },
+    )
+    .await?;
+    let answer: MatchAnswer = recv_msg(&mut b.recv).await.context("recv MatchAnswer")?;
+    b.conn.close(0u32.into(), b"thanks");
+    let (sat, gs_addr, gs_noise_static) = match answer {
+        MatchAnswer::Refused { code } => return Err(SessionEnd::Refused(code).into()),
+        MatchAnswer::Granted {
             sat,
             gs_addr,
             gs_noise_static,
-        } => (ar, sat, gs_addr, gs_noise_static),
+        } => (sat, gs_addr, gs_noise_static),
     };
     // Check what we were given before using it.
-    let keys = trust.keyset();
-    let now = unix_s();
-    let ar_claims = verify_ar(&ar, &keys, now).map_err(|e| anyhow!("AR from VS: {e}"))?;
-    let sat_claims = verify_sat(&sat, &keys, now).map_err(|e| anyhow!("SAT from VS: {e}"))?;
-    if ar_claims.cnf != session_pub
-        || sat_claims.cnf != session_pub
-        || sat_claims.ar_cti != ar_claims.cti
-    {
-        bail!("tokens from VS are not bound to our session key");
+    let sat_claims = verify_sat(&sat, &keys, unix_s()).map_err(|e| anyhow!("SAT: {e}"))?;
+    if sat_claims.cnf != session_pub || sat_claims.ar_cti != ar_claims.cti {
+        bail!("SAT is not bound to our session key and AR");
     }
     Ok(Credentials {
         session,
         ar,
         sat,
         sat_claims,
-        gs_addr: gs_addr.parse().context("bad GS address from VS")?,
+        gs_addr: gs_addr.parse().context("bad GS address from the Broker")?,
         gs_noise_static,
     })
 }

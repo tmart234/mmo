@@ -57,7 +57,7 @@ device (Kotlin / Swift adapter)                 C SDK (fpp-ffi)                 
 ```
 
 - **Binding.** `attest_challenge = SHA-256("fpp/1/attest-challenge" || 0x00
-  || vs_challenge || session_pub)`. Android puts it in
+  || verifier_challenge || session_pub)`. Android puts it in
   `setAttestationChallenge`, and App Attest uses it as `clientDataHash`. So
   evidence is bound to one single-use VS challenge *and* to the session key the
   AR is issued for (`cnf`).
@@ -66,7 +66,7 @@ device (Kotlin / Swift adapter)                 C SDK (fpp-ffi)                 
   rule.
 - **`attest-android`**: Google's two published roots are vendored (2022 RSA
   and "Key Attestation CA1"), and the status list is loaded with
-  `vs --android-status`. Checks 1–7 in the crate docs. An **Ed25519** attested
+  `svc-verifier --android-status`. Checks 1–7 in the crate docs. An **Ed25519** attested
   key (KeyMint on Android 13+, TEE) can *be* the session key, which earns D2.
 - **`attest-apple`**: Apple's App Attestation root is vendored. Attestations
   are checked as Apple documents (chain, nonce extension, key id, App ID, a
@@ -140,7 +140,7 @@ quirks.
      registered build when another ran) fail. A fuzz target covers every
      parser.
 
-   ✅ Wired in: the VS admits a GS with a real TPM (`vs --tpm-ek-roots
+   ✅ Wired in: Server Liveness admits a GS with a real TPM (`svc-liveness --tpm-ek-roots
    --build-registry --gs-program --require-secure-boot`); the GS gathers the
    evidence with tpm2-tools (`gs-sim --tpm2`), and credential activation
    runs at every join, before `JoinAccept`. CI builds the GS with signed
@@ -151,8 +151,8 @@ quirks.
    untrusted manufacturer, and a modified GS that really ran. Operator
    steps: `TPM_GUIDE.md`. Open: TPM 2.0 re-attestation during a session,
    and `dbx` currency.
-5. **Persistent App Attest keys** in the VS (today in memory: a restarted VS
-   asks each app to attest a new key).
+5. **Persistent App Attest keys** in the Verifier (today in memory: a
+   restarted Verifier asks each app to attest a new key).
 
 For the home-lab **Pi 5 GS**, nothing on the board can prove its boot
 remotely. It stays S-Community: it is admitted with an enrolled key, and it

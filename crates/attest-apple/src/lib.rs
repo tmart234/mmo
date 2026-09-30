@@ -4,7 +4,7 @@
 //! (`DCAppAttestService.generateKey`) and has Apple attest it once
 //! (`attestKey(keyId, clientDataHash:)`). Later sessions prove possession of
 //! the same key with assertions (`generateAssertion`). In both, the client
-//! data hash is `attest_challenge(vs_challenge, session_pub)`.
+//! data hash is `attest_challenge(verifier_challenge, session_pub)`.
 //!
 //! [`appraise_attestation`] checks, as Apple documents: the `x5c` chain to
 //! the pinned Apple App Attestation Root CA; the nonce extension
@@ -156,7 +156,7 @@ fn claims(key_id: &[u8; 32], development: bool) -> Claims {
 }
 
 /// Appraise an attestation object; `client_data_hash` is
-/// `attest_challenge(vs_challenge, session_pub)`.
+/// `attest_challenge(verifier_challenge, session_pub)`.
 pub fn appraise_attestation(
     attestation: &[u8],
     client_data_hash: &[u8; 32],

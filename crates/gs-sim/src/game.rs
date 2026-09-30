@@ -11,7 +11,7 @@
 //!    client commits to them with a signed `InputCommit` (reliable).
 //! 5. Every tick: apply intents (clamped), send each player a snapshot.
 //!    Every epoch: sign a Checkpoint over what was applied and decided, send
-//!    it to the VS, and its digest (`CheckpointHead`) to every player.
+//!    it to Server Liveness, and its digest (`CheckpointHead`) to every player.
 //! 6. New SARs are forwarded (`SarUpdate`). If they stop, the server has lost
 //!    its blessing: every player is kicked with `SAR_LAPSED`.
 //!
@@ -93,7 +93,7 @@ pub struct Match {
     /// State digest at the end of each epoch not yet checkpointed.
     epoch_state: BTreeMap<u32, Digest>,
     pub signals: Vec<Signal>,
-    /// Signed Checkpoints not yet taken by the caller (for the VS).
+    /// Signed Checkpoints not yet taken by the caller (for Server Liveness).
     pub checkpoints_out: Vec<(u32, Vec<u8>)>,
     /// Ledger lines (JSON) not yet taken by the caller.
     pub ledger_out: Vec<String>,
@@ -597,7 +597,7 @@ pub async fn run(
             }
             changed = sar_changed(&mut sar_rx) => {
                 match changed {
-                    // The VS link is gone: SARs will not come back.
+                    // The Server Liveness link is gone: SARs will not come back.
                     None => m.lapse(),
                     Some(sar) => m.on_sar(sar, now()),
                 }

@@ -1,0 +1,31 @@
+[package]
+name = "svc-verifier"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "The Verifier (04 §5.1): appraises a client's platform evidence and signs its Attestation Result, with its own key, in its own process"
+
+[dependencies]
+anyhow         = { workspace = true }
+tokio          = { workspace = true }
+quinn          = { workspace = true }
+clap           = { workspace = true }
+dashmap        = { workspace = true }
+ed25519-dalek  = { workspace = true }
+sha2           = { workspace = true }
+rand           = { workspace = true }
+hex            = { workspace = true }
+
+common         = { path = "../common" }
+fpp-types      = { path = "../fpp-types" }
+fpp-crypto     = { path = "../fpp-crypto" }
+fpp-tokens     = { path = "../fpp-tokens" }
+fpp-svc        = { path = "../fpp-svc" }
+attest-core    = { path = "../attest-core" }
+attest-android = { path = "../attest-android" }
+attest-apple   = { path = "../attest-apple" }
+
+[[bin]]
+name = "svc-verifier"
+path = "src/main.rs"

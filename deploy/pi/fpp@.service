@@ -1,0 +1,41 @@
+# systemd template for one service of the cell on a Raspberry Pi Zero 2 W:
+# fpp@liveness, fpp@verifier, fpp@broker. Each runs as its own user and
+# can read only its own directory of the cell (its signing seed, cell
+# identity and public TLS identity). Install: deploy/pi/README.md.
+[Unit]
+Description=FPP cell service: %i
+# Tokens carry expiry times: the clock must be right before the first one.
+# The Pi Zero 2 W has no real-time clock.
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+
+[Service]
+Type=simple
+User=fpp-%i
+Group=fpp
+WorkingDirectory=/var/lib/fpp/work/%i
+# ARGS: the service's options (bind address, TLS files, ...)
+EnvironmentFile=/etc/fpp/%i.env
+ExecStart=/usr/local/bin/svc-%i --cell /var/lib/fpp/cell $ARGS
+Restart=on-failure
+RestartSec=2
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# its own key directory, the shared public-key directory, its working directory
+ReadWritePaths=/var/lib/fpp/cell/%i /var/lib/fpp/cell/public /var/lib/fpp/work/%i
+# 512 MB RAM on the board: three services well inside it.
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target

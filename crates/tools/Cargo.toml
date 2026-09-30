@@ -1,9 +1,12 @@
 [package]
 name = "tools"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
 license.workspace = true
 publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
 
 [[bin]]
 name = "gen_keys"
@@ -18,8 +21,7 @@ name = "play"
 path = "src/play.rs"
 
 [dependencies]
-ed25519-dalek = { workspace = true }
-rand = { workspace = true }
 ctrlc = { workspace = true }
 anyhow = { workspace = true }
 common = { path = "../common" }
+fpp-svc = { path = "../fpp-svc" }

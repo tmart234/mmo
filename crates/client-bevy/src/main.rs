@@ -13,7 +13,7 @@ use bevy::prelude::Gizmos;
 use bevy::core_pipeline::tonemapping::Tonemapping;
 
 use client_bevy::{gather_input_impl, pump_snapshots_impl};
-use client_core::{request_admission, ClientEvent, ClientTrust, GameClient};
+use client_core::{request_admission, ClientEvent, ClientTrust, GameClient, Services};
 use common::proto::{ClientCmd, WorldSnapshot};
 use std::{sync::Mutex, time::Duration};
 use tokio::sync::mpsc;
@@ -237,7 +237,7 @@ fn net_startup(mut commands: Commands) {
         rx_ws: Mutex::new(rx_ws),
     });
 
-    let vs_addr = String::from("127.0.0.1:4444");
+    let services = Services::default();
 
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -246,14 +246,14 @@ fn net_startup(mut commands: Commands) {
             .expect("tokio runtime");
 
         rt.block_on(async move {
-            // Admission via the VS (stub Verifier + Broker), then the game
+            // Admission via the Verifier and the Broker, then the game
             // server over fpp-session; see client_core.
             let trust = match ClientTrust::load_default() {
                 Ok(t) => t,
                 Err(e) => return eprintln!("[NET] trust roots: {e:#}"),
             };
-            println!("[NET] requesting admission from {vs_addr}...");
-            let creds = match request_admission(&vs_addr, &trust, "open").await {
+            println!("[NET] requesting admission from {services:?}...");
+            let creds = match request_admission(&services, &trust, "open").await {
                 Ok(c) => c,
                 Err(e) => return eprintln!("[NET] admission failed: {e:#}"),
             };

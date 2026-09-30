@@ -13,12 +13,12 @@ endif
 
 # -------- Headless package set (what CI builds/tests) --------
 # Keep GUI crates (e.g., client-bevy) out of CI to avoid winit display issues.
-HEADLESS_PKGS := fpp-types fpp-wire fpp-crypto fpp-merkle fpp-tokens fpp-session fpp-ffi fpp-audit fpp-log fpp-svc svc-log attest-core attest-android attest-apple attest-tpm common client-core gs-sim vs tools
+HEADLESS_PKGS := fpp-types fpp-wire fpp-crypto fpp-merkle fpp-tokens fpp-session fpp-ffi fpp-audit fpp-log fpp-svc svc-log attest-core attest-android attest-apple attest-tpm common client-core gs-sim svc-liveness svc-verifier svc-broker tools
 PKG_FLAGS := $(foreach p,$(HEADLESS_PKGS),-p $(p))
 
 # -------- Phonies --------
 .PHONY: help ci check build-headless test-headless test-stage interop ffi-c-test ffi-c-test-i686 \
-        pi-vs pi-vs-smoke ffi-c-test-aarch64 sim-positive clean-build clean-lock-build \
+        pi-cell pi-cell-smoke ffi-c-test-aarch64 sim-positive clean-build clean-lock-build \
         check-all build-all test-all
 
 # -------- Help --------
@@ -28,11 +28,11 @@ help:
 	@echo "  check              - fmt+clippy (headless crates only)"
 	@echo "  build-headless     - build headless crates (-p $(HEADLESS_PKGS))"
 	@echo "  test-headless      - cargo test for headless crates"
-	@echo "  test-stage         - test headless crates + run smoke (VS <-> GS <-> client)"
+	@echo "  test-stage         - test headless crates + run smoke (cell <-> GS <-> client)"
 	@echo "  interop            - check FPP golden vectors with the independent Python verifier"
 	@echo "  ffi-c-test         - C SDK conformance (x86_64); ffi-c-test-i686 for the Halo ABI"
-	@echo "  pi-vs              - cross-build the VS (and gen_keys) for a Raspberry Pi (aarch64)"
-	@echo "  pi-vs-smoke        - smoke test with the aarch64 VS under qemu-aarch64-static"
+	@echo "  pi-cell            - cross-build the cell's services (and gen_keys, fpp-cell) for a Raspberry Pi (aarch64)"
+	@echo "  pi-cell-smoke      - smoke test with the aarch64 services under qemu-aarch64-static"
 	@echo "  ffi-c-test-aarch64 - C SDK conformance for the Pi 5 host (aarch64, under qemu)"
 	@echo "  sim-positive       - just run the smoke harness (gen_keys + smoke)"
 	@echo "  clean-build        - cargo clean + fmt + build (workspace, all targets)"
@@ -67,9 +67,9 @@ build-headless:
 test-headless:
 	cargo test --all-targets $(PKG_FLAGS)
 
-# Run tests AND the smoke test (VS <-> gs-sim <-> client-sim happy path)
+# Run tests AND the smoke test (a cell of services <-> gs-sim <-> client-sim)
 test-stage: test-headless
-	@echo "Running smoke test (\`vs\` + \`gs-sim --test-once\` + \`client-sim --smoke-test\`)..."
+	@echo "Running smoke test (\`svc-liveness\`, \`svc-verifier\`, \`svc-broker\` + \`gs-sim --test-once\` + \`client-sim --smoke-test\`)..."
 	cargo run -p tools --bin gen_keys
 	cargo run -p tools --bin smoke
 
@@ -138,7 +138,7 @@ test-all:
 	cargo test --workspace --all-targets
 
 # -------- Bevy (GUI client) orchestration --------
-# Builds everything needed, then runs VS + GS + client-bevy via tools/bin/play
+# Builds everything needed, then runs the cell + GS + client-bevy via tools/bin/play
 play:
 	@echo "Building client-bevy sanity3d..."
 	cargo build -p client-bevy --bin sanity3d
@@ -150,10 +150,10 @@ play-full:
 	cargo build --all-targets $(PKG_FLAGS)
 	@echo "Building client-bevy..."
 	cargo build -p client-bevy
-	@echo "Ensuring VS keys + launching VS, GS, and Bevy client..."
+	@echo "Ensuring dev keys + launching the cell, GS, and Bevy client..."
 	cargo run -p tools --bin gen_keys
 	cargo run -p tools --bin play
-# -------- Raspberry Pi (aarch64): VS on a Pi Zero 2 W, SDK for the Pi 5 host --------
+# -------- Raspberry Pi (aarch64): the cell on a Pi Zero 2 W, SDK for the Pi 5 host --------
 # Cross-builds with clang + lld and Debian/Ubuntu's aarch64 sysroot, so no
 # aarch64 gcc is needed:
 #   rustup target add aarch64-unknown-linux-gnu
@@ -169,15 +169,15 @@ PI_ENV := CC_aarch64_unknown_linux_gnu=clang CXX_aarch64_unknown_linux_gnu=clang
 PI_QEMU := qemu-aarch64-static
 PI_SYSROOT := /usr/aarch64-linux-gnu
 
-pi-vs:
-	$(PI_ENV) cargo build --release -p vs -p tools --target $(PI_TARGET)
-	@echo "VS for the Pi: target/$(PI_TARGET)/release/vs (install: deploy/pi/README.md)"
+pi-cell:
+	$(PI_ENV) cargo build --release -p svc-liveness -p svc-verifier -p svc-broker -p fpp-svc -p tools --target $(PI_TARGET)
+	@echo "Cell for the Pi: target/$(PI_TARGET)/release/svc-{liveness,verifier,broker} (install: deploy/pi/README.md)"
 
-# The full smoke test (both passes), with the VS the Pi runs, emulated.
-pi-vs-smoke: pi-vs
-	cargo build -p vs -p gs-sim -p client-core -p tools
+# The full smoke test with the services the Pi runs, emulated.
+pi-cell-smoke: pi-cell
+	cargo build -p gs-sim -p client-core -p tools
 	cargo run -p tools --bin gen_keys
-	SMOKE_VS_BIN=target/$(PI_TARGET)/release/vs SMOKE_VS_WRAPPER=$(PI_QEMU) SMOKE_VS_STARTUP_MS=1500 \
+	SMOKE_BIN_DIR=target/$(PI_TARGET)/release SMOKE_WRAPPER=$(PI_QEMU) SMOKE_STARTUP_MS=1500 \
 		QEMU_LD_PREFIX=$(PI_SYSROOT) cargo run -p tools --bin smoke
 
 # libfpp.a for the Pi 5 host loader (LP64 aarch64; the itself is ILP32,

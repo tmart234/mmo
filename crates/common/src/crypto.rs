@@ -1,7 +1,4 @@
-use bincode::{DefaultOptions, Options};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use rand::rngs::OsRng;
-use serde::Serialize;
 use sha2::{Digest, Sha256 as Sha2};
 
 pub fn now_ms() -> u64 {
@@ -10,10 +7,6 @@ pub fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
-}
-
-pub fn rand_u128() -> u128 {
-    rand::random::<u128>()
 }
 
 pub fn sha256(data: &[u8]) -> [u8; 32] {
@@ -35,12 +28,6 @@ pub fn file_sha256(path: &std::path::Path) -> std::io::Result<[u8; 32]> {
         h.update(&buf[..n]);
     }
     Ok(h.finalize().into())
-}
-
-pub fn gen_ed25519() -> (SigningKey, VerifyingKey) {
-    let sk = SigningKey::generate(&mut OsRng);
-    let vk = sk.verifying_key(); // compute before moving sk
-    (sk, vk)
 }
 
 pub fn sign(sk: &SigningKey, msg: &[u8]) -> [u8; 64] {
@@ -76,57 +63,29 @@ pub fn join_request_sign_bytes(
     .expect("serialize join request")
 }
 
-/// Bytes a client's session key signs to prove possession at admission,
-/// bound to the VS challenge and everything the tokens will say.
-pub fn client_admission_sign_bytes(
+/// Bytes a client's session key signs for the Verifier, bound to its
+/// challenge and everything the AR will say.
+pub fn evidence_request_sign_bytes(
     challenge: &[u8; 32],
     session_pub: &[u8; 32],
     platform: &str,
     client_build: &[u8; 32],
-    queue: &str,
     evidence: &[u8],
 ) -> Vec<u8> {
     bincode::serialize(&(
-        "mmo/client-admission/v1",
+        "mmo/evidence-request/v1",
         challenge,
         session_pub,
         platform,
         client_build,
-        queue,
         evidence,
     ))
-    .expect("serialize client admission")
+    .expect("serialize evidence request")
 }
 
-/// Turn a runtime signature Vec<u8> (should be 64 bytes) into a fixed
-/// [u8; 64]. Returns None if it's the wrong length.
-pub fn sigvec_to_array64(sig: &crate::proto::Sig) -> Option<[u8; 64]> {
-    sig.as_slice().try_into().ok()
-}
-
-pub fn rolling_hash_update(prev: [u8; 32], event_bytes: &[u8]) -> [u8; 32] {
-    let mut h = Sha2::new();
-    h.update(prev);
-    h.update(event_bytes);
-    h.finalize().into()
-}
-
-pub fn canonical_serialize<T: Serialize>(t: &T) -> Vec<u8> {
-    DefaultOptions::new()
-        .with_fixint_encoding() // stable integer encoding
-        .reject_trailing_bytes() // disallow extras
-        .serialize(t)
-        .expect("canonical serialize")
-}
-
-/// Load a pinned Ed25519 public key (32 raw bytes) from `path`.
-pub fn load_verifying_key(path: impl AsRef<std::path::Path>) -> anyhow::Result<VerifyingKey> {
-    use anyhow::Context;
-    let path = path.as_ref();
-    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-        anyhow::anyhow!("{}: expected 32 bytes, got {}", path.display(), bytes.len())
-    })?;
-    VerifyingKey::from_bytes(&arr)
-        .with_context(|| format!("{}: invalid Ed25519 key", path.display()))
+/// Bytes a client's session key signs for the Broker: this AR, for this
+/// queue, bound to the Broker's challenge.
+pub fn match_request_sign_bytes(challenge: &[u8; 32], ar: &[u8], queue: &str) -> Vec<u8> {
+    bincode::serialize(&("mmo/match-request/v1", challenge, ar, queue))
+        .expect("serialize match request")
 }

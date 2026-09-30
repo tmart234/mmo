@@ -307,21 +307,21 @@ pub unsafe extern "C" fn fpp_object_digest(
 // ------------------------------------------------------------------ platform evidence
 
 /// The challenge a device binds its platform evidence to (roadmap P3):
-/// `SHA-256("fpp/1/attest-challenge" || 0x00 || vs_challenge || session_pub)`.
+/// `SHA-256("fpp/1/attest-challenge" || 0x00 || verifier_challenge || session_pub)`.
 /// Pass it to Android `KeyGenParameterSpec.Builder.setAttestationChallenge`
 /// or as the App Attest `clientDataHash`. Evidence made for another admission
 /// challenge or another session key does not verify.
 ///
 /// # Safety
-/// `vs_challenge`, `session_pub` and `out` valid for 32 bytes each.
+/// `verifier_challenge`, `session_pub` and `out` valid for 32 bytes each.
 #[no_mangle]
 pub unsafe extern "C" fn fpp_attest_challenge(
-    vs_challenge: *const u8,
+    verifier_challenge: *const u8,
     session_pub: *const u8,
     out: *mut u8,
 ) -> FppStatus {
     guard(|| {
-        let challenge = unsafe { fixed::<32>(vs_challenge) }?;
+        let challenge = unsafe { fixed::<32>(verifier_challenge) }?;
         let session = unsafe { fixed::<32>(session_pub) }?;
         unsafe { write_fixed(out, &attest_challenge(&challenge, &session)) }
     })

@@ -12,11 +12,17 @@
 //! - [`rpc`]: one request and one response per stream, and serving them
 //!   with the caller's name, which each service checks against the callers
 //!   it allows.
+//! - [`keys`]: each service's own signing keys, and the public keys it
+//!   publishes in the cell.
+//! - [`api`]: the requests services make of each other.
 
+pub mod api;
 pub mod cell;
+pub mod keys;
 pub mod mtls;
 pub mod rpc;
 
 pub use cell::{Identity, CELL_DOMAIN};
+pub use keys::PublicKeys;
 pub use quinn;
 pub use rpc::{call, serve, Caller};

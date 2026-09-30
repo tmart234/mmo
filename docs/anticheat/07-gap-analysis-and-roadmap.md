@@ -15,16 +15,16 @@ because several **chain together**.
 | ID | Sev | Finding | Location | Fix (phase) |
 |----|-----|---------|----------|-------------|
 | F01 | **Critical** | TLS certificate verification disabled on client→GS and GS→VS. A network or local proxy can read and alter unsigned traffic (snapshots) and impersonate either server. | `crates/client-core/src/lib.rs:33,51`; `crates/gs-sim/src/main.rs:359,401-402` | ✅ Fixed (P0): dev CA + CA-signed VS/GS certificates (`common::pki`); insecure verifiers removed |
-| F02 | **Critical** | The GS does not pin the VS key: it verifies `JoinAccept` with the `vs_pub` *contained in the same message*, then trusts tickets signed by that key. Combined with F01, any MITM or fake VS can "bless" a GS. | `crates/gs-sim/src/main.rs:173,181` | ✅ Fixed (P0): GS pins `keys/vs_ed25519.pub` (`gs_sim::admission::verify_join_accept`) |
+| F02 | **Critical** | The GS does not pin the VS key: it verifies `JoinAccept` with the `vs_pub` *contained in the same message*, then trusts tickets signed by that key. Combined with F01, any MITM or fake VS can "bless" a GS. | `crates/gs-sim/src/main.rs:173,181` | ✅ Fixed (P0), then superseded (P2.4): the GS reaches Server Liveness only over TLS to the pinned CA and name (F01), and what blesses it is its SAR chain under the Server Liveness key in its bundle (every SAR must certify its own keys; clients play only under one); `JoinAccept` carries no key or signature of its own |
 | F03 | **High** | The client verifies the VS signature and freshness only on the first ticket. `TicketUpdate`s are accepted unverified and freshness is computed but ignored. **F01 + F02 + F03 = revocation bypass**: after the handshake a revoked GS (or a MITM feeding it tickets) keeps clients playing. | `crates/client-core/src/lib.rs:335,401-403` | ✅ Fixed (P0): `common::tickets::TicketChain` verifies every update (signature, session, chain, expiry); GS forwards every ticket in order |
 | F04 | **High** | TPM quote freshness is attester-controlled. The VS checks the quote against its *own* nonce, whose first 16 bytes equal the GS-chosen `JoinRequest.nonce`, and join nonces are not tracked. A captured quote can be replayed forever. | `crates/vs/src/admission.rs:94,115` | ✅ Fixed in the prototype: VS-issued single-use `AttestChallenge` per connection, quote bound to it and to the signed JoinRequest; re-attestation quotes seeded by a recent VS ticket signature (`vs/src/attest.rs`). The Verifier (P3) keeps the same rule. |
-| F05 | **High** | Hardware TPM path is non-functional or incorrect: `extend_pcr` ignores its index (always slot 0); `verify_quote` rejects non-Ed25519 AKs and does not parse `TPMS_ATTEST`, so real quotes can never verify; no EK chain or AK credential activation. The docs (`TPM_GUIDE.md`) and the code disagree on what is implemented. | `crates/common/src/tpm.rs:155,284,438,504,518` | ✅ Real TPM 2.0 appraisal: `crates/attest-tpm` (quotes with RSA/ECDSA AKs, EK certificate chains to pinned manufacturer roots, credential activation, boot-log replay with Secure Boot's state) and the VS's GS admission (`vs --tpm-ek-roots`, `vs/src/tpm2.rs`), with the GS gathering evidence through tpm2-tools (`gs-sim --tpm2`). The dead `hardware-tpm` provider (it never compiled) is removed and `TPM_GUIDE.md` rewritten to match. Tested end to end against swtpm in CI. Open: TPM 2.0 re-attestation during a session; `dbx` currency |
-| F06 | **High** | `sw_hash` is self-reported (the binary hashes itself), and PCR 0 is extended with an app hash. The allowlist and "attestation" provide no assurance against a modified GS. | `crates/gs-sim/src/main.rs:88,99` | ✅ The VS takes a GS's build from the kernel's IMA measurement (replayed against the quoted PCR 10), requires it in a Build Registry (`vs --build-registry`), and refuses a GS whose own `sw_hash` differs or that brings no TPM evidence. CI builds the GS with signed SLSA provenance and publishes each build's registry line (`gs-release.yml`). Tested against swtpm: a modified GS that really ran is refused. Open: runtime integrity after start (confidential VM, P5) |
+| F05 | **High** | Hardware TPM path is non-functional or incorrect: `extend_pcr` ignores its index (always slot 0); `verify_quote` rejects non-Ed25519 AKs and does not parse `TPMS_ATTEST`, so real quotes can never verify; no EK chain or AK credential activation. The docs (`TPM_GUIDE.md`) and the code disagree on what is implemented. | `crates/common/src/tpm.rs:155,284,438,504,518` | ✅ Real TPM 2.0 appraisal: `crates/attest-tpm` (quotes with RSA/ECDSA AKs, EK certificate chains to pinned manufacturer roots, credential activation, boot-log replay with Secure Boot's state) and Server Liveness's GS admission (`svc-liveness --tpm-ek-roots`, `svc-liveness/src/tpm2.rs`), with the GS gathering evidence through tpm2-tools (`gs-sim --tpm2`). The dead `hardware-tpm` provider (it never compiled) is removed and `TPM_GUIDE.md` rewritten to match. Tested end to end against swtpm in CI. Open: TPM 2.0 re-attestation during a session; `dbx` currency |
+| F06 | **High** | `sw_hash` is self-reported (the binary hashes itself), and PCR 0 is extended with an app hash. The allowlist and "attestation" provide no assurance against a modified GS. | `crates/gs-sim/src/main.rs:88,99` | ✅ Server Liveness takes a GS's build from the kernel's IMA measurement (replayed against the quoted PCR 10), requires it in a Build Registry (`svc-liveness --build-registry`), and refuses a GS whose own `sw_hash` differs or that brings no TPM evidence. CI builds the GS with signed SLSA provenance and publishes each build's registry line (`gs-release.yml`). Tested against swtpm: a modified GS that really ran is refused. Open: runtime integrity after start (confidential VM, P5) |
 | F07 | Medium | Unbounded allocation from a peer-controlled length prefix on the VS bi-stream path (bypasses the 16 MiB cap in `framing::recv_msg`). An admitted GS can force up to 4 GiB allocations per stream. | `crates/vs/src/streams.rs:110` | ✅ Fixed (P0): `framing::recv_msg_max`, 64 KiB default cap, explicit caps for snapshots (1 MiB) and transcripts (4 MiB) |
 | F08 | Medium | No timeout on accepting or reading the `JoinRequest`: idle connections hold VS tasks indefinitely (slowloris). | `crates/vs/src/admission.rs:30-34` | ✅ Fixed (P0): `admission_timeout_ms` deadline + QUIC Retry address validation |
 | F09 | Medium | Process-global `Mutex<Enforcer>` shared by all sessions, with `lock().unwrap()`. It serializes all sessions, and one panic poisons every session. | `crates/vs/src/enforcer.rs:300` | Per-session state; remove from VS (P2) |
 | F10 | Medium | `PlayTicket.client_binding` is always zero, so a ticket is a bearer credential usable by any client. | `crates/vs/src/streams.rs:47,58` | ✅ Fixed (P1): PlayTickets are gone; admission uses a SAT bound to the session key (`cnf`), proven in the handshake; a stolen SAT is rejected (`client-core/tests/session_attacks.rs`) |
-| F11 | Medium | No domain separation in signatures. `JoinAccept` signs the raw 16-byte `session_id` with the same key that signs tickets and receipts. | `crates/vs/src/admission.rs:143` | ✅ Fixed (P1) for every FPP object: tokens, Checkpoints, InputCommits and AdmitPops are COSE with `fpp-ctx` and per-role keys (Verifier, Broker, Liveness keys are distinct). The prototype's `JoinAccept` still signs the raw session id with the VS seed key, which signs nothing else now |
+| F11 | Medium | No domain separation in signatures. `JoinAccept` signs the raw 16-byte `session_id` with the same key that signs tickets and receipts. | `crates/vs/src/admission.rs:143` | ✅ Fixed (P1) for every FPP object: tokens, Checkpoints, InputCommits and AdmitPops are COSE with `fpp-ctx` and per-role keys (Verifier, Broker, Liveness keys are distinct). `JoinAccept` no longer carries a signature (P2.4, see F02), and each role key is now made by its own service, not derived from one seed |
 | F12 | Medium | Protocol version mismatch is logged but the session proceeds. | `crates/gs-sim/src/client_port.rs:258` | ✅ Fixed (P1): control links reject an unknown `ChallengeRequest.version`; fpp-session binds its version in the Noise prologue and handshake payloads; tokens carry `fpp-v` |
 | F13 | Medium | The VS "physics" check uses GS-claimed positions and GS-claimed time, sampled every ~2 s. It does not constrain a rogue GS and is bypassed by teleport-and-return. | `crates/vs/src/enforcer.rs` | ✅ Removed from the trust plane (P1): the VS no longer sees positions; the GS clamps intent (AUTH-01) and signs per-epoch Checkpoints over applied inputs and state. ✅ `fpp-audit` (M4, 04 §8.5) verifies Checkpoints independently from players' evidence bundles (signatures, chains, roots, acknowledgements, an outcome for every input, equivocation across bundles). Open: re-simulation (was each decision right?), which needs a title's headless build |
 | F14 | Low | Evidence ("DA log") is written to local files in the working directory: no integrity, durability or replication. | `crates/vs/src/streams.rs:401-420` | Evidence Store (P2) |
@@ -55,7 +55,7 @@ because several **chain together**.
 | NET | ✗ | Not addressed. |
 | SEC (AC security) | ◐ | Rust (good); CI audit non-blocking; no fuzzing; keys in repo. |
 | PRIV | ✗ | Not addressed. |
-| OPS | ✗ | Single-process VS; no regions, fail modes or capacity model. |
+| OPS | ◐ | One regional cell of separate services (P2.4, `deploy/cell`); no multi-region, capacity model or documented fail modes yet. |
 | PLAT | ✗ | Desktop Rust client only. |
 | GOV | ✗ | Not addressed. |
 
@@ -89,7 +89,7 @@ tools/  fuzz/  (cargo-fuzz targets for every decoder)
 ```
 
 Existing crates migrate: `common` → `fpp-*`, `gs-sim` →
-`gs-authority` + `gs-checkpoint`, `vs` → `svc-*` (split), `client-core` →
+`gs-authority` + `gs-checkpoint`, `vs` → `svc-*` (✅ split, P2.4), `client-core` →
 `ia-core` + reference client, `client-bevy` stays as reference client.
 
 ## 4. Roadmap
@@ -181,9 +181,24 @@ only witnesses cosign). The witness refuses rollbacks and split views and
 remembers across restarts. Go's `golang.org/x/mod/sumdb` independently
 verifies the checkpoint, every tile, every entry and inclusion proofs
 (`interop/go/tlog`, in CI).
-**Next (P2.2–P2.4):** Revocation Feed (Enforcement key, `RevocationEvent`,
-log entries, subscribers), Evidence Store, then the VS split into Verifier,
-Broker and Server Liveness processes, and a regional cell deployment.
+**Service split ✅ (P2.4):** the VS is gone. `svc-liveness` (GS admission
+with TPM 2.0, the SAR chain, Checkpoints, watchdog), `svc-verifier`
+(evidence → AR) and `svc-broker` (AR → SAT) are separate processes, each
+with its own key made in its own cell directory (`fpp-svc::keys`; nothing
+is derived from a shared seed) and its own public TLS certificate. Clients
+go to the Verifier, then the Broker; the Broker asks Server Liveness for a
+slot over the cell's mutual TLS (only the Broker may). The key bundle is
+gathered from what each service publishes. A cell runs as three containers
+that each mount only their own key directory (`deploy/cell`), or as three
+processes (`tools::cell`, the smoke test). Tested: a client through all
+three; an AR signed by the Broker's or Liveness's key, or used by another
+key, is refused; a non-Broker caller cannot place players; with Server
+Liveness stopped the Verifier and Broker keep answering and the Broker
+refuses within 2 s (`svc-broker/tests/cell.rs`, `make ci` smoke).
+**Next (P2.2, P2.3):** Revocation Feed (Enforcement key, `RevocationEvent`,
+log entries, subscribers, revocation→kick load test), Evidence Store
+(Server Liveness still writes Checkpoints to local files), and the SAR
+lapse exit test.
 
 ### P3 — Real attestation (8–12 weeks, parallelizable per platform)
 Verifier appraisal for TPM 2.0 (EK chain, credential activation, TCG log
