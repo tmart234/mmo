@@ -13,7 +13,7 @@ endif
 
 # -------- Headless package set (what CI builds/tests) --------
 # Keep GUI crates (e.g., client-bevy) out of CI to avoid winit display issues.
-HEADLESS_PKGS := fpp-types fpp-wire fpp-crypto fpp-merkle fpp-tokens fpp-session fpp-ffi fpp-audit fpp-log fpp-svc svc-log attest-core attest-android attest-apple common client-core gs-core gs-sim vs tools
+HEADLESS_PKGS := fpp-types fpp-wire fpp-crypto fpp-merkle fpp-tokens fpp-session fpp-ffi fpp-audit fpp-log fpp-svc svc-log attest-core attest-android attest-apple attest-tpm common client-core gs-core gs-sim vs tools
 PKG_FLAGS := $(foreach p,$(HEADLESS_PKGS),-p $(p))
 
 # -------- Phonies --------
