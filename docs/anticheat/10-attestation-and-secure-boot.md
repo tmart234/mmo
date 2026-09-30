@@ -118,10 +118,33 @@ quirks.
 3. **Play Integrity** (Android): a server-side decrypted verdict for
    `MEETS_STRONG_INTEGRITY` and device recall, for bans that survive
    reinstalls.
-4. **`attest-tpm`** (game servers and Windows clients): `TPMS_ATTEST`
-   parsing, EK certificate chains, credential activation, and TCG event log
-   replay with a Secure Boot and `dbx` policy. This replaces the prototype
-   path (F05, F21).
+4. ◐ **`attest-tpm`** (game servers and Windows clients). Done, in
+   `crates/attest-tpm`:
+   - `TPMS_ATTEST` quotes, verified with the AK's `TPMT_PUBLIC` (RSA-SSA,
+     RSA-PSS, ECDSA P-256/P-384): the AK must be a restricted signing key
+     made in the TPM; the nonce; the PCR values against the signed digest;
+   - EK certificates to a pinned manufacturer root (attest-core's chains),
+     and that the certificate's key is the EK's;
+   - credential activation: `TPM2_MakeCredential` in software (RSA-OAEP
+     with the "IDENTITY" label, or ECDH with KDFe), which only the TPM
+     holding the EK opens, and only for the AK with that Name;
+   - the measured-boot log replayed against the quote, and Secure Boot's
+     state from PCR 7 (the event's data checked against its digest);
+   - the IMA log replayed against PCR 10, and a **Build Registry**: the
+     program a server runs, as the kernel measured it before running it,
+     must be a registered build (F06);
+   - tests against a real TPM 2.0 (swtpm, libtpms) with tpm2-tools in CI:
+     the TPM activates the credentials the crate makes, RSA and ECDSA quotes
+     verify, and forged quotes, nonces, PCR values, boot logs (Secure Boot
+     off, claimed on) and IMA logs (a modified server, or a log naming the
+     registered build when another ran) fail. A fuzz target covers every
+     parser.
+
+   Next: the VS's GS admission uses it (enrollment by credential
+   activation, quotes with boot and IMA logs, `--build-registry`), the GS's
+   `hardware-tpm` provider gathers the evidence, and CI publishes the
+   registry with signed build provenance. `dbx` currency is not appraised
+   yet.
 5. **Persistent App Attest keys** in the VS (today in memory: a restarted VS
    asks each app to attest a new key).
 

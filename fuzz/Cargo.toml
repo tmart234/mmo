@@ -19,6 +19,7 @@ fpp-crypto = { path = "../crates/fpp-crypto" }
 fpp-session = { path = "../crates/fpp-session" }
 fpp-tokens = { path = "../crates/fpp-tokens" }
 fpp-types = { path = "../crates/fpp-types" }
+attest-tpm = { path = "../crates/attest-tpm" }
 
 # Separate workspace: built only by `cargo +nightly fuzz`, never by the main CI.
 [workspace]
@@ -48,6 +49,13 @@ bench = false
 [[bin]]
 name = "p2p_recv"
 path = "fuzz_targets/p2p_recv.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tpm_evidence"
+path = "fuzz_targets/tpm_evidence.rs"
 test = false
 doc = false
 bench = false
