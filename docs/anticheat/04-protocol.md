@@ -102,9 +102,13 @@ Rationale: platform evidence algorithms vary and are not ours to choose. The
 passport model normalizes them into FPP-S1 tokens at the Verifier, so relying
 parties implement exactly one signature algorithm on the hot path.
 Post-quantum: confidentiality (harvest-now-decrypt-later of PII and telemetry)
-is addressed now via hybrid key exchange. Authenticity of long-lived roots is
-hybrid now. Short-lived objects (TTL of seconds to minutes) migrate when
-platform and hardware support allows.
+is addressed now via hybrid key exchange. Long-lived roots sign hybrid
+(implemented for the Log key), but that buys post-quantum authenticity only
+where the ML-DSA half is verified: in the prototype that is the witness
+alone, since no relying party verifies an S1H object yet and C2SP
+checkpoint verifiers check only the Ed25519 line (07, F22). Short-lived
+objects (TTL of seconds to minutes) migrate when platform and hardware
+support allows.
 
 ## 4. Keys and roles
 
