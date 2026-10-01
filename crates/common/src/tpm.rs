@@ -1,5 +1,5 @@
 //! What a game server's TPM quotes at admission. The TPM 2.0 evidence
-//! itself is gathered by `gs_sim::tpm2` and appraised by `attest-tpm` in the
+//! itself is gathered by `common::tpm2` and appraised by `attest-tpm` in the
 //! VS (`vs/src/tpm2.rs`).
 
 use sha2::{Digest as _, Sha256};

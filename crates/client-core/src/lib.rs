@@ -15,14 +15,18 @@
 
 pub use anyhow::{anyhow, bail, Context, Result};
 
+pub mod tpm;
 pub mod transparency;
 
 use common::{
     admission::request_challenge,
     crypto::{evidence_request_sign_bytes, match_request_sign_bytes},
-    framing::{recv_msg, send_msg},
+    framing::{recv_msg, send_msg, send_msg_continue},
     keys::KeyBundle,
-    proto::{ClientCmd, EvidenceAnswer, EvidenceRequest, MatchAnswer, MatchRequest, WorldSnapshot},
+    proto::{
+        ClientCmd, CredentialChallenge, CredentialResponse, EvidenceAnswer, EvidenceRequest,
+        MatchAnswer, MatchRequest, WorldSnapshot,
+    },
 };
 use ed25519_dalek::SigningKey;
 use fpp_crypto::{Ed25519Signer, KeySet, SessionSigner};
@@ -143,12 +147,34 @@ pub async fn request_admission(
     request_admission_with(services, trust, queue, Box::new(session)).await
 }
 
+/// A device's platform evidence for the Verifier (roadmap P3).
+pub trait Attestor: Send + Sync {
+    /// Evidence bound to the Verifier's challenge and the session key
+    /// (`SessionKey::to_bytes`).
+    fn evidence(&self, verifier_challenge: &[u8; 32], session_pub: &[u8]) -> Result<Vec<u8>>;
+    /// `TPM2_ActivateCredential`, when the Verifier asks (TPM evidence).
+    fn activate(&self, _challenge: &CredentialChallenge) -> Result<Vec<u8>> {
+        bail!("this device has no TPM to activate a credential")
+    }
+}
+
 /// [`request_admission`] with a given session key.
 pub async fn request_admission_with(
     services: &Services,
     trust: &ClientTrust,
     queue: &str,
     session: SessionSigning,
+) -> Result<Credentials> {
+    request_admission_attested(services, trust, queue, session, None).await
+}
+
+/// [`request_admission_with`] with the device's platform evidence.
+pub async fn request_admission_attested(
+    services: &Services,
+    trust: &ClientTrust,
+    queue: &str,
+    session: SessionSigning,
+    attestor: Option<&dyn Attestor>,
 ) -> Result<Credentials> {
     let session_key = session.session_key();
     let session_pub = session_key.to_bytes();
@@ -158,7 +184,10 @@ pub async fn request_admission_with(
     let mut v = request_challenge(&trust.ca_der, services.verifier, "verifier").await?;
     let platform = std::env::consts::OS.to_string();
     let client_build = common::crypto::sha256(env!("CARGO_PKG_VERSION").as_bytes());
-    let evidence = Vec::new(); // no platform evidence yet (P3): tier D0
+    let evidence = match attestor {
+        Some(a) => a.evidence(&v.challenge, &session_pub)?,
+        None => Vec::new(), // no platform evidence: tier D0
+    };
     let msg = evidence_request_sign_bytes(
         &v.challenge,
         &session_pub,
@@ -170,7 +199,8 @@ pub async fn request_admission_with(
         .sign(&msg)
         .try_into()
         .map_err(|_| anyhow!("the session key's signature is not 64 bytes"))?;
-    send_msg(
+    // (the stream stays open: the Verifier may ask for credential activation)
+    send_msg_continue(
         &mut v.send,
         &EvidenceRequest {
             session_pub,
@@ -181,11 +211,18 @@ pub async fn request_admission_with(
         },
     )
     .await?;
-    let answer: EvidenceAnswer = recv_msg(&mut v.recv).await.context("recv EvidenceAnswer")?;
+    let mut answer: EvidenceAnswer = recv_msg(&mut v.recv).await.context("recv EvidenceAnswer")?;
+    if let EvidenceAnswer::Activate(credential) = &answer {
+        let attestor = attestor.context("the Verifier asked for credential activation")?;
+        let secret = attestor.activate(credential)?;
+        send_msg(&mut v.send, &CredentialResponse { secret }).await?;
+        answer = recv_msg(&mut v.recv).await.context("recv EvidenceAnswer")?;
+    }
     v.conn.close(0u32.into(), b"thanks");
     let ar = match answer {
         EvidenceAnswer::Ar(ar) => ar,
         EvidenceAnswer::Refused { code } => return Err(SessionEnd::Refused(code).into()),
+        EvidenceAnswer::Activate(_) => bail!("the Verifier asked for activation twice"),
     };
     let ar_claims = verify_ar(&ar, &keys, unix_s()).map_err(|e| anyhow!("AR: {e}"))?;
     if ar_claims.cnf != session_key || ar_claims.nonce != v.challenge {

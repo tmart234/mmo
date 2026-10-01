@@ -272,7 +272,22 @@ match with a P-256 key and the smoke client uses one. StrongBox reaches
 D2. Fixed with it: an Android key that is itself the session key could
 not carry its own public key in its attestation challenge; it now binds
 `attest_challenge_hw_key` and must equal the session key (10 §5).
-Next: TPM client evidence, Play Integrity, a client Build Registry.
+**PC TPM clients ✅ (P3.2):** the Verifier appraises a PC's TPM 2.0: EK
+chain to a pinned manufacturer, quote over the challenge and session key,
+the boot log explaining every quoted PCR, Windows' boot configuration
+(test-signing, debuggers, code integrity, VBS, HVCI, boot DMA protection)
+from the WBCL, a session key made in and certified by the TPM, and
+credential activation as a second round trip (10 §5). Windows with Secure
+Boot and a clean kernel is D2; test-signing or Secure Boot off is D0;
+Linux is D1.
+**Exit ✅ (P3, PC):** `tools/src/attestation_exit.rs` in `make ci`, on
+swtpm: replayed quote rejected; software TPM (unpinned manufacturer)
+rejected; a guessed credential rejected; test-signing and HVCI-off
+machines in the right tiers (D0; D2 with `hvci: false`); the tier drives
+matchmaking (`verified` admits D2 and plays, refuses D0/D1; `hardened`
+(D3) refuses all, since nothing runtime-attests yet). Not yet on a real
+Windows machine.
+Next: Play Integrity, a client Build Registry.
 **Exit:** red-team tests: replayed quote rejected; software TPM rejected;
 test-signing/HVCI-off machine lands in the correct tier; tier drives
 matchmaking in a staging queue.

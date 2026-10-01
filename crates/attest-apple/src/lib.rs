@@ -144,13 +144,14 @@ fn claims(key_id: &[u8; 32], development: bool) -> Claims {
         verified_boot: None,
         app_attested: true,
         // The App Attest key signs only assertions, so it cannot be the FPP
-        // session key; a Secure Enclave session key needs P-256 session keys
-        // (04 §4.1 S1), a later step.
+        // session key, and App Attest cannot prove where a separate session
+        // key lives (even a Secure Enclave one).
         session_key_in_hw: false,
         os_patch_level: None,
         // App Attest's key id: stable for the app install (a reinstall makes
         // a new one).
         hardware_identity: Some(key_id.to_vec()),
+        boot: Default::default(),
         warnings,
     }
 }

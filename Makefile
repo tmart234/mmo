@@ -28,7 +28,7 @@ help:
 	@echo "  check              - fmt+clippy (headless crates only)"
 	@echo "  build-headless     - build headless crates (-p $(HEADLESS_PKGS))"
 	@echo "  test-headless      - cargo test for headless crates"
-	@echo "  test-stage         - test headless crates + run smoke (cell <-> GS <-> client) + revocation and split-view exit tests"
+	@echo "  test-stage         - test headless crates + run smoke (cell <-> GS <-> client) + revocation, split-view and attestation exit tests"
 	@echo "  interop            - check FPP golden vectors with the independent Python verifier"
 	@echo "  ffi-c-test         - C SDK conformance (x86_64); ffi-c-test-i686 for the Halo ABI"
 	@echo "  pi-cell            - cross-build the cell's services (and gen_keys, fpp-cell) for a Raspberry Pi (aarch64)"
@@ -76,6 +76,8 @@ test-stage: test-headless
 	cargo run -p tools --bin revocation_load
 	@echo "Split-view exit test (a player proves a rogue GS showed it another Checkpoint; GS revoked)..."
 	cargo run -p tools --bin split_view
+	@echo "P3 exit tests (PC TPM clients on swtpm: tiers from measured boot, replayed quote, software TPM, guessed credential)..."
+	cargo run -p tools --bin attestation_exit
 
 # FPP v1 golden vectors, checked by the independent Python implementation.
 # (The Rust side is checked by crates/fpp-crypto/tests/golden.rs.)

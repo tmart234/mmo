@@ -100,6 +100,10 @@ quirks.
 | Android, locked, verified boot, a P-256 key endorsing a software session key | key attestation | **D1** | as above, `key_in_hw: false` |
 | Android, unlocked bootloader or custom OS | key attestation | **D0** | `secure_boot: false` |
 | iPhone / iPad | App Attest | **D1** | `app_attested`; `secure_boot` absent |
+| Windows PC: Secure Boot on, no test-signing, debugger, safe mode or WinPE, code integrity on; session key in the TPM | TPM quote + WBCL + certified key | **D2** | `secure_boot`, `measured_boot`, `key_in_hw`; `vbs`, `hvci`, `iommu` as measured (`hvci-off` warned) |
+| Windows PC with test-signing, a kernel or boot debugger, or Secure Boot off | same | **D0** | the warning names it |
+| Linux PC with a TPM (no Windows boot configuration to read) | TPM quote + certified key | **D1** | `key_in_hw`; `os-not-measured` |
+| A TPM whose EK no pinned manufacturer certified (a software TPM), a replayed quote, a failed credential activation | | **D0** | `evidence-rejected: …` |
 | anything else, or failed evidence | none | **D0** | warning names why |
 
 ## 5. Next steps (P3, in order)
@@ -139,7 +143,7 @@ quirks.
 3. **Play Integrity** (Android): a server-side decrypted verdict for
    `MEETS_STRONG_INTEGRITY` and device recall, for bans that survive
    reinstalls.
-4. ◐ **`attest-tpm`** (game servers and Windows clients). Done, in
+4. ✅ **`attest-tpm`** (game servers and PC clients). Done, in
    `crates/attest-tpm`:
    - `TPMS_ATTEST` quotes, verified with the AK's `TPMT_PUBLIC` (RSA-SSA,
      RSA-PSS, ECDSA P-256/P-384): the AK must be a restricted signing key
@@ -172,6 +176,42 @@ quirks.
    untrusted manufacturer, and a modified GS that really ran. Operator
    steps: `TPM_GUIDE.md`. Open: TPM 2.0 re-attestation during a session,
    and `dbx` currency.
+   ✅ **Clients (P3.2).** A PC client's evidence (`Evidence::Tpm`):
+   - an EK certificate chained to a manufacturer root the Verifier pins
+     (`svc-verifier --tpm-ek-roots`);
+   - a quote whose nonce is `attest_challenge(verifier_challenge,
+     session_pub)`, so it is for this admission and this session key;
+   - the measured-boot log, which must explain every quoted PCR of 7 and
+     12–14, including PCRs it does not touch (an omitted event would leave
+     its PCR unexplained);
+   - a session key the TPM made (P-256, `fixedTPM`, unrestricted signing),
+     certified by the AK (`TPM2_Certify`), which must be the AR's key.
+
+   Then a second round trip: credential activation, which ties the AK to
+   the certified EK. Windows' boot configuration is read from the SIPA
+   events in the WBCL (`attest_tpm::wbcl`, after `wbcl.h`), only from
+   events in quoted PCRs whose digest is the hash of their data: test
+   signing, the kernel and boot debuggers, code integrity, safe mode,
+   WinPE, VBS, HVCI and boot DMA protection. A weakening measured once
+   counts (a resume after hibernation measures again); a protection must
+   hold every time. The EK digest is the hardware identity (DID). The
+   client side is `client_core::tpm` over tpm2-tools (`common::tpm2`):
+   the session key signs every object through `tpm2_sign`.
+   **Exit tests** (`tools/src/attestation_exit.rs`, in `make ci`, on swtpm
+   with boot logs extended into its PCRs): Windows with HVCI is D2, joins
+   `verified` and plays with TPM-signed InputCommits, and `hardened` (D3)
+   refuses it; HVCI off is D2 with `hvci: false`; test-signing and Secure
+   Boot off are D0 and refused by `verified`; Linux is D1; and D0 for a
+   software TPM from an unpinned manufacturer, a replayed quote, a guessed
+   credential, and a TPM's evidence presented for a session key outside
+   the TPM.
+   Not verified here: a real Windows machine. The logs follow the TCG
+   format and `wbcl.h`, and real WBCLs (tens of KiB, many more events,
+   resume cycles) are the next check; evidence is capped at 48 KiB today.
+   A Windows game would gather it with the Platform Crypto Provider and
+   `Tbsi_GetTCGLog`; the C SDK has no TPM evidence builder yet. D3 needs
+   `GetRuntimeAttestationReport` (Windows 25H2+), which nothing appraises
+   yet.
 5. **Persistent App Attest keys** in the Verifier (today in memory: a
    restarted Verifier asks each app to attest a new key).
 

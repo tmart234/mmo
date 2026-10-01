@@ -6,12 +6,13 @@
 //! a match (the Broker does) or bless a server (Server Liveness does).
 
 pub mod appraisal;
+pub mod tpm;
 
 use anyhow::{Context, Result};
 use common::admission::accept_challenge;
 use common::crypto::{evidence_request_sign_bytes, now_ms};
-use common::framing::{recv_msg, send_msg};
-use common::proto::{EvidenceAnswer, EvidenceRequest};
+use common::framing::{recv_msg, send_msg, send_msg_continue};
+use common::proto::{CredentialChallenge, CredentialResponse, EvidenceAnswer, EvidenceRequest};
 use fpp_crypto::Ed25519Signer;
 use fpp_tokens::AttestationResult;
 use fpp_types::{BuildId, Did, Reason, SessionKey};
@@ -46,12 +47,29 @@ fn refuse(reason: Reason) -> EvidenceAnswer {
     }
 }
 
+/// What a request leads to.
+pub enum Step {
+    Answer(EvidenceAnswer),
+    /// TPM evidence: the credential to send, and what to answer once the
+    /// client's TPM returned the secret (or not).
+    Activate(CredentialChallenge, Box<PendingAr>),
+}
+
+/// An AR waiting for credential activation.
+pub struct PendingAr {
+    challenge: [u8; 32],
+    req: EvidenceRequest,
+    session_key: SessionKey,
+    appraised: appraisal::Appraised,
+    activation: tpm::Activation,
+}
+
 impl Verifier {
     /// Appraise one request made against `challenge`.
-    pub fn answer(&self, challenge: &[u8; 32], req: &EvidenceRequest) -> EvidenceAnswer {
+    pub fn answer(&self, challenge: &[u8; 32], req: &EvidenceRequest) -> Step {
         // Proof of possession of the session key, bound to this challenge.
         let Some(session_key) = SessionKey::from_bytes(&req.session_pub) else {
-            return refuse(Reason::PopInvalid);
+            return Step::Answer(refuse(Reason::PopInvalid));
         };
         let msg = evidence_request_sign_bytes(
             challenge,
@@ -61,15 +79,56 @@ impl Verifier {
             &req.evidence,
         );
         if !fpp_crypto::verify_session_raw(&session_key, &msg, &req.pop_sig) {
-            return refuse(Reason::PopInvalid);
+            return Step::Answer(refuse(Reason::PopInvalid));
         }
         if req.platform.is_empty() || req.platform.len() > 32 {
-            return refuse(Reason::ArInvalid);
+            return Step::Answer(refuse(Reason::ArInvalid));
         }
 
         // Platform evidence, bound to this challenge and session key.
-        let appraised =
-            appraisal::appraise(&self.attestation, challenge, &session_key, &req.evidence);
+        match appraisal::appraise(&self.attestation, challenge, &session_key, &req.evidence) {
+            appraisal::Outcome::Done(appraised) => {
+                Step::Answer(self.issue(challenge, req, session_key, appraised))
+            }
+            appraisal::Outcome::Activate(appraised, activation) => Step::Activate(
+                CredentialChallenge {
+                    id_object: activation.id_object.clone(),
+                    encrypted_secret: activation.encrypted_secret.clone(),
+                },
+                Box::new(PendingAr {
+                    challenge: *challenge,
+                    req: req.clone(),
+                    session_key,
+                    appraised,
+                    activation,
+                }),
+            ),
+        }
+    }
+
+    /// The AR once the client answered the credential: as appraised if its
+    /// TPM opened it, else D0.
+    pub fn activated(&self, pending: PendingAr, secret: &[u8]) -> EvidenceAnswer {
+        let appraised = if pending.activation.opened(secret) {
+            pending.appraised
+        } else {
+            appraisal::activation_failed()
+        };
+        self.issue(
+            &pending.challenge,
+            &pending.req,
+            pending.session_key,
+            appraised,
+        )
+    }
+
+    fn issue(
+        &self,
+        challenge: &[u8; 32],
+        req: &EvidenceRequest,
+        session_key: SessionKey,
+        appraised: appraisal::Appraised,
+    ) -> EvidenceAnswer {
         // A hardware-rooted identity where the platform gives one (dev
         // stand-in for HMAC(publisher_did_key, hardware_identity), 04 §5);
         // else a per-key pseudonym.
@@ -91,7 +150,9 @@ impl Verifier {
             tier: appraised.tier,
             features: appraised.features,
             client_build: BuildId(req.client_build),
-            platform: req.platform.clone(),
+            platform: appraised
+                .platform
+                .map_or_else(|| req.platform.clone(), str::to_string),
             policy_ver: POLICY_VER,
             warnings: appraised.warnings,
         };
@@ -113,7 +174,20 @@ impl Verifier {
                     .await
                     .context("request timed out")?
                     .context("recv EvidenceRequest")?;
-                send_msg(&mut o.send, &verifier.answer(&o.challenge, &req)).await?;
+                let answer = match verifier.answer(&o.challenge, &req) {
+                    Step::Answer(a) => a,
+                    Step::Activate(credential, pending) => {
+                        send_msg_continue(&mut o.send, &EvidenceAnswer::Activate(credential))
+                            .await?;
+                        let r: CredentialResponse =
+                            timeout(verifier.deadline, recv_msg(&mut o.recv))
+                                .await
+                                .context("activation timed out")?
+                                .context("recv CredentialResponse")?;
+                        verifier.activated(*pending, &r.secret)
+                    }
+                };
+                send_msg(&mut o.send, &answer).await?;
                 // Let the reply drain before the connection is dropped.
                 let _ = timeout(Duration::from_secs(2), o.conn.closed()).await;
                 Ok::<_, anyhow::Error>(())

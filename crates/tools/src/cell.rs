@@ -119,6 +119,8 @@ pub struct Launch {
     pub wrapper: Option<OsString>,
     /// Wait this long after starting each service.
     pub startup: Duration,
+    /// More arguments for a service (e.g. the Verifier's TPM roots).
+    pub extra_args: Vec<(&'static str, Vec<String>)>,
 }
 
 impl Launch {
@@ -141,6 +143,7 @@ impl Launch {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(200),
             ),
+            extra_args: Vec::new(),
         }
     }
 }
@@ -183,6 +186,13 @@ impl Cell {
             let (mut cmd, bin) = command(&format!("svc-{s}"));
             let child = cmd
                 .args(args(s))
+                .args(
+                    launch
+                        .extra_args
+                        .iter()
+                        .filter(|(name, _)| *name == s)
+                        .flat_map(|(_, a)| a.clone()),
+                )
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())
                 .spawn()

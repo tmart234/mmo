@@ -701,7 +701,7 @@ action = &( kick: 0, deny_admission: 1, downgrade_tier: 2, segregate: 3,
 | Endpoint | Caller | Request → Response |
 |----------|--------|--------------------|
 | `POST /v1/attest/challenge` | IA | `{platform, ia_version}` → `{nonce, exp}` |
-| `POST /v1/attest/evidence` | IA | `{nonce, evidence…, session_pub}` → `AttestationResult` |
+| `POST /v1/attest/evidence` | IA | `{nonce, evidence…, session_pub}` → `AttestationResult`; for TPM evidence first `Activate {credential}` → `{secret}` (`TPM2_ActivateCredential`), then the AR (10 §5) |
 | `POST /v1/attest/report` | IA (dual path) | `IntegrityReport` → `{ack}` |
 | `POST /v1/admission` | client | `{account_token, AR, queue}` → `SAT` + GS endpoint (or queue position) |
 | `POST /v1/server/attest` | GS / Host Agent | CVM or measured-boot evidence → `SAR` (then renewed on a stream) |

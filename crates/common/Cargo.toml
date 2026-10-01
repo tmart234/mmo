@@ -24,6 +24,7 @@ hex              = { workspace = true }
 serde_json       = { workspace = true }
 
 fpp-crypto       = { path = "../fpp-crypto" }
+fpp-types        = { path = "../fpp-types" }
 
 
 [features]

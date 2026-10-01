@@ -194,6 +194,28 @@ pub fn verify_signature(key: &Public, message: &[u8], sig: &Signature) -> Result
     }
 }
 
+/// The AK's signature over a `TPMS_ATTEST` it made (a quote, a
+/// certification): the AK's attributes, its scheme, the signature.
+pub fn verify_ak_signature(
+    ak: &Public,
+    attest_bytes: &[u8],
+    signature_bytes: &[u8],
+) -> Result<Signature, TpmError> {
+    ak.check_attestation_key()?;
+    let sig = Signature::parse(signature_bytes)?;
+    // (a key made for one scheme signs with no other)
+    let key_scheme = match &ak.params {
+        KeyParams::Rsa { scheme, .. } | KeyParams::Ecc { scheme, .. } => *scheme,
+    };
+    if key_scheme.0 != alg::NULL
+        && (key_scheme.0, key_scheme.1) != (sig.scheme().0, Some(sig.scheme().1))
+    {
+        return Err(TpmError::Policy("signature scheme differs from the key's"));
+    }
+    verify_signature(ak, attest_bytes, &sig)?;
+    Ok(sig)
+}
+
 /// What a verified quote established.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Quote {
@@ -218,18 +240,7 @@ pub fn verify_quote(
     nonce: &[u8],
     pcrs: &Pcrs,
 ) -> Result<Quote, TpmError> {
-    ak.check_attestation_key()?;
-    let sig = Signature::parse(signature_bytes)?;
-    // (a key made for one scheme signs with no other)
-    let key_scheme = match &ak.params {
-        KeyParams::Rsa { scheme, .. } | KeyParams::Ecc { scheme, .. } => *scheme,
-    };
-    if key_scheme.0 != alg::NULL
-        && (key_scheme.0, key_scheme.1) != (sig.scheme().0, Some(sig.scheme().1))
-    {
-        return Err(TpmError::Policy("signature scheme differs from the key's"));
-    }
-    verify_signature(ak, attest_bytes, &sig)?;
+    let sig = verify_ak_signature(ak, attest_bytes, signature_bytes)?;
     let attest = Attest::parse(attest_bytes)?;
     if attest.extra_data != nonce {
         return Err(TpmError::NonceMismatch);

@@ -10,9 +10,10 @@ use sha2::{Digest, Sha256};
 /// Domain separation for [`attest_challenge`].
 pub const ATTEST_CHALLENGE_CTX: &str = "fpp/1/attest-challenge";
 
-/// Largest evidence envelope accepted (a certificate chain of a few KiB, or an
-/// App Attest object with its receipt).
-pub const MAX_EVIDENCE: usize = 16 * 1024;
+/// Largest evidence envelope accepted (a certificate chain of a few KiB, an
+/// App Attest object with its receipt, or a TPM quote with a PC's
+/// measured-boot log; a real Windows log can be larger, see 10 §5).
+pub const MAX_EVIDENCE: usize = 48 * 1024;
 /// Most certificates in a chain.
 pub const MAX_CHAIN: usize = 8;
 
@@ -61,12 +62,40 @@ pub enum Evidence {
     /// Apple App Attest: an assertion from `generateAssertion` by a key the
     /// Verifier has already appraised (`key_id`, `assertion`).
     AppleAppAssert { key_id: Vec<u8>, assertion: Vec<u8> },
+    /// A PC's TPM 2.0 (`tpm`): see [`TpmEvidence`].
+    Tpm(Box<TpmEvidence>),
+}
+
+/// A PC's TPM 2.0 evidence. The quote's nonce is
+/// `attest_challenge(verifier_challenge, session_pub)`; the session key is
+/// a P-256 key in the TPM, certified by the AK. Credential activation (a
+/// second round trip) then ties the AK to the certified EK.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TpmEvidence {
+    /// `TPM2B_PUBLIC` of the Endorsement Key, and its certificate chain
+    /// (leaf first, to a manufacturer root).
+    pub ek_public: Vec<u8>,
+    pub ek_chain: Vec<Vec<u8>>,
+    /// `TPM2B_PUBLIC` of the Attestation Key.
+    pub ak_public: Vec<u8>,
+    /// The quote: `TPMS_ATTEST` and `TPMT_SIGNATURE`.
+    pub quote: Vec<u8>,
+    pub quote_signature: Vec<u8>,
+    /// The quoted PCRs' values (SHA-256 bank).
+    pub pcrs: Vec<(u8, Vec<u8>)>,
+    /// The measured-boot log (TCG; on Windows the WBCL); empty if none.
+    pub boot_log: Vec<u8>,
+    /// The session key's `TPM2B_PUBLIC`, and the AK's certification of it.
+    pub session_public: Vec<u8>,
+    pub certify: Vec<u8>,
+    pub certify_signature: Vec<u8>,
 }
 
 impl Evidence {
     pub const FMT_ANDROID_KEY: &'static str = "android-key";
     pub const FMT_APPLE_ATTEST: &'static str = "apple-appattest";
     pub const FMT_APPLE_ASSERT: &'static str = "apple-appassert";
+    pub const FMT_TPM: &'static str = "tpm";
 
     pub fn encode(&self) -> Vec<u8> {
         let v = match self {
@@ -86,6 +115,32 @@ impl Evidence {
                 ("key_id", Value::bytes(key_id.clone())),
                 ("assertion", Value::bytes(assertion.clone())),
             ]),
+            Evidence::Tpm(t) => {
+                let b = |v: &Vec<u8>| Value::bytes(v.clone());
+                cbor::text_map([
+                    ("fmt", Value::text(Self::FMT_TPM)),
+                    ("ek", b(&t.ek_public)),
+                    ("ak", b(&t.ak_public)),
+                    ("ek_x5c", Value::Array(t.ek_chain.iter().map(b).collect())),
+                    ("quote", b(&t.quote)),
+                    ("quote_sig", b(&t.quote_signature)),
+                    (
+                        "pcrs",
+                        Value::Array(
+                            t.pcrs
+                                .iter()
+                                .map(|(i, v)| {
+                                    Value::Array(vec![Value::Unsigned((*i).into()), b(v)])
+                                })
+                                .collect(),
+                        ),
+                    ),
+                    ("boot_log", b(&t.boot_log)),
+                    ("session", b(&t.session_public)),
+                    ("certify", b(&t.certify)),
+                    ("certify_sig", b(&t.certify_signature)),
+                ])
+            }
         };
         cbor::encode(&v).expect("evidence envelope encodes")
     }
@@ -134,6 +189,49 @@ impl Evidence {
                 key_id: bytes_of("key_id")?,
                 assertion: bytes_of("assertion")?,
             })),
+            Self::FMT_TPM => {
+                let array = |name| {
+                    m.field(name)
+                        .ok()
+                        .and_then(Value::as_array)
+                        .ok_or(EvidenceError(name))
+                };
+                let ek_chain = array("ek_x5c")?;
+                if ek_chain.is_empty() || ek_chain.len() > MAX_CHAIN {
+                    return Err(EvidenceError("ek_x5c length"));
+                }
+                let ek_chain = ek_chain
+                    .iter()
+                    .map(|c| c.as_bytes().map(<[u8]>::to_vec))
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or(EvidenceError("ek_x5c entry"))?;
+                let pcrs = array("pcrs")?;
+                if pcrs.len() > 24 {
+                    return Err(EvidenceError("pcrs length"));
+                }
+                let pcrs = pcrs
+                    .iter()
+                    .map(|p| match p.as_array() {
+                        Some([Value::Unsigned(i), v]) if *i < 24 => {
+                            Some((*i as u8, v.as_bytes()?.to_vec()))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or(EvidenceError("pcrs entry"))?;
+                Ok(Some(Evidence::Tpm(Box::new(TpmEvidence {
+                    ek_public: bytes_of("ek")?,
+                    ek_chain,
+                    ak_public: bytes_of("ak")?,
+                    quote: bytes_of("quote")?,
+                    quote_signature: bytes_of("quote_sig")?,
+                    pcrs,
+                    boot_log: bytes_of("boot_log")?,
+                    session_public: bytes_of("session")?,
+                    certify: bytes_of("certify")?,
+                    certify_signature: bytes_of("certify_sig")?,
+                }))))
+            }
             _ => Err(EvidenceError("unknown fmt")),
         }
     }

@@ -10,7 +10,7 @@ fuzz_target!(|data: &[u8]| {
     let Some((&selector, body)) = data.split_first() else {
         return;
     };
-    match selector % 5 {
+    match selector % 7 {
         0 => {
             let _ = Public::from_tpm2b(body);
         }
@@ -25,6 +25,24 @@ fuzz_target!(|data: &[u8]| {
         }
         3 => {
             let _ = ima::replay(body);
+        }
+        // Windows' boot configuration from a replayed log
+        4 => {
+            if let Ok(log) = eventlog::replay(body) {
+                let _ = attest_tpm::wbcl::windows_boot(&log, &[7, 12, 13, 14]);
+            }
+        }
+        // a client's session key certification, and the evidence envelope
+        5 => {
+            let _ = attest_tpm::certify::Certification::parse(body);
+            let parts: Vec<&[u8]> = body.splitn(4, |b| *b == 0xa5).collect();
+            if let [key, attest, signature, session] = parts.as_slice() {
+                if let Ok(ak) = Public::from_tpm2b(key) {
+                    let _ =
+                        attest_tpm::certify::verify_session_key(&ak, attest, signature, session);
+                }
+            }
+            let _ = fpp_tokens::evidence::Evidence::decode(body);
         }
         _ => {
             // a whole appraisal: key, quote, signature and logs cut from the input

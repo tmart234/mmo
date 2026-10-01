@@ -47,6 +47,8 @@ pub fn queue_min_tier(queue: &str) -> Option<DeviceTier> {
     match queue {
         "open" => Some(DeviceTier::D0Unknown),
         "verified" => Some(DeviceTier::D2Hardware),
+        // runtime-attested platforms only (no evidence reaches it yet)
+        "hardened" => Some(DeviceTier::D3Hardened),
         _ => None,
     }
 }

@@ -3,9 +3,12 @@
 //! a hardware-rooted DID where the platform gives one.
 //!
 //! Formats (attest_core::Evidence): Android key attestation (`attest-android`),
-//! Apple App Attest attestations and assertions (`attest-apple`). All bind to
-//! `attest_challenge(verifier_challenge, session_pub)`, so evidence made for another
-//! admission or another session key fails. Evidence that fails appraisal is
+//! Apple App Attest attestations and assertions (`attest-apple`), a PC's
+//! TPM 2.0 ([`crate::tpm`], which needs a second round trip: credential
+//! activation). All bind to `attest_challenge(verifier_challenge,
+//! session_pub)` (an Android key that is itself the session key, to
+//! `attest_challenge_hw_key`), so evidence made for another admission or
+//! another session key fails. Evidence that fails appraisal is
 //! not an error for the client: it is tier D0 with a warning (03 §4.2), and
 //! the queue's tier floor decides.
 
@@ -25,6 +28,9 @@ pub struct ClientAttestation {
     /// App Attest keys appraised so far, by key id (in memory: a restarted
     /// Verifier asks the app to attest a new key).
     pub apple_keys: DashMap<[u8; 32], AppKey>,
+    /// TPM manufacturers' roots (DER): EK certificates must chain to one.
+    /// Empty: TPM evidence earns D0.
+    pub tpm_ek_roots: Vec<Vec<u8>>,
 }
 
 impl ClientAttestation {
@@ -72,12 +78,16 @@ impl ClientAttestation {
             android,
             apple,
             apple_keys: DashMap::new(),
+            tpm_ek_roots: Vec::new(),
         })
     }
 }
 
 /// The outcome for one admission.
 pub struct Appraised {
+    /// The platform the evidence proves (`android`, `ios`, `windows`, `pc`),
+    /// which the AR states instead of the client's own claim.
+    pub platform: Option<&'static str>,
     pub tier: DeviceTier,
     pub features: Features,
     /// Hardware-rooted identity for the DID, when the platform gives one.
@@ -87,6 +97,7 @@ pub struct Appraised {
 
 fn unrooted(warning: String) -> Appraised {
     Appraised {
+        platform: None,
         tier: DeviceTier::D0Unknown,
         features: Features::default(),
         identity: None,
@@ -115,6 +126,10 @@ fn now() -> (i64, u32) {
 fn features(c: &Claims, now_yyyymm: u32) -> Features {
     Features {
         secure_boot: c.verified_boot,
+        measured_boot: c.boot.measured_boot,
+        vbs: c.boot.vbs,
+        hvci: c.boot.hvci,
+        iommu: c.boot.iommu,
         key_in_hw: Some(c.session_key_in_hw),
         app_attested: Some(c.app_attested),
         strongbox: (c.key_storage == KeyStorage::StrongBox).then_some(true),
@@ -172,7 +187,33 @@ fn appraise_evidence(
             ))?;
             attest_apple::appraise_assertion(&assertion, challenge, &mut key, policy)
         }
+        // (appraised in `appraise`: it needs a second round trip)
+        Evidence::Tpm(_) => Err(AttestError::Envelope("tpm")),
     }
+}
+
+/// What appraisal decided: an AR now, or after credential activation.
+pub enum Outcome {
+    Done(Appraised),
+    /// TPM evidence: `Appraised` holds once the client's TPM opens the
+    /// credential; otherwise the client is D0.
+    Activate(Appraised, crate::tpm::Activation),
+}
+
+fn appraised(claims: &Claims, now_yyyymm: u32) -> Appraised {
+    Appraised {
+        platform: Some(claims.platform),
+        tier: device_tier(claims),
+        features: features(claims, now_yyyymm),
+        identity: claims.hardware_identity.clone(),
+        warnings: claims.warnings.clone(),
+    }
+}
+
+/// The outcome when credential activation fails: the AK is not in the TPM
+/// that holds the certified EK.
+pub fn activation_failed() -> Appraised {
+    unrooted("evidence-rejected: credential activation failed".into())
 }
 
 /// Appraise an admission's evidence (empty: D0).
@@ -181,28 +222,55 @@ pub fn appraise(
     verifier_challenge: &[u8; 32],
     session_key: &SessionKey,
     evidence: &[u8],
-) -> Appraised {
+) -> Outcome {
     let evidence = match Evidence::decode(evidence) {
         Ok(Some(e)) => e,
-        Ok(None) => return unrooted("no-platform-evidence".into()),
-        Err(e) => return unrooted(format!("evidence-rejected: {e}")),
+        Ok(None) => return Outcome::Done(unrooted("no-platform-evidence".into())),
+        Err(e) => return Outcome::Done(unrooted(format!("evidence-rejected: {e}"))),
     };
     let (now_unix, now_yyyymm) = now();
     let session_pub = session_key.to_bytes();
-    match appraise_evidence(
+    if let Evidence::Tpm(t) = &evidence {
+        return match crate::tpm::appraise_tpm(
+            &cfg.tpm_ek_roots,
+            t,
+            verifier_challenge,
+            &session_pub,
+            now_unix,
+        ) {
+            Ok((claims, activation)) => {
+                Outcome::Activate(appraised(&claims, now_yyyymm), activation)
+            }
+            Err(e) => Outcome::Done(unrooted(format!("evidence-rejected: {e}"))),
+        };
+    }
+    Outcome::Done(appraise_once(
         cfg,
         evidence,
         verifier_challenge,
         &session_pub,
         now_unix,
         now_yyyymm,
+    ))
+}
+
+fn appraise_once(
+    cfg: &ClientAttestation,
+    evidence: Evidence,
+    verifier_challenge: &[u8; 32],
+    session_pub: &[u8],
+    now_unix: i64,
+    now_yyyymm: u32,
+) -> Appraised {
+    match appraise_evidence(
+        cfg,
+        evidence,
+        verifier_challenge,
+        session_pub,
+        now_unix,
+        now_yyyymm,
     ) {
-        Ok(claims) => Appraised {
-            tier: device_tier(&claims),
-            features: features(&claims, now_yyyymm),
-            identity: claims.hardware_identity.clone(),
-            warnings: claims.warnings.clone(),
-        },
+        Ok(claims) => appraised(&claims, now_yyyymm),
         Err(e) => unrooted(format!("evidence-rejected: {e}")),
     }
 }
@@ -218,13 +286,25 @@ mod tests {
         assert!((202_301..=210_012).contains(&ym) && (1..=12).contains(&(ym % 100)));
     }
 
+    fn done(o: Outcome) -> Appraised {
+        match o {
+            Outcome::Done(a) => a,
+            Outcome::Activate(..) => panic!("no activation expected"),
+        }
+    }
+
     #[test]
     fn missing_and_bad_evidence_are_d0() {
         let cfg = ClientAttestation::default();
-        let a = appraise(&cfg, &[1; 32], &SessionKey::Ed25519([2; 32]), &[]);
+        let a = done(appraise(&cfg, &[1; 32], &SessionKey::Ed25519([2; 32]), &[]));
         assert_eq!(a.tier, DeviceTier::D0Unknown);
         assert_eq!(a.warnings, vec!["no-platform-evidence".to_string()]);
-        let a = appraise(&cfg, &[1; 32], &SessionKey::Ed25519([2; 32]), &[0xff, 0x00]);
+        let a = done(appraise(
+            &cfg,
+            &[1; 32],
+            &SessionKey::Ed25519([2; 32]),
+            &[0xff, 0x00],
+        ));
         assert_eq!(a.tier, DeviceTier::D0Unknown);
         assert!(a.warnings[0].starts_with("evidence-rejected"));
         // Well-formed, but this Verifier has no Android policy.
@@ -232,7 +312,7 @@ mod tests {
             chain: vec![vec![1]],
         }
         .encode();
-        let a = appraise(&cfg, &[1; 32], &SessionKey::Ed25519([2; 32]), &e);
+        let a = done(appraise(&cfg, &[1; 32], &SessionKey::Ed25519([2; 32]), &e));
         assert_eq!(a.tier, DeviceTier::D0Unknown);
         assert!(a.warnings[0].contains("no Android policy"));
     }

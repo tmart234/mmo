@@ -5,3 +5,4 @@ pub mod keys;
 pub mod pki;
 pub mod proto;
 pub mod tpm;
+pub mod tpm2;

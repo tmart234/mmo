@@ -254,6 +254,7 @@ dependencies = [
  "bincode",
  "ed25519-dalek",
  "fpp-crypto",
+ "fpp-types",
  "hex",
  "quinn",
  "rand 0.8.8",

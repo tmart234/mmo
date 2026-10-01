@@ -36,6 +36,11 @@ struct Opts {
     /// production.
     #[arg(long)]
     apple_allow_development: bool,
+    /// TPM manufacturers' root certificates (a PEM bundle): a PC's TPM
+    /// evidence counts only if its EK certificate chains to one. Without
+    /// it, TPM evidence earns D0.
+    #[arg(long)]
+    tpm_ek_roots: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -47,17 +52,24 @@ async fn main() -> Result<()> {
         .map(std::fs::read_to_string)
         .transpose()
         .context("read --android-status")?;
-    let attestation = ClientAttestation::from_options(
+    let mut attestation = ClientAttestation::from_options(
         &o.android_apps,
         status.as_deref(),
         &o.apple_app_ids,
         o.apple_allow_development,
     )?;
+    if let Some(path) = &o.tpm_ek_roots {
+        let pem =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        attestation.tpm_ek_roots = attest_core::x509::pem_certificates(&pem)
+            .map_err(|e| anyhow::anyhow!("--tpm-ek-roots: {e}"))?;
+    }
     let on = |b: bool| if b { "on" } else { "off" };
     println!(
-        "[verifier] client evidence: android {}, apple {}",
+        "[verifier] client evidence: android {}, apple {}, TPM {} manufacturer root(s)",
         on(attestation.android.is_some()),
-        on(attestation.apple.is_some())
+        on(attestation.apple.is_some()),
+        attestation.tpm_ek_roots.len()
     );
     let identity = common::pki::ServerIdentity::load(&o.tls_cert, &o.tls_key)?;
     let (verifier, endpoint) = svc_verifier::start(&o.cell, &identity, o.bind, attestation)?;
