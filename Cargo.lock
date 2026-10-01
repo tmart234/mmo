@@ -5621,7 +5621,6 @@ dependencies = [
  "clap",
  "common",
  "dashmap",
- "ed25519-dalek",
  "fpp-crypto",
  "fpp-svc",
  "fpp-tokens",
