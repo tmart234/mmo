@@ -152,6 +152,7 @@ fn claims(key_id: &[u8; 32], development: bool) -> Claims {
         // a new one).
         hardware_identity: Some(key_id.to_vec()),
         boot: Default::default(),
+        app: None,
         warnings,
     }
 }

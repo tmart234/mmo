@@ -28,6 +28,8 @@
 //! none, by design), or that the OS is not rooted *after* a verified boot.
 //! Play Integrity's verdicts cover part of that and are a separate adapter.
 
+pub mod integrity;
+
 use std::collections::HashSet;
 
 use attest_core::der::{self, Tlv, CLASS_CONTEXT, TAG_SEQUENCE, TAG_SET};
@@ -140,6 +142,10 @@ pub struct RootOfTrust {
     pub verified_boot_hash: Option<Vec<u8>>,
 }
 
+/// `attestationApplicationId`: (package name, versionCode) per package,
+/// and the signing certificates' digests.
+pub type ApplicationId = (Vec<(String, u64)>, Vec<Vec<u8>>);
+
 /// The parts of the KeyDescription the appraisal uses.
 #[derive(Debug)]
 pub struct KeyDescription {
@@ -152,8 +158,9 @@ pub struct KeyDescription {
     /// Hardware-enforced only.
     pub root_of_trust: Option<RootOfTrust>,
     pub os_patch_level: Option<u32>,
-    /// `(package names, signing-certificate digests)`.
-    pub application: Option<(Vec<String>, Vec<Vec<u8>>)>,
+    /// `((package name, versionCode) per package, signing-certificate
+    /// digests)`.
+    pub application: Option<ApplicationId>,
 }
 
 pub fn parse_key_description(ext: &[u8]) -> Result<KeyDescription, AttestError> {
@@ -203,10 +210,15 @@ pub fn parse_key_description(ext: &[u8]) -> Result<KeyDescription, AttestError> 
                     .first()
                     .ok_or(AttestError::Malformed("package name"))?
                     .octets("package name")?;
-                packages.push(
+                let version = info
+                    .get(1)
+                    .ok_or(AttestError::Malformed("package version"))?
+                    .uint("package version")?;
+                packages.push((
                     String::from_utf8(name.to_vec())
                         .map_err(|_| AttestError::Malformed("package name"))?,
-                );
+                    version,
+                ));
             }
             let digests = parts[1]
                 .children(TAG_SET, "signature digests")?
@@ -301,15 +313,22 @@ pub fn appraise(
         root_of_trust.device_locked && root_of_trust.verified_boot_state == VERIFIED_BOOT_VERIFIED;
 
     let mut warnings = vec!["no-stable-device-id".to_string()];
-    let app_attested = match &kd.application {
-        Some((packages, digests)) => policy.apps.iter().any(|app| {
-            packages.contains(&app.package)
-                && digests
-                    .iter()
-                    .any(|d| app.signer_sha256.iter().any(|a| d[..] == a[..]))
+    // Our app (an allowed package, signed by an allowed certificate), and
+    // its versionCode.
+    let app = match &kd.application {
+        Some((packages, digests)) => policy.apps.iter().find_map(|app| {
+            let (_, version) = packages.iter().find(|(name, _)| *name == app.package)?;
+            digests
+                .iter()
+                .any(|d| app.signer_sha256.iter().any(|a| d[..] == a[..]))
+                .then(|| attest_core::AttestedApp {
+                    id: format!("android:{}", app.package),
+                    version: *version,
+                })
         }),
-        None => false,
+        None => None,
     };
+    let app_attested = app.is_some();
     if !app_attested {
         warnings.push("app-not-attested".into());
     }
@@ -333,6 +352,7 @@ pub fn appraise(
         os_patch_level: kd.os_patch_level,
         hardware_identity: None,
         boot: Default::default(),
+        app,
         warnings,
     })
 }

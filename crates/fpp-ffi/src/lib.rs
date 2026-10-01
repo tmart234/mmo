@@ -397,24 +397,77 @@ pub unsafe extern "C" fn fpp_evidence_android_key(
     cap: usize,
     out_len: *mut usize,
 ) -> FppStatus {
+    guard(|| unsafe { android_key(certs, lens, count, None, out, cap, out_len) })
+}
+
+/// [`fpp_evidence_android_key`] with a Play Integrity token (the string
+/// `IntegrityTokenResponse.token()` gives), requested with
+/// `nonce = base64url(fpp_attest_challenge_key(verifier_challenge,
+/// session_key))` (no padding). A Verifier with the app's response keys
+/// needs a `MEETS_STRONG_INTEGRITY` verdict for tier D2.
+///
+/// # Safety
+/// As [`fpp_evidence_android_key`]; `token` valid for `token_len` bytes of
+/// UTF-8.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn fpp_evidence_android_key_integrity(
+    certs: *const *const u8,
+    lens: *const usize,
+    count: usize,
+    token: *const u8,
+    token_len: usize,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> FppStatus {
     guard(|| {
-        if count == 0 || count > MAX_CHAIN {
+        let token = std::str::from_utf8(unsafe { input(token, token_len) }?)
+            .map_err(|_| FppStatus::InvalidArgument)?;
+        if token.is_empty() || token.len() > 8 * 1024 {
             return Err(FppStatus::InvalidArgument);
         }
-        if certs.is_null() || lens.is_null() {
-            return Err(FppStatus::NullPointer);
+        unsafe {
+            android_key(
+                certs,
+                lens,
+                count,
+                Some(token.to_string()),
+                out,
+                cap,
+                out_len,
+            )
         }
-        let mut chain = Vec::with_capacity(count);
-        for i in 0..count {
-            // SAFETY: both arrays are valid for `count` entries.
-            let (ptr, len) = unsafe { (*certs.add(i), *lens.add(i)) };
-            if len == 0 {
-                return Err(FppStatus::InvalidArgument);
-            }
-            chain.push(unsafe { input(ptr, len) }?.to_vec());
-        }
-        write_evidence(Evidence::AndroidKey { chain }, out, cap, out_len)
     })
+}
+
+/// # Safety
+/// As [`fpp_evidence_android_key`].
+unsafe fn android_key(
+    certs: *const *const u8,
+    lens: *const usize,
+    count: usize,
+    integrity: Option<String>,
+    out: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> Res {
+    if count == 0 || count > MAX_CHAIN {
+        return Err(FppStatus::InvalidArgument);
+    }
+    if certs.is_null() || lens.is_null() {
+        return Err(FppStatus::NullPointer);
+    }
+    let mut chain = Vec::with_capacity(count);
+    for i in 0..count {
+        // SAFETY: both arrays are valid for `count` entries.
+        let (ptr, len) = unsafe { (*certs.add(i), *lens.add(i)) };
+        if len == 0 {
+            return Err(FppStatus::InvalidArgument);
+        }
+        chain.push(unsafe { input(ptr, len) }?.to_vec());
+    }
+    write_evidence(Evidence::AndroidKey { chain, integrity }, out, cap, out_len)
 }
 
 /// The evidence envelope for an Apple App Attest attestation object (from

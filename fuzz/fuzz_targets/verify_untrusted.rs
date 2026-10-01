@@ -50,6 +50,15 @@ fuzz_target!(|data: &[u8]| {
             use fpp_wire::Payload as _;
             let _ = fpp_tokens::AttestationResult::from_cbor(body);
             let _ = fpp_tokens::SessionAdmissionToken::from_cbor(body);
+            // a Play Integrity token (with fixed response keys)
+            if let Ok(token) = std::str::from_utf8(body) {
+                let keys = attest_android::integrity::IntegrityKeys {
+                    decryption: [7; 32],
+                    verification: vec![4; 65],
+                };
+                let _ = attest_android::integrity::b64(token);
+                let _ = attest_android::integrity::verify(token, &keys, &[0; 32], &[], 0, 1);
+            }
         }
         _ => {
             let mid = body.len() / 2;

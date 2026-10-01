@@ -9,7 +9,14 @@ description = "Verifier appraisal of Android Keystore key attestation (KeyMint):
 [dependencies]
 attest-core = { path = "../attest-core" }
 serde_json = { workspace = true }
+# Play Integrity tokens: AES key wrap, AES-GCM, ECDSA P-256
+aws-lc-rs = { workspace = true }
+
+[features]
+# Play Integrity token minting, for other crates' tests
+testing = []
 
 [dev-dependencies]
+attest-android = { path = ".", features = ["testing"] }
 rcgen = { workspace = true }
 fpp-types = { path = "../fpp-types" }

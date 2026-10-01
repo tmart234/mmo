@@ -19,6 +19,7 @@ fpp-log = { path = "../crates/fpp-log" }
 fpp-session = { path = "../crates/fpp-session" }
 fpp-tokens = { path = "../crates/fpp-tokens" }
 fpp-types = { path = "../crates/fpp-types" }
+attest-android = { path = "../crates/attest-android" }
 attest-tpm = { path = "../crates/attest-tpm" }
 
 # Separate workspace: built only by `cargo +nightly fuzz`, never by the main CI.

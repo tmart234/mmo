@@ -307,6 +307,24 @@ enum FppStatus fpp_evidence_android_key(const uint8_t *const *certs,
                                         size_t cap,
                                         size_t *out_len);
 
+// [`fpp_evidence_android_key`] with a Play Integrity token (the string
+// `IntegrityTokenResponse.token()` gives), requested with
+// `nonce = base64url(fpp_attest_challenge_key(verifier_challenge,
+// session_key))` (no padding). A Verifier with the app's response keys
+// needs a `MEETS_STRONG_INTEGRITY` verdict for tier D2.
+//
+// # Safety
+// As [`fpp_evidence_android_key`]; `token` valid for `token_len` bytes of
+// UTF-8.
+enum FppStatus fpp_evidence_android_key_integrity(const uint8_t *const *certs,
+                                                  const size_t *lens,
+                                                  size_t count,
+                                                  const uint8_t *token,
+                                                  size_t token_len,
+                                                  uint8_t *out,
+                                                  size_t cap,
+                                                  size_t *out_len);
+
 // The evidence envelope for an Apple App Attest attestation object (from
 // `DCAppAttestService.attestKey`, made with `fpp_attest_challenge` as the
 // client data hash). Send it once per app key; later admissions send

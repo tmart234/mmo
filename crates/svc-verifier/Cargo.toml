@@ -26,6 +26,10 @@ attest-android = { path = "../attest-android" }
 attest-apple   = { path = "../attest-apple" }
 attest-tpm     = { path = "../attest-tpm" }
 
+[dev-dependencies]
+attest-android = { path = "../attest-android", features = ["testing"] }
+serde_json     = { workspace = true }
+
 [[bin]]
 name = "svc-verifier"
 path = "src/main.rs"

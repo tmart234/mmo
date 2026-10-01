@@ -287,7 +287,19 @@ machines in the right tiers (D0; D2 with `hvci: false`); the tier drives
 matchmaking (`verified` admits D2 and plays, refuses D0/D1; `hardened`
 (D3) refuses all, since nothing runtime-attests yet). Not yet on a real
 Windows machine.
-Next: Play Integrity, a client Build Registry.
+**Play Integrity and client builds ✅ (P3.3, P3.4):** Play Integrity
+verdicts decrypted and verified by the Verifier with the app's response
+keys; with them configured, Android D2 needs `MEETS_STRONG_INTEGRITY`. A
+client Build Registry maps attested app versions to build ids: the AR's
+`client_build` is attested where the platform attests it, and an
+unregistered version is at most D1 (10 §5).
+**P3 status:** done for PC (TPM) and Android, with the exit tests. Open:
+D3 (Windows `GetRuntimeAttestationReport`, nothing appraises it); a real
+Windows machine's WBCL and a real device's evidence and Play Integrity
+token (all tests use formats as documented); a TPM evidence builder in the
+C SDK; Play Integrity device recall; persistent App Attest keys; client
+builds on platforms that do not attest them (Windows, iOS); TPM 2.0
+re-attestation during a session.
 **Exit:** red-team tests: replayed quote rejected; software TPM rejected;
 test-signing/HVCI-off machine lands in the correct tier; tier drives
 matchmaking in a staging queue.
