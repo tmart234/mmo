@@ -16,17 +16,27 @@ pub const MAX_EVIDENCE: usize = 16 * 1024;
 /// Most certificates in a chain.
 pub const MAX_CHAIN: usize = 8;
 
-/// `SHA-256(ctx || 0x00 || verifier_challenge || session_pub)`: what the device's
+/// `SHA-256(ctx || 0x00 || verifier_challenge || session_pub)` (`session_pub`
+/// as `SessionKey::to_bytes`: 32 bytes for Ed25519, 65 for P-256): what the device's
 /// platform evidence must carry (the Android attestation challenge, the App
 /// Attest client data hash). Evidence made for another challenge or another
 /// session key does not verify.
-pub fn attest_challenge(verifier_challenge: &[u8; 32], session_pub: &[u8; 32]) -> [u8; 32] {
+pub fn attest_challenge(verifier_challenge: &[u8; 32], session_pub: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(ATTEST_CHALLENGE_CTX.as_bytes());
     h.update([0]);
     h.update(verifier_challenge);
     h.update(session_pub);
     h.finalize().into()
+}
+
+/// The challenge for a key that will *be* the session key (an Android
+/// Keystore key, attested when it is made): its public key does not exist
+/// yet, so the challenge binds the Verifier's challenge only, and the
+/// Verifier requires the attested key to equal the session key.
+/// `attest_challenge(verifier_challenge, &[])`.
+pub fn attest_challenge_hw_key(verifier_challenge: &[u8; 32]) -> [u8; 32] {
+    attest_challenge(verifier_challenge, &[])
 }
 
 /// A malformed evidence envelope (which field).

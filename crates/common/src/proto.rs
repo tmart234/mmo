@@ -16,7 +16,7 @@ pub type OpId = [u8; 16];
 
 /// Version in `ChallengeRequest`; bump on any admission-flow change (7:
 /// a purpose, and players' equivocation reports to Server Liveness).
-pub const ADMISSION_VERSION: u32 = 7;
+pub const ADMISSION_VERSION: u32 = 8;
 
 /// First message on a connection to a public service (Server Liveness, the
 /// Verifier, the Broker): asks for a single-use challenge.
@@ -128,10 +128,12 @@ pub struct CheckpointSubmit {
 /// device's platform evidence, for an Attestation Result.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct EvidenceRequest {
-    /// Ed25519 session key the AR (and later the SAT) is bound to.
-    pub session_pub: [u8; 32],
+    /// Session key the AR (and later the SAT) is bound to, as
+    /// `SessionKey::to_bytes` (Ed25519, or P-256 for a key in hardware).
+    pub session_pub: Vec<u8>,
     /// Session-key signature over `evidence_request_sign_bytes` (proof of
-    /// possession, bound to the Verifier's challenge).
+    /// possession, bound to the Verifier's challenge): Ed25519, or ES256
+    /// `r ‖ s` with low `s`.
     #[serde(with = "BigArray")]
     pub pop_sig: [u8; 64],
     pub platform: String,

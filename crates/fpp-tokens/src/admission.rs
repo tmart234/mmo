@@ -4,7 +4,7 @@
 
 use crate::{verify_ar, verify_sat, AttestationResult, SessionAdmissionToken, Token, TokenError};
 use fpp_crypto::KeyResolver;
-use fpp_types::{BuildId, DeviceTier, Did, GsInstanceId, MatchId};
+use fpp_types::{BuildId, DeviceTier, Did, GsInstanceId, MatchId, SessionKey};
 use fpp_wire::{RevocationEvent, SubjectKind};
 use std::collections::HashSet;
 
@@ -25,7 +25,7 @@ pub struct Revocations {
     pub devices: HashSet<Did>,
     pub accounts: HashSet<[u8; 32]>,
     pub builds: HashSet<BuildId>,
-    /// Session keys (`cnf`).
+    /// Session keys (`cnf`), by `fpp_crypto::session_key_id`.
     pub sessions: HashSet<[u8; 32]>,
 }
 
@@ -54,7 +54,9 @@ impl Revocations {
             || self.token_ctis.contains(&ar.cti)
             || self.devices.contains(&sat.did)
             || self.accounts.contains(&sat.sub)
-            || self.sessions.contains(&sat.cnf)
+            || self
+                .sessions
+                .contains(&fpp_crypto::session_key_id(&sat.cnf))
             || self.builds.contains(&ar.client_build)
     }
 }
@@ -72,7 +74,7 @@ pub struct Admitted {
 pub fn admit(
     sat: &[u8],
     ar: &[u8],
-    session_key: &[u8; 32],
+    session_key: &SessionKey,
     keys: &impl KeyResolver,
     policy: &AdmissionPolicy,
     revoked: &Revocations,

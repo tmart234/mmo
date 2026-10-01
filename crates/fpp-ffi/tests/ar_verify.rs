@@ -24,7 +24,7 @@ fn ar(session: [u8; 32], tier: DeviceTier, iat: u64) -> AttestationResult {
         iat,
         exp: iat + 1800,
         cti: [1; 16],
-        cnf: session,
+        cnf: fpp_types::SessionKey::Ed25519(session),
         nonce: [2; 32],
         did: Did([3; 32]),
         tier,

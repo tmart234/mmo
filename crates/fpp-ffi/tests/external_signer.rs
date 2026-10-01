@@ -188,3 +188,145 @@ fn bad_arguments() {
         );
     }
 }
+
+// ---- ES256: a P-256 key in a TPM, the Secure Enclave or StrongBox.
+
+/// P-256 "hardware": signs with the key at `ctx`, returning `r ‖ s` with
+/// whichever `s` it likes (here always the high one, as hardware may).
+unsafe extern "C" fn p256_sign_high_s(
+    ctx: *mut c_void,
+    msg: *const u8,
+    len: usize,
+    sig: *mut u8,
+) -> c_int {
+    use p256::ecdsa::signature::Signer as _;
+    let key = unsafe { &*(ctx as *const p256::ecdsa::SigningKey) };
+    let msg = unsafe { std::slice::from_raw_parts(msg, len) };
+    let s: p256::ecdsa::Signature = key.sign(msg);
+    let s = s.normalize_s().unwrap_or(s);
+    let (r, low) = s.split_scalars();
+    let high = p256::ecdsa::Signature::from_scalars(r, -low).unwrap();
+    unsafe { ptr::copy_nonoverlapping(high.to_bytes().as_ptr(), sig, 64) };
+    0
+}
+
+fn p256_key() -> p256::ecdsa::SigningKey {
+    p256::ecdsa::SigningKey::from_bytes(&[0x53; 32].into()).unwrap()
+}
+
+fn sec1(key: &p256::ecdsa::SigningKey) -> Vec<u8> {
+    key.verifying_key()
+        .to_encoded_point(false)
+        .as_bytes()
+        .to_vec()
+}
+
+#[test]
+fn an_external_p256_key_signs_session_objects_with_low_s() {
+    let key = p256_key();
+    let public = sec1(&key);
+    let mut ext = ptr::null_mut();
+    unsafe {
+        assert_eq!(
+            fpp_signer_external_p256(
+                public.as_ptr(),
+                Some(p256_sign_high_s),
+                &key as *const _ as *mut c_void,
+                &mut ext,
+            ),
+            FppStatus::Ok
+        );
+        // the session key, 65 bytes; no 32-byte Ed25519 key
+        let mut got = [0u8; FPP_SESSION_KEY_MAX];
+        let mut got_len = 0usize;
+        assert_eq!(
+            fpp_signer_session_key(ext, got.as_mut_ptr(), &mut got_len),
+            FppStatus::Ok
+        );
+        assert_eq!(&got[..got_len], &public[..]);
+        let mut ed = [0u8; 32];
+        assert_eq!(
+            fpp_signer_public_key(ext, ed.as_mut_ptr()),
+            FppStatus::InvalidArgument
+        );
+    }
+    let c = commit(ext).unwrap();
+    // ES256 and low s, whatever the hardware returned
+    let s = fpp_wire::cose::Sign1::decode(&c).unwrap();
+    assert_eq!(s.protected.alg, fpp_wire::cose::alg::ES256);
+    let sig = p256::ecdsa::Signature::from_slice(&s.signature).unwrap();
+    assert!(sig.normalize_s().is_none(), "high s emitted");
+    unsafe {
+        assert_eq!(
+            fpp_verify_input_commit_key(
+                c.as_ptr(),
+                c.len(),
+                public.as_ptr(),
+                public.len(),
+                ptr::null_mut()
+            ),
+            FppStatus::Ok
+        );
+        // the 32-byte entry point cannot name this key
+        assert_ne!(
+            fpp_verify_input_commit(c.as_ptr(), c.len(), public[1..33].as_ptr(), ptr::null_mut()),
+            FppStatus::Ok
+        );
+        // the challenge binds the 65-byte key, as the Verifier computes it
+        let mut ch = [0u8; 32];
+        assert_eq!(
+            fpp_attest_challenge_key(
+                [9; 32].as_ptr(),
+                public.as_ptr(),
+                public.len(),
+                ch.as_mut_ptr()
+            ),
+            FppStatus::Ok
+        );
+        assert_eq!(
+            ch,
+            fpp_tokens::evidence::attest_challenge(&[9; 32], &public)
+        );
+        // a P-256 key cannot sign as a host
+        let mut b = ptr::null_mut();
+        assert_eq!(
+            fpp_checkpoint_begin(
+                [1; 16].as_ptr(),
+                [2; 32].as_ptr(),
+                1,
+                0,
+                0,
+                63,
+                ptr::null(),
+                &mut b
+            ),
+            FppStatus::Ok
+        );
+        let mut out = vec![0u8; 4096];
+        let mut len = 0usize;
+        assert_eq!(
+            fpp_checkpoint_sign(b, ext, out.as_mut_ptr(), out.len(), &mut len),
+            FppStatus::InvalidArgument
+        );
+        fpp_checkpoint_free(b);
+        fpp_signer_free(ext);
+    }
+}
+
+#[test]
+fn a_p256_key_that_is_not_on_the_curve_is_refused() {
+    let mut public = sec1(&p256_key());
+    public[64] ^= 1;
+    let mut out = ptr::null_mut();
+    unsafe {
+        assert_eq!(
+            fpp_signer_external_p256(
+                public.as_ptr(),
+                Some(p256_sign_high_s),
+                ptr::null_mut(),
+                &mut out
+            ),
+            FppStatus::InvalidArgument
+        );
+    }
+}

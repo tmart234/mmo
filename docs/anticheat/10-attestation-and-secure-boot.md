@@ -96,7 +96,8 @@ quirks.
 | Device | Evidence | Tier | Claims |
 |--------|----------|------|--------|
 | Android 13+, locked, verified boot, Ed25519 session key in the TEE | key attestation | **D2** | `secure_boot`, `key_in_hw`, `app_attested` |
-| Android, locked, verified boot, P-256 key (TEE or StrongBox) | key attestation | **D1** | as above, `key_in_hw: false`; `strongbox` if so |
+| Android, locked, verified boot, P-256 (ES256) session key in the TEE or StrongBox | key attestation | **D2** | as above; `strongbox` if so |
+| Android, locked, verified boot, a P-256 key endorsing a software session key | key attestation | **D1** | as above, `key_in_hw: false` |
 | Android, unlocked bootloader or custom OS | key attestation | **D0** | `secure_boot: false` |
 | iPhone / iPad | App Attest | **D1** | `app_attested`; `secure_boot` absent |
 | anything else, or failed evidence | none | **D0** | warning names why |
@@ -110,11 +111,31 @@ quirks.
    when the hardware fails or signs with another key. Tests: an external
    key produces the same bytes as a local key with the same seed (Ed25519 is
    deterministic), and it signs InputCommits, Checkpoints and the P2P
-   AdmitPop. D2 is reachable on Android 13+ devices.
-2. **P-256 session keys (suite S1, ES256)** in `fpp-crypto`, the tokens and
-   `fpp-session`. Secure Enclave and StrongBox keys are P-256 only. An App
-   Attest assertion then endorses a Secure Enclave session key, and iOS and
-   StrongBox reach D2.
+   AdmitPop. D2 is reachable on Android 13+ devices (with the binding fixed
+   in step 2).
+2. ✅ **P-256 session keys (suite S1, ES256)**: a `SessionKey` is Ed25519 or
+   P-256 everywhere a session key goes: `cnf` of ARs and SATs (an EC2
+   `COSE_Key`), the AdmitPop and InputCommits (`fpp-session`, the GS), the
+   Verifier's and Broker's proofs of possession, revocations
+   (`session_key_id`). ES256 signatures are `r ‖ s` with low `s`; ES256 is
+   accepted only from session keys. The C SDK adds
+   `fpp_signer_external_p256` (the hardware may return either `s`; the SDK
+   emits the low one and checks it), `fpp_signer_session_key` and `_key`
+   variants of the challenge, InputCommit and AR checks, without changing
+   the 32-byte calls the Halo port uses. Golden vectors carry an ES256
+   InputCommit, an AR with a P-256 `cnf`, a high-`s` twin and an ES256 key
+   under an EdDSA header; the Python verifier checks them with its own P-256
+   (checked against RFC 6979 A.2.5). The smoke client plays with a P-256 key.
+   StrongBox now reaches D2.
+   **Fixed with it:** a Keystore key that *is* the session key is attested
+   when it is made, so its own public key cannot be in its challenge, and
+   the D2 path above could not work on a real device. Such a key now binds
+   `attest_challenge_hw_key(verifier_challenge)` (no session key), and the
+   Verifier requires the attested key to equal the session key; a key that
+   endorses a separate session key still binds that key.
+   iOS stays D1: an App Attest key signs only assertions, so the session
+   key is a separate key, and App Attest cannot prove it is in the Secure
+   Enclave.
 3. **Play Integrity** (Android): a server-side decrypted verdict for
    `MEETS_STRONG_INTEGRITY` and device recall, for bans that survive
    reinstalls.

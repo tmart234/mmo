@@ -93,7 +93,7 @@ and `interop/python/fpp_interop.py` (independent, standard library only).
 | Suite | Use | Algorithms |
 |-------|-----|------------|
 | **FPP-T1** (transport) | All QUIC/TLS | TLS 1.3; groups `X25519MLKEM768` (preferred), `X25519`; AEAD `TLS_AES_128_GCM_SHA256`, `TLS_CHACHA20_POLY1305_SHA256`. Certificates: ECDSA P-256 or Ed25519. |
-| **FPP-S1** (short-lived objects) | Tokens, commits, checkpoints, reports, revocations | Ed25519 (COSE `EdDSA`, −8), SHA-256. ES256 (ECDSA P-256, −7) is also allowed **only** for device-held session keys, because TPMs and Apple's Secure Enclave generally lack Ed25519. |
+| **FPP-S1** (short-lived objects) | Tokens, commits, checkpoints, reports, revocations | Ed25519 (COSE `EdDSA`, −8), SHA-256. ES256 (ECDSA P-256, −7) is also allowed **only** for device-held session keys, because TPMs, Apple's Secure Enclave and StrongBox lack Ed25519. An ES256 signature is `r ‖ s` (64 bytes) with **low `s`** (`s ≤ n/2`); verifiers refuse the high twin, so a signed object has one encoding per signing (its digest is a chain link). A verifier accepts ES256 only from a key of role `session`. |
 | **FPP-S1H** (long-lived roots) | Build manifests, policies, log tree heads, Verifier/Broker CA certs | `COSE_Sign` with Ed25519 **and** ML-DSA-65 (FIPS 204) |
 | **FPP-VRF1** | Outcome randomness | ECVRF-EDWARDS25519-SHA512-TAI (RFC 9381) |
 | Platform-dictated | Evidence only (Verifier-internal) | TPM AK (RSA-2048 / ECC P-256), Android key attestation (ECDSA P-256), App Attest (ECDSA P-256), SEV-SNP VCEK (ECDSA P-384), TDX quote (ECDSA P-256) |
@@ -162,7 +162,8 @@ AttestationResult = {
   4 => uint,                ; exp  (≤ iat + 1800)
   6 => uint,                ; iat
   7 => bstr .size 16,       ; cti
-  8 => { 1 => COSE_Key },   ; cnf: session public key (RFC 8747)
+  8 => { 1 => COSE_Key },   ; cnf: session public key (RFC 8747): Ed25519
+                            ; {1: 1, -1: 6, -2: x}, or P-256 {1: 2, -1: 1, -2: x, -3: y}
   10 => bstr .size 32,      ; eat_nonce: echo of Verifier challenge
   265 => "tag:fpp,2026:ar/1", ; eat_profile
   -65601 => bstr .size 32,  ; fpp-did
@@ -681,6 +682,8 @@ RevocationEvent = {                    ; COSE_Sign1, fpp-ctx "fpp/1/revocation"
   "record" => bstr .size 32,           ; hash of enforcement record (in transparency log)
 }
 subject_kind = &( account: 0, device: 1, session: 2, sat: 3, gs_instance: 4, build: 5 )
+; session id: an Ed25519 session key's 32 bytes; for a P-256 session key,
+; SHA-256 of its compressed SEC1 point (33 bytes)
 action = &( kick: 0, deny_admission: 1, downgrade_tier: 2, segregate: 3,
             suspend: 4, ban: 5, invalidate_match: 6 )
 ```

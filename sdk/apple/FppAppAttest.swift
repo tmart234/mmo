@@ -15,8 +15,11 @@
 //
 // App Attest proves a genuine Apple device's Secure Enclave holds the key
 // and that it belongs to this app. It says nothing about the OS (no boot
-// measurements, no jailbreak verdict). The session key stays in software, so
-// the Verifier grants tier D1 until P-256 session keys land (04 §4.1).
+// measurements, no jailbreak verdict). The App Attest key can only sign
+// assertions, not FPP objects, so the session key is a separate key, and
+// App Attest cannot prove where that one lives: even a Secure Enclave P-256
+// session key (fpp_signer_external_p256) is only endorsed. The Verifier
+// grants tier D1 (docs/anticheat/10 §4).
 import DeviceCheck
 import Foundation
 

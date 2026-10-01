@@ -25,7 +25,7 @@ use common::{
     proto::{ClientCmd, EvidenceAnswer, EvidenceRequest, MatchAnswer, MatchRequest, WorldSnapshot},
 };
 use ed25519_dalek::SigningKey;
-use fpp_crypto::{Ed25519Signer, KeySet, Signer as _};
+use fpp_crypto::{Ed25519Signer, KeySet, SessionSigner};
 use fpp_session::{JoinConfig, Joiner, JoinerEvent};
 use fpp_tokens::{control::Control, verify_ar, verify_sat, SarChain, SessionAdmissionToken};
 use fpp_types::{Digest, Reason};
@@ -90,10 +90,14 @@ impl ClientTrust {
     }
 }
 
+/// A session key, held here or in hardware.
+pub type SessionSigning = Box<dyn SessionSigner + Send + Sync>;
+
 /// Everything needed to join a match.
 pub struct Credentials {
-    /// Session key: proves itself to the server, signs InputCommits.
-    pub session: Ed25519Signer,
+    /// Session key: proves itself to the server, signs InputCommits
+    /// (Ed25519, or ES256 for a key held in hardware).
+    pub session: SessionSigning,
     pub ar: Vec<u8>,
     pub sat: Vec<u8>,
     pub sat_claims: SessionAdmissionToken,
@@ -136,7 +140,7 @@ pub async fn request_admission(
     queue: &str,
 ) -> Result<Credentials> {
     let session = Ed25519Signer::new(SigningKey::generate(&mut OsRng));
-    request_admission_with(services, trust, queue, session).await
+    request_admission_with(services, trust, queue, Box::new(session)).await
 }
 
 /// [`request_admission`] with a given session key.
@@ -144,9 +148,10 @@ pub async fn request_admission_with(
     services: &Services,
     trust: &ClientTrust,
     queue: &str,
-    session: Ed25519Signer,
+    session: SessionSigning,
 ) -> Result<Credentials> {
-    let session_pub = session.verifying_key().to_bytes();
+    let session_key = session.session_key();
+    let session_pub = session_key.to_bytes();
     let keys = trust.keyset();
 
     // ---- Verifier: the session key and the device's evidence, for an AR.
@@ -161,7 +166,10 @@ pub async fn request_admission_with(
         &client_build,
         &evidence,
     );
-    let pop_sig: [u8; 64] = session.sign(&msg).try_into().expect("64-byte signature");
+    let pop_sig: [u8; 64] = session
+        .sign(&msg)
+        .try_into()
+        .map_err(|_| anyhow!("the session key's signature is not 64 bytes"))?;
     send_msg(
         &mut v.send,
         &EvidenceRequest {
@@ -180,14 +188,17 @@ pub async fn request_admission_with(
         EvidenceAnswer::Refused { code } => return Err(SessionEnd::Refused(code).into()),
     };
     let ar_claims = verify_ar(&ar, &keys, unix_s()).map_err(|e| anyhow!("AR: {e}"))?;
-    if ar_claims.cnf != session_pub || ar_claims.nonce != v.challenge {
+    if ar_claims.cnf != session_key || ar_claims.nonce != v.challenge {
         bail!("AR is not for our session key and this request");
     }
 
     // ---- Broker: the AR, used by its key, for a match.
     let mut b = request_challenge(&trust.ca_der, services.broker, "broker").await?;
     let msg = match_request_sign_bytes(&b.challenge, &ar, queue);
-    let pop_sig: [u8; 64] = session.sign(&msg).try_into().expect("64-byte signature");
+    let pop_sig: [u8; 64] = session
+        .sign(&msg)
+        .try_into()
+        .map_err(|_| anyhow!("the session key's signature is not 64 bytes"))?;
     send_msg(
         &mut b.send,
         &MatchRequest {
@@ -209,7 +220,7 @@ pub async fn request_admission_with(
     };
     // Check what we were given before using it.
     let sat_claims = verify_sat(&sat, &keys, unix_s()).map_err(|e| anyhow!("SAT: {e}"))?;
-    if sat_claims.cnf != session_pub || sat_claims.ar_cti != ar_claims.cti {
+    if sat_claims.cnf != session_key || sat_claims.ar_cti != ar_claims.cti {
         bail!("SAT is not bound to our session key and AR");
     }
     Ok(Credentials {
@@ -358,7 +369,7 @@ impl GameClient {
                 attestation: Vec::new(),
                 hello: Vec::new(),
             },
-            &creds.session,
+            creds.session.as_ref(),
             addr_bytes(&creds.gs_addr),
         )
         .map_err(|e| anyhow!("join: {e}"))?;
@@ -461,7 +472,7 @@ impl GameClient {
             frames_root: fpp_merkle::root(&leaves),
             prev: self.prev_commit,
         };
-        let signed = fpp_crypto::sign(&self.creds.session, &commit);
+        let signed = fpp_crypto::sign(self.creds.session.as_ref(), &commit);
         self.prev_commit = fpp_crypto::object_digest(&signed);
         self.epoch_frames.clear();
         self.control(&Control::InputCommit { commit: signed })

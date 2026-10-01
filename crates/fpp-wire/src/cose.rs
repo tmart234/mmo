@@ -25,6 +25,8 @@ const KID: i64 = 4;
 pub mod alg {
     /// EdDSA with Ed25519.
     pub const EDDSA: i64 = -8;
+    /// ECDSA P-256 with SHA-256 (device-held session keys only, 04 §3).
+    pub const ES256: i64 = -7;
     /// ML-DSA-65 (FIPS 204; draft-ietf-cose-dilithium).
     pub const ML_DSA_65: i64 = -49;
 }

@@ -6,12 +6,14 @@ through the C SDK in `crates/fpp-ffi`).
 
 | File | Platform | Evidence | Verifier crate | Best tier today |
 |------|----------|----------|----------------|-----------------|
-| `android/FppKeyAttestation.kt` | Android 9+ | Keystore key attestation (TEE or StrongBox), chain to Google's roots | `attest-android` | D2 with an Ed25519 session key in the TEE (Android 13+), which signs through `fpp_signer_external` and `FppKeyAttestation.sign`; D1 with a P-256 key endorsing a software session key |
-| `apple/FppAppAttest.swift` | iOS 14+ | App Attest attestation once, then assertions | `attest-apple` | D1 (the session key stays in software until P-256 session keys) |
+| `android/FppKeyAttestation.kt` | Android 9+ | Keystore key attestation (TEE or StrongBox), chain to Google's roots | `attest-android` | D2 when the attested key is the session key (`attestSessionKey` with `fpp_attest_challenge_hw_key`): Ed25519 in the TEE (Android 13+, `fpp_signer_external`) or P-256 in the TEE or StrongBox (`fpp_signer_external_p256`), signing through `FppKeyAttestation.sign`; D1 with a P-256 key endorsing a software session key (`attestEndorsement`) |
+| `apple/FppAppAttest.swift` | iOS 14+ | App Attest attestation once, then assertions | `attest-apple` | D1 (App Attest endorses a separate session key and cannot prove where it lives) |
 
-Both bind evidence to `fpp_attest_challenge(verifier_challenge, session_pub)`, so
-evidence cannot be replayed into another admission or used for another
-session key. Wrap the result with `fpp_evidence_android_key`,
+Evidence is bound to `fpp_attest_challenge(verifier_challenge, session_pub)`,
+or, for a Keystore key that is itself the session key (its public key does
+not exist before it is made), to `fpp_attest_challenge_hw_key(verifier_challenge)`
+with the attested key required to equal the session key. Either way it
+cannot be replayed into another admission or used for another session key. Wrap the result with `fpp_evidence_android_key`,
 `fpp_evidence_apple_attest` or `fpp_evidence_apple_assert`, and send it as
 `EvidenceRequest.evidence` to the Verifier.
 

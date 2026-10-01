@@ -8,7 +8,7 @@ use client_core::*;
 use common::keys::KeyBundle;
 use common::proto::ClientCmd;
 use ed25519_dalek::SigningKey;
-use fpp_crypto::Ed25519Signer;
+use fpp_crypto::{Ed25519Signer, SessionSigner as _};
 use fpp_session::{Host, HostConfig, StaticKeypair};
 use fpp_tokens::{
     instance_id, sar_link, AttestationResult, Features, ServerAttestationResult,
@@ -62,6 +62,8 @@ struct Server {
     /// While true, the test liveness service keeps issuing SARs.
     feeding: Arc<AtomicBool>,
     checkpoints: mpsc::UnboundedReceiver<(u32, Vec<u8>)>,
+    /// What the server observed (an invalid InputCommit, ...).
+    signals: mpsc::UnboundedReceiver<game::Signal>,
     /// Revocation events for the match (already verified, as gs-sim does).
     revoke: mpsc::UnboundedSender<fpp_wire::RevocationEvent>,
     _stop: Arc<AtomicBool>,
@@ -90,6 +92,7 @@ async fn start_server(keys: &Arc<ServiceKeys>, sar_noise_static: Option<[u8; 32]
     );
     let (sar_tx, sar_rx) = watch::channel(None);
     let (cp_tx, checkpoints) = mpsc::unbounded_channel();
+    let (signal_tx, signals) = mpsc::unbounded_channel();
     let stop = Arc::new(AtomicBool::new(false));
     let (revoke, rev_rx) = mpsc::unbounded_channel();
     tokio::spawn(game::run(
@@ -97,8 +100,11 @@ async fn start_server(keys: &Arc<ServiceKeys>, sar_noise_static: Option<[u8; 32]
         m,
         sar_rx,
         rev_rx,
-        cp_tx,
-        None,
+        game::Outputs {
+            checkpoints: cp_tx,
+            signals: Some(signal_tx),
+            ledger: None,
+        },
         stop.clone(),
     ));
 
@@ -143,6 +149,7 @@ async fn start_server(keys: &Arc<ServiceKeys>, sar_noise_static: Option<[u8; 32]
         instance_pub,
         feeding,
         checkpoints,
+        signals,
         revoke,
         _stop: stop,
     }
@@ -152,11 +159,11 @@ async fn start_server(keys: &Arc<ServiceKeys>, sar_noise_static: Option<[u8; 32]
 fn credentials(
     keys: &ServiceKeys,
     s: &Server,
-    session: Ed25519Signer,
+    session: SessionSigning,
     slot: u16,
     match_id: MatchId,
 ) -> Credentials {
-    let session_pub = session.verifying_key().to_bytes();
+    let session_pub = session.session_key();
     let now = unix_s();
     let ar = AttestationResult {
         iss: "ver.test".into(),
@@ -208,8 +215,15 @@ fn setup() -> (Arc<ServiceKeys>, ClientTrust) {
     (keys, trust)
 }
 
-fn new_session() -> Ed25519Signer {
-    Ed25519Signer::new(SigningKey::generate(&mut rand::rngs::OsRng))
+fn new_session() -> SessionSigning {
+    Box::new(Ed25519Signer::new(SigningKey::generate(
+        &mut rand::rngs::OsRng,
+    )))
+}
+
+/// An ES256 session key, as a TPM, the Secure Enclave or StrongBox holds.
+fn new_p256_session() -> SessionSigning {
+    Box::new(fpp_crypto::P256Signer::generate())
 }
 
 fn end_of(e: anyhow::Error) -> SessionEnd {
@@ -222,9 +236,20 @@ const GRACE: Duration = Duration::from_millis(1_500);
 
 #[tokio::test]
 async fn admitted_client_plays_and_the_server_checkpoints_its_inputs() {
+    plays_and_is_checkpointed(new_session()).await;
+}
+
+/// The same with an ES256 session key: the AdmitPop and every InputCommit
+/// are ES256, and the server accepts them all.
+#[tokio::test]
+async fn a_p256_session_key_plays_like_an_ed25519_one() {
+    plays_and_is_checkpointed(new_p256_session()).await;
+}
+
+async fn plays_and_is_checkpointed(session: SessionSigning) {
     let (keys, trust) = setup();
     let mut s = start_server(&keys, None).await;
-    let creds = credentials(&keys, &s, new_session(), 0, MATCH);
+    let creds = credentials(&keys, &s, session, 0, MATCH);
     let mut c = GameClient::connect_with_grace(creds, &trust, JOIN, GRACE)
         .await
         .unwrap();
@@ -257,6 +282,12 @@ async fn admitted_client_plays_and_the_server_checkpoints_its_inputs() {
         last = Some((epoch, v.digest));
     }
     assert!(last.is_some(), "no checkpoints produced");
+    // every InputCommit verified and matched what the server saw
+    let mut signals = Vec::new();
+    while let Ok(sig) = s.signals.try_recv() {
+        signals.push(sig);
+    }
+    assert!(signals.is_empty(), "{signals:?}");
     c.bye().await.unwrap();
 }
 
@@ -346,12 +377,17 @@ async fn a_revocation_event_removes_the_player_it_names() {
     use fpp_wire::{Action, RevocationEvent, Scope, SubjectKind};
     let (keys, trust) = setup();
     let s = start_server(&keys, None).await;
-    let a_seed = [0xa1u8; 32];
-    let a_key = Ed25519Signer::new(SigningKey::from_bytes(&a_seed));
+    // (the revoked player has a P-256 session key: revocations name it by
+    // its 32-byte id, `session_key_id`)
+    let a_key = || {
+        fpp_crypto::P256Signer::new(
+            p256::ecdsa::SigningKey::from_bytes(&[0xa1; 32].into()).unwrap(),
+        )
+    };
     let b_key = new_session();
-    let a_pub = a_key.verifying_key().to_bytes();
+    let a_pub = fpp_crypto::session_key_id(&a_key().session_key());
     let mut a = GameClient::connect_with_grace(
-        credentials(&keys, &s, a_key, 0, MATCH),
+        credentials(&keys, &s, Box::new(a_key()), 0, MATCH),
         &trust,
         JOIN,
         GRACE,
@@ -396,13 +432,7 @@ async fn a_revocation_event_removes_the_player_it_names() {
         b.step(&ClientCmd::Move { dx: 1.0, dy: 0.0 }).await.unwrap();
     }
     // and the revoked session is refused if it comes back with another slot
-    let again = credentials(
-        &keys,
-        &s,
-        Ed25519Signer::new(SigningKey::from_bytes(&a_seed)),
-        2,
-        MATCH,
-    );
+    let again = credentials(&keys, &s, Box::new(a_key()), 2, MATCH);
     let err = GameClient::connect_with_grace(again, &trust, JOIN, GRACE)
         .await
         .map(|_| ())

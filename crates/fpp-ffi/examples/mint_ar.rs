@@ -61,7 +61,7 @@ fn main() {
                 iat,
                 exp: iat + 1800,
                 cti: rand::random(),
-                cnf: session,
+                cnf: fpp_types::SessionKey::Ed25519(session),
                 nonce: [0; 32],
                 did: Did(rand::random()),
                 tier,

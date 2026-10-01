@@ -11,6 +11,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// Longest session key encoding ([`fpp_signer_session_key`]): a P-256 point.
+#define FPP_SESSION_KEY_MAX 65
+
 // `FppArInfo.features` bits: a feature the Verifier reported true.
 #define FPP_FEATURE_SECURE_BOOT (1 << 0)
 
@@ -118,8 +121,10 @@ typedef enum FppStatus {
 
 // What a poll returned (`FppP2pEvent.kind`).
 typedef enum FppP2pEventKind {
-  // Host: a player joined. `peer`; `key` = its session key (verify its
-  // InputCommits with it); data = attestation ‖ admit_pop ‖ hello.
+  // Host: a player joined. `peer`; `key` = its Ed25519 session key (verify
+  // its InputCommits with it), or a P-256 session key's 32-byte id (get
+  // the key with `fpp_p2p_host_peer_session_key`); data = attestation ‖
+  // admit_pop ‖ hello.
   FPP_P2P_EVENT_KIND_PEER_JOINED = 1,
   // Host (`peer` set) or joiner: an application datagram; data = payload.
   FPP_P2P_EVENT_KIND_DATA = 2,
@@ -266,6 +271,27 @@ enum FppStatus fpp_attest_challenge(const uint8_t *verifier_challenge,
                                     const uint8_t *session_pub,
                                     uint8_t *out);
 
+// The challenge for a key that will itself be the session key (an Android
+// Keystore key, Ed25519 in the TEE or P-256 in the TEE or StrongBox): it
+// is attested when it is made, so its public key cannot be in the
+// challenge. The Verifier then requires the attested key to be the
+// session key. `SHA-256("fpp/1/attest-challenge" || 0x00 || verifier_challenge)`.
+//
+// # Safety
+// `verifier_challenge` and `out` valid for 32 bytes each.
+enum FppStatus fpp_attest_challenge_hw_key(const uint8_t *verifier_challenge, uint8_t *out);
+
+// [`fpp_attest_challenge`] for a session key of either kind
+// (`fpp_signer_session_key`: 32 or 65 bytes).
+//
+// # Safety
+// `verifier_challenge` and `out` valid for 32 bytes; `session_key` valid
+// for `session_key_len` bytes.
+enum FppStatus fpp_attest_challenge_key(const uint8_t *verifier_challenge,
+                                        const uint8_t *session_key,
+                                        size_t session_key_len,
+                                        uint8_t *out);
+
 // The evidence envelope for an Android Keystore key attestation: the
 // attested key's certificate chain, leaf first
 // (`KeyStore.getCertificateChain`, each `Certificate.getEncoded()`), for
@@ -337,15 +363,43 @@ enum FppStatus fpp_signer_external(const uint8_t *public_key,
                                    void *ctx,
                                    struct FppSigner **out);
 
+// [`fpp_signer_external`] for an ECDSA P-256 session key (ES256): a key in
+// a TPM, the Secure Enclave or StrongBox, which have no Ed25519.
+// `public_key` is the uncompressed SEC1 point (`0x04 ‖ x ‖ y`, 65 bytes);
+// the callback writes the signature as `r ‖ s` (64 bytes, big-endian; not
+// DER), over SHA-256 of the message as ES256 defines. Either `s` is
+// accepted; the SDK emits the low one.
+//
+// # Safety
+// `public_key` valid for 65 bytes; `callback` safe to call as documented at
+// `FppSignCallback`; `out` valid for a pointer write.
+enum FppStatus fpp_signer_external_p256(const uint8_t *public_key,
+                                        FppSignCallback callback,
+                                        void *ctx,
+                                        struct FppSigner **out);
+
 // # Safety
 // `signer` NULL or a live handle; not used afterwards.
 void fpp_signer_free(struct FppSigner *signer);
 
 // The key's 32-byte Ed25519 public key (what peers need to verify it).
+// `FPP_STATUS_INVALID_ARGUMENT` for a P-256 key: use
+// [`fpp_signer_session_key`].
 //
 // # Safety
 // `signer` a live handle; `out` valid for 32 bytes.
 enum FppStatus fpp_signer_public_key(const struct FppSigner *signer, uint8_t *out);
+
+// The key as a session key: 32 bytes for Ed25519, 65 (`0x04 ‖ x ‖ y`) for
+// P-256. This is what `fpp_attest_challenge_key`, `fpp_verify_input_commit_key`
+// and `fpp_ar_verify_key` take, and what the Verifier binds the AR to.
+//
+// # Safety
+// `signer` a live handle; `out` valid for `FPP_SESSION_KEY_MAX` bytes;
+// `out_len` valid for a write.
+enum FppStatus fpp_signer_session_key(const struct FppSigner *signer,
+                                      uint8_t *out,
+                                      size_t *out_len);
 
 // SHA-256 of a public key's COSE_Key: the `gs_instance_id` of a host key.
 // The first 16 bytes are the key's `kid`.
@@ -488,6 +542,18 @@ enum FppStatus fpp_verify_input_commit(const uint8_t *object,
                                        const uint8_t *session_public_key,
                                        struct FppInputCommitInfo *info);
 
+// [`fpp_verify_input_commit`] for a session key of either kind (32 bytes
+// Ed25519, or 65 bytes P-256: `fpp_p2p_host_peer_session_key`).
+//
+// # Safety
+// `object` valid for `len` bytes; `session_key` valid for
+// `session_key_len` bytes; `info` NULL or valid for a write.
+enum FppStatus fpp_verify_input_commit_key(const uint8_t *object,
+                                           size_t len,
+                                           const uint8_t *session_key,
+                                           size_t session_key_len,
+                                           struct FppInputCommitInfo *info);
+
 // Verify a signed Checkpoint against a host's 32-byte instance public key,
 // and check that `gs_instance_id` names that key. On success fills `*info`
 // if it is not NULL.
@@ -521,6 +587,22 @@ enum FppStatus fpp_ar_verify(const uint8_t *ar,
                              uint64_t now_s,
                              uint8_t minimum_tier,
                              struct FppArInfo *info);
+
+// [`fpp_ar_verify`] for a session key of either kind (32 bytes Ed25519,
+// or 65 bytes P-256: `fpp_p2p_host_peer_session_key`).
+//
+// # Safety
+// As [`fpp_ar_verify`], with `session_key` valid for `session_key_len`
+// bytes.
+enum FppStatus fpp_ar_verify_key(const uint8_t *ar,
+                                 size_t len,
+                                 const uint8_t *verifier_keys,
+                                 size_t verifier_key_count,
+                                 const uint8_t *session_key,
+                                 size_t session_key_len,
+                                 uint64_t now_s,
+                                 uint8_t minimum_tier,
+                                 struct FppArInfo *info);
 
 // Generate a static X25519 key pair (the host's identity for its invites).
 // `private_out` and `public_out`: 32 bytes each. Keep the private key secret;
@@ -633,6 +715,19 @@ enum FppStatus fpp_p2p_host_poll_event(struct FppP2pHost *host,
                                        struct FppP2pEvent *event,
                                        uint8_t *data,
                                        size_t cap);
+
+// The session key `peer` proved in its handshake, 32 bytes (Ed25519) or 65
+// (P-256), for `fpp_verify_input_commit_key` and `fpp_ar_verify_key`.
+// (`FppP2pEvent.key` holds a P-256 key's 32-byte id, `0x02/0x03`-compressed
+// point hashed, as revocations name it.)
+//
+// # Safety
+// `host` a live handle; `out` valid for `FPP_SESSION_KEY_MAX` bytes;
+// `out_len` valid for a write.
+enum FppStatus fpp_p2p_host_peer_session_key(const struct FppP2pHost *host,
+                                             uint32_t peer,
+                                             uint8_t *out,
+                                             size_t *out_len);
 
 // Number of joined players.
 //

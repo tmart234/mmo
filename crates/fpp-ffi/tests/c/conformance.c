@@ -250,6 +250,23 @@ int main(void) {
         CHECK_STATUS(fpp_attest_challenge(ones, twos, got), FPP_STATUS_OK);
         CHECK(memcmp(got, want, 32) == 0);
         CHECK_STATUS(fpp_attest_challenge(NULL, twos, got), FPP_STATUS_NULL_POINTER);
+        /* the same through the variable-length entry point (a valid key of
+           32 bytes: Ed25519), and for a key that will itself be the session
+           key: SHA-256("fpp/1/attest-challenge" || 0x00 || 01*32) */
+        {
+            uint8_t fixed_len[32];
+            CHECK_STATUS(fpp_attest_challenge(ones, session_pub, fixed_len), FPP_STATUS_OK);
+            CHECK_STATUS(fpp_attest_challenge_key(ones, session_pub, 32, got), FPP_STATUS_OK);
+            CHECK(memcmp(got, fixed_len, 32) == 0);
+            CHECK_STATUS(fpp_attest_challenge_key(ones, session_pub, 31, got), FPP_STATUS_INVALID_ARGUMENT);
+        }
+        {
+            static const uint8_t want_hw[32] = {
+                0xec, 0xba, 0x6d, 0x90, 0xf0, 0x7b, 0x53, 0x3e, 0x93, 0x5c, 0x65, 0x36, 0x59, 0x71, 0x44, 0x3c,
+                0x69, 0xd9, 0xc3, 0xd0, 0x5b, 0x2b, 0x19, 0xb3, 0x55, 0x6c, 0x8e, 0x40, 0xee, 0x38, 0x76, 0x79};
+            CHECK_STATUS(fpp_attest_challenge_hw_key(ones, got), FPP_STATUS_OK);
+            CHECK(memcmp(got, want_hw, 32) == 0);
+        }
         CHECK_STATUS(fpp_evidence_android_key(certs, lens, 2, NULL, 0, &need), FPP_STATUS_BUFFER_TOO_SMALL);
         CHECK(need > 0 && need <= sizeof env);
         CHECK_STATUS(fpp_evidence_android_key(certs, lens, 2, env, sizeof env, &len), FPP_STATUS_OK);

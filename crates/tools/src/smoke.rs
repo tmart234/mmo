@@ -113,7 +113,8 @@ fn run_smoke_pass() -> Result<(bool, bool, bool)> {
     std::thread::sleep(Duration::from_millis(500));
 
     // 3. Clients: one that must be refused the `verified` queue (tier floor
-    //    D2; this device has no evidence), then the smoke client.
+    //    D2; this device has no evidence), then the smoke client, with a
+    //    P-256 session key.
     let client_bin = bin_path("client-sim", "debug");
     let client = |args: &[&str]| {
         Command::new(&client_bin)
@@ -122,7 +123,9 @@ fn run_smoke_pass() -> Result<(bool, bool, bool)> {
             .with_context(|| format!("run {:?}", client_bin))
     };
     let refused = client(&["--queue", "verified", "--expect-refused"])?;
-    let played = client(&["--smoke-test", "--check-log", "30"])?;
+    // (an ES256 session key, as a TPM or the Secure Enclave holds: the
+    // Ed25519 path is the other exit tests' clients)
+    let played = client(&["--smoke-test", "--check-log", "30", "--session-key", "p256"])?;
     let client_ok = played.success() && refused.success();
     println!(
         "[SMOKE] clients: smoke {:?}, verified-queue refusal {:?}",

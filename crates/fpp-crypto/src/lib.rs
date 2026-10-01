@@ -10,13 +10,14 @@
 //! 4. the `kid` resolves to a known key, and that key's role allows the
 //!    context (a session key can never sign a Checkpoint, a GS key can never
 //!    sign an InputCommit);
-//! 5. the signature verifies over `Sig_structure`;
+//! 5. the signature verifies over `Sig_structure` (Ed25519, or ES256 for
+//!    session keys held in hardware, with a low-S signature);
 //! 6. only then is the payload decoded, strictly, against its schema.
 
 #![forbid(unsafe_code)]
 
 use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey};
-use fpp_types::{ctx, Digest, Kid, FPP_VERSION};
+use fpp_types::{ctx, Digest, Kid, SessionKey, FPP_VERSION};
 use fpp_wire::cbor::{self, Value};
 use fpp_wire::cose::{alg, ProtectedHeader, Sign1};
 use fpp_wire::{Payload, WireError};
@@ -91,6 +92,74 @@ pub fn kid(public: &VerifyingKey) -> Kid {
     Kid(key_digest(public).0[..16].try_into().expect("16 bytes"))
 }
 
+/// `COSE_Key` for a session key: Ed25519 as [`cose_key_ed25519`], P-256 as
+/// `{1: 2 (EC2), -1: 1 (P-256), -2: x, -3: y}`.
+pub fn cose_key_session(key: &SessionKey) -> Value {
+    match key {
+        SessionKey::Ed25519(x) => Value::Map(vec![
+            (Value::int(1), Value::int(1)),
+            (Value::int(-1), Value::int(6)),
+            (Value::int(-2), Value::bytes(x.to_vec())),
+        ]),
+        SessionKey::P256 { x, y } => Value::Map(vec![
+            (Value::int(1), Value::int(2)),
+            (Value::int(-1), Value::int(1)),
+            (Value::int(-2), Value::bytes(x.to_vec())),
+            (Value::int(-3), Value::bytes(y.to_vec())),
+        ]),
+    }
+}
+
+/// The session key a `COSE_Key` holds, if it is exactly one of the two
+/// encodings of [`cose_key_session`] and a valid point.
+pub fn session_key_from_cose(v: &Value) -> Option<SessionKey> {
+    let Value::Map(entries) = v else { return None };
+    let get = |k: i64| {
+        entries
+            .iter()
+            .find(|(key, _)| *key == Value::int(k))
+            .map(|(_, v)| v)
+    };
+    let fixed = |k: i64| -> Option<[u8; 32]> { get(k)?.as_bytes()?.try_into().ok() };
+    let key = match entries.len() {
+        3 => SessionKey::Ed25519(fixed(-2)?),
+        4 => SessionKey::P256 {
+            x: fixed(-2)?,
+            y: fixed(-3)?,
+        },
+        _ => return None,
+    };
+    (cose_key_session(&key) == *v && PublicKey::session(&key).is_some()).then_some(key)
+}
+
+/// `kid` of a session key (for Ed25519 the same as [`kid`]).
+pub fn session_kid(key: &SessionKey) -> Kid {
+    let enc = cbor::encode(&cose_key_session(key)).expect("COSE_Key keys are unique");
+    Kid(Sha256::digest(enc)[..16].try_into().expect("16 bytes"))
+}
+
+/// The 32 bytes that name a session key in revocations (`session:<hex>`,
+/// 04 §9): an Ed25519 key itself; for P-256, SHA-256 of the compressed
+/// point.
+pub fn session_key_id(key: &SessionKey) -> [u8; 32] {
+    match key {
+        SessionKey::Ed25519(k) => *k,
+        SessionKey::P256 { x, y } => {
+            let mut h = Sha256::new();
+            h.update([2 + (y[31] & 1)]);
+            h.update(x);
+            h.finalize().into()
+        }
+    }
+}
+
+/// Verify a raw signature (not a COSE object) by a session key over `msg`:
+/// proofs of possession in the admission messages. ES256 signatures are
+/// `r ‖ s` with low `s`.
+pub fn verify_session_raw(key: &SessionKey, msg: &[u8], sig: &[u8]) -> bool {
+    PublicKey::session(key).is_some_and(|k| k.verify(msg, sig))
+}
+
 /// `COSE_Key` for an ML-DSA-65 public key (draft-ietf-cose-dilithium):
 /// `{1: 7 (AKP), 3: -49 (ML-DSA-65), -1: pub}`.
 pub fn cose_key_ml_dsa(public: &[u8]) -> Value {
@@ -117,6 +186,11 @@ pub trait Signer {
     fn alg(&self) -> i64;
     fn kid(&self) -> Kid;
     fn sign(&self, to_be_signed: &[u8]) -> Vec<u8>;
+}
+
+/// A player's session key, held here or in hardware (Ed25519 or ES256).
+pub trait SessionSigner: Signer {
+    fn session_key(&self) -> SessionKey;
 }
 
 /// An Ed25519 signing key whose private half may live outside this process
@@ -162,6 +236,71 @@ impl Ed25519Key for Ed25519Signer {
     }
 }
 
+impl SessionSigner for Ed25519Signer {
+    fn session_key(&self) -> SessionKey {
+        SessionKey::Ed25519(self.public_key())
+    }
+}
+
+/// An ES256 session key in software (simulators and tests; a real one
+/// stays in a TPM, the Secure Enclave or StrongBox). Signatures are
+/// `r ‖ s` with low `s`.
+pub struct P256Signer {
+    sk: p256::ecdsa::SigningKey,
+    kid: Kid,
+}
+
+impl P256Signer {
+    pub fn new(sk: p256::ecdsa::SigningKey) -> Self {
+        let kid = session_kid(&p256_session_key(sk.verifying_key()));
+        Self { sk, kid }
+    }
+
+    pub fn generate() -> Self {
+        Self::new(p256::ecdsa::SigningKey::random(
+            &mut p256::elliptic_curve::rand_core::OsRng,
+        ))
+    }
+}
+
+/// A P-256 public key as a [`SessionKey`].
+pub fn p256_session_key(key: &p256::ecdsa::VerifyingKey) -> SessionKey {
+    SessionKey::from_bytes(key.to_encoded_point(false).as_bytes()).expect("uncompressed point")
+}
+
+/// `r ‖ s` of an ECDSA signature, with `s` made low (the other valid
+/// signature of the same message: `(r, n - s)`). Verifiers here accept only
+/// low `s`, so a signed object has exactly one valid encoding per signing.
+pub fn es256_normalize(sig: &[u8]) -> Option<[u8; 64]> {
+    let sig = p256::ecdsa::Signature::from_slice(sig).ok()?;
+    let sig = sig.normalize_s().unwrap_or(sig);
+    Some(sig.to_bytes().into())
+}
+
+impl Signer for P256Signer {
+    fn alg(&self) -> i64 {
+        alg::ES256
+    }
+
+    fn kid(&self) -> Kid {
+        self.kid
+    }
+
+    fn sign(&self, to_be_signed: &[u8]) -> Vec<u8> {
+        use p256::ecdsa::signature::Signer as _;
+        let sig: p256::ecdsa::Signature = self.sk.sign(to_be_signed);
+        es256_normalize(&sig.to_bytes())
+            .expect("a signature")
+            .to_vec()
+    }
+}
+
+impl SessionSigner for P256Signer {
+    fn session_key(&self) -> SessionKey {
+        p256_session_key(self.sk.verifying_key())
+    }
+}
+
 /// Sign a payload under its own context and content type.
 pub fn sign<P: Payload>(signer: &(impl Signer + ?Sized), payload: &P) -> Vec<u8> {
     sign_raw(signer, P::CTX, P::CONTENT_TYPE, payload.to_cbor())
@@ -188,11 +327,55 @@ pub fn sign_raw(
     s.encode()
 }
 
+/// A public key that signs FPP-S1 objects.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PublicKey {
+    Ed25519(VerifyingKey),
+    /// ES256, for device-held session keys only.
+    P256(p256::ecdsa::VerifyingKey),
+}
+
+impl PublicKey {
+    /// A session key's verifying key, if it is a valid point.
+    pub fn session(key: &SessionKey) -> Option<Self> {
+        match key {
+            SessionKey::Ed25519(k) => VerifyingKey::from_bytes(k).ok().map(PublicKey::Ed25519),
+            SessionKey::P256 { .. } => p256::ecdsa::VerifyingKey::from_sec1_bytes(&key.to_bytes())
+                .ok()
+                .map(PublicKey::P256),
+        }
+    }
+
+    pub fn alg(&self) -> i64 {
+        match self {
+            PublicKey::Ed25519(_) => alg::EDDSA,
+            PublicKey::P256(_) => alg::ES256,
+        }
+    }
+
+    /// Ed25519 strictly (RFC 8032 §5.1.7, no small-order keys); ES256 with
+    /// `r ‖ s` and low `s` only.
+    pub fn verify(&self, msg: &[u8], sig: &[u8]) -> bool {
+        match self {
+            PublicKey::Ed25519(k) => {
+                Signature::from_slice(sig).is_ok_and(|sig| k.verify_strict(msg, &sig).is_ok())
+            }
+            PublicKey::P256(k) => {
+                use p256::ecdsa::signature::Verifier as _;
+                let Ok(sig) = p256::ecdsa::Signature::from_slice(sig) else {
+                    return false;
+                };
+                sig.normalize_s().is_none() && k.verify(msg, &sig).is_ok()
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct VerificationKey {
     pub role: KeyRole,
     pub alg: i64,
-    pub key: VerifyingKey,
+    pub key: PublicKey,
 }
 
 /// A hybrid (FPP-S1H) key: both halves, one role.
@@ -227,10 +410,26 @@ impl KeySet {
             VerificationKey {
                 role,
                 alg: alg::EDDSA,
-                key,
+                key: PublicKey::Ed25519(key),
             },
         );
         k
+    }
+
+    /// Register a player's session key (role [`KeyRole::Session`]). `None`
+    /// if it is not a valid point.
+    pub fn insert_session(&mut self, key: &SessionKey) -> Option<Kid> {
+        let public = PublicKey::session(key)?;
+        let k = session_kid(key);
+        self.keys.insert(
+            k,
+            VerificationKey {
+                role: KeyRole::Session,
+                alg: public.alg(),
+                key: public,
+            },
+        );
+        Some(k)
     }
 }
 
@@ -354,10 +553,13 @@ pub fn verify<P: Payload>(
     if h.alg != key.alg {
         return Err(VerifyError::Algorithm(h.alg));
     }
-    let sig = Signature::from_slice(&s.signature).map_err(|_| VerifyError::Signature)?;
-    key.key
-        .verify_strict(&s.to_be_signed(), &sig)
-        .map_err(|_| VerifyError::Signature)?;
+    // ES256 only for session keys (04 §3)
+    if matches!(key.key, PublicKey::P256(_)) && key.role != KeyRole::Session {
+        return Err(VerifyError::Algorithm(h.alg));
+    }
+    if !key.key.verify(&s.to_be_signed(), &s.signature) {
+        return Err(VerifyError::Signature);
+    }
     let payload = P::from_cbor(&s.payload).map_err(VerifyError::Payload)?;
     Ok(Verified {
         payload,

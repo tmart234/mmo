@@ -15,7 +15,8 @@ pub mod der;
 pub mod x509;
 
 pub use fpp_tokens::evidence::{
-    attest_challenge, Evidence, EvidenceError, ATTEST_CHALLENGE_CTX, MAX_CHAIN, MAX_EVIDENCE,
+    attest_challenge, attest_challenge_hw_key, Evidence, EvidenceError, ATTEST_CHALLENGE_CTX,
+    MAX_CHAIN, MAX_EVIDENCE,
 };
 use fpp_types::DeviceTier;
 

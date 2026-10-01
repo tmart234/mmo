@@ -306,8 +306,11 @@ async fn main() -> Result<()> {
         m,
         sar_rx,
         rev_rx,
-        cp_tx,
-        ledger,
+        game::Outputs {
+            checkpoints: cp_tx,
+            signals: None,
+            ledger,
+        },
         stop.clone(),
     ));
 

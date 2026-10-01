@@ -19,11 +19,11 @@ use common::admission::accept_challenge;
 use common::crypto::{match_request_sign_bytes, now_ms};
 use common::framing::{recv_msg, send_msg};
 use common::proto::{MatchAnswer, MatchRequest};
-use ed25519_dalek::{Signature, VerifyingKey};
-use fpp_crypto::{Ed25519Signer, KeyRole, KeySet};
+use ed25519_dalek::VerifyingKey;
+use fpp_crypto::{session_key_id, Ed25519Signer, KeyRole, KeySet};
 use fpp_svc::api::liveness::{Placement, Request, Response};
 use fpp_tokens::{instance_id, verify_ar, SessionAdmissionToken};
-use fpp_types::{DeviceTier, MatchId, Reason};
+use fpp_types::{DeviceTier, MatchId, Reason, SessionKey};
 use fpp_wire::{RevocationEvent, SubjectKind};
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
@@ -121,8 +121,8 @@ pub struct Broker {
 
 /// The dev account id of a session key (the SAT's `sub`: there is no
 /// account system yet).
-pub fn account_of(session_pub: &[u8; 32]) -> [u8; 32] {
-    tagged_hash("mmo/dev-acct", session_pub)
+pub fn account_of(session_key: &SessionKey) -> [u8; 32] {
+    tagged_hash("mmo/dev-acct", &session_key.to_bytes())
 }
 
 fn tagged_hash(tag: &str, data: &[u8]) -> [u8; 32] {
@@ -169,7 +169,7 @@ impl Broker {
                 && match e.subject_kind {
                     SubjectKind::Account => e.subject_id == account,
                     SubjectKind::Device => e.subject_id == ar.did.0,
-                    SubjectKind::Session => e.subject_id == ar.cnf,
+                    SubjectKind::Session => e.subject_id == session_key_id(&ar.cnf),
                     SubjectKind::Build => e.subject_id == ar.client_build.0,
                     SubjectKind::Sat | SubjectKind::GsInstance => false,
                 }
@@ -227,14 +227,8 @@ impl Broker {
             return refuse(Reason::ArInvalid);
         };
         // The AR is used by the key it was issued to, for this request.
-        let Ok(session_key) = VerifyingKey::from_bytes(&ar.cnf) else {
-            return refuse(Reason::PopInvalid);
-        };
         let msg = match_request_sign_bytes(challenge, &req.ar, &req.queue);
-        if session_key
-            .verify_strict(&msg, &Signature::from_bytes(&req.pop_sig))
-            .is_err()
-        {
+        if !fpp_crypto::verify_session_raw(&ar.cnf, &msg, &req.pop_sig) {
             return refuse(Reason::PopInvalid);
         }
 
@@ -271,7 +265,7 @@ impl Broker {
         };
         println!(
             "[broker] admitted ..{} to match {}.. slot {} (tier D{})",
-            hex::encode(&ar.cnf[..3]),
+            hex::encode(&session_key_id(&ar.cnf)[..3]),
             hex::encode(&p.match_id[..4]),
             p.slot,
             ar.tier as u8

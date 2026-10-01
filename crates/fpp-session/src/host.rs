@@ -4,7 +4,8 @@ use crate::hello::{HostHello, JoinHello};
 use crate::packet::{self, Packet, COOKIE_LEN};
 use crate::session::{kind, Frame, Session};
 use crate::{random_u32, Error, StaticKeypair, Transmit, NOISE_PARAMS, PROLOGUE};
-use fpp_crypto::{KeyRole, KeySet};
+use fpp_crypto::KeySet;
+use fpp_types::SessionKey;
 use fpp_wire::AdmitPop;
 use std::collections::{HashMap, VecDeque};
 use subtle::ConstantTimeEq;
@@ -45,8 +46,8 @@ pub enum HostEvent {
     /// A player completed the handshake and proved its session key.
     PeerJoined {
         peer: u32,
-        /// Ed25519 FPP session key: verify this player's InputCommits with it.
-        session_key: [u8; 32],
+        /// FPP session key: verify this player's InputCommits with it.
+        session_key: SessionKey,
         /// The signed AdmitPop, for the evidence bundle.
         admit_pop: Vec<u8>,
         /// Attestation Result bytes; empty means no device evidence (tier D0).
@@ -76,7 +77,7 @@ pub enum HostEvent {
 }
 
 struct Pending {
-    session_key: [u8; 32],
+    session_key: SessionKey,
     admit_pop: Vec<u8>,
     attestation: Vec<u8>,
     hello: Vec<u8>,
@@ -94,7 +95,7 @@ pub struct Host<A> {
     /// By our (local) receiver index.
     slots: HashMap<u32, Slot<A>>,
     /// Peer id → (local index, session key).
-    peers: HashMap<u32, (u32, [u8; 32])>,
+    peers: HashMap<u32, (u32, SessionKey)>,
     pending_order: VecDeque<u32>,
     next_peer: u32,
     tx: VecDeque<Transmit<A>>,
@@ -290,10 +291,9 @@ impl<A: Clone + Eq + AsRef<[u8]>> Host<A> {
 
     /// The session key must have signed an AdmitPop for exactly this channel.
     fn check_binding(&self, join: &JoinHello, joiner_static: &[u8; 32]) -> Result<(), Error> {
-        let key = ed25519_dalek::VerifyingKey::from_bytes(&join.session_key)
-            .map_err(|_| Error::Binding)?;
         let mut keys = KeySet::default();
-        keys.insert_ed25519(KeyRole::Session, key);
+        keys.insert_session(&join.session_key)
+            .ok_or(Error::Binding)?;
         let pop = fpp_crypto::verify::<AdmitPop>(&join.admit_pop, &keys)
             .map_err(|_| Error::Binding)?
             .payload;
@@ -425,6 +425,11 @@ impl<A: Clone + Eq + AsRef<[u8]>> Host<A> {
     pub fn peer_address(&self, peer: u32) -> Option<&A> {
         let (index, _) = self.peers.get(&peer)?;
         self.slots.get(index).map(|s| &s.session.remote)
+    }
+
+    /// The session key `peer` proved in its handshake.
+    pub fn peer_session_key(&self, peer: u32) -> Option<SessionKey> {
+        self.peers.get(&peer).map(|(_, key)| *key)
     }
 
     pub fn peer_count(&self) -> usize {

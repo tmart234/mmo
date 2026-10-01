@@ -148,7 +148,7 @@ fn ar(key: &Ed25519Signer, session: &Ed25519Signer) -> Vec<u8> {
             iat: now,
             exp: now + 600,
             cti: [1; 16],
-            cnf: session.verifying_key().to_bytes(),
+            cnf: fpp_types::SessionKey::Ed25519(session.verifying_key().to_bytes()),
             nonce: [0; 32],
             did: Did([2; 32]),
             tier: DeviceTier::D3Hardened,

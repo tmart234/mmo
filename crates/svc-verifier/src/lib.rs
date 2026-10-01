@@ -12,10 +12,9 @@ use common::admission::accept_challenge;
 use common::crypto::{evidence_request_sign_bytes, now_ms};
 use common::framing::{recv_msg, send_msg};
 use common::proto::{EvidenceAnswer, EvidenceRequest};
-use ed25519_dalek::{Signature, VerifyingKey};
 use fpp_crypto::Ed25519Signer;
 use fpp_tokens::AttestationResult;
-use fpp_types::{BuildId, Did, Reason};
+use fpp_types::{BuildId, Did, Reason, SessionKey};
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -51,7 +50,7 @@ impl Verifier {
     /// Appraise one request made against `challenge`.
     pub fn answer(&self, challenge: &[u8; 32], req: &EvidenceRequest) -> EvidenceAnswer {
         // Proof of possession of the session key, bound to this challenge.
-        let Ok(key) = VerifyingKey::from_bytes(&req.session_pub) else {
+        let Some(session_key) = SessionKey::from_bytes(&req.session_pub) else {
             return refuse(Reason::PopInvalid);
         };
         let msg = evidence_request_sign_bytes(
@@ -61,10 +60,7 @@ impl Verifier {
             &req.client_build,
             &req.evidence,
         );
-        if key
-            .verify_strict(&msg, &Signature::from_bytes(&req.pop_sig))
-            .is_err()
-        {
+        if !fpp_crypto::verify_session_raw(&session_key, &msg, &req.pop_sig) {
             return refuse(Reason::PopInvalid);
         }
         if req.platform.is_empty() || req.platform.len() > 32 {
@@ -72,12 +68,8 @@ impl Verifier {
         }
 
         // Platform evidence, bound to this challenge and session key.
-        let appraised = appraisal::appraise(
-            &self.attestation,
-            challenge,
-            &req.session_pub,
-            &req.evidence,
-        );
+        let appraised =
+            appraisal::appraise(&self.attestation, challenge, &session_key, &req.evidence);
         // A hardware-rooted identity where the platform gives one (dev
         // stand-in for HMAC(publisher_did_key, hardware_identity), 04 §5);
         // else a per-key pseudonym.
@@ -93,7 +85,7 @@ impl Verifier {
             iat: now,
             exp: now + AR_LIFETIME_S,
             cti,
-            cnf: req.session_pub,
+            cnf: session_key,
             nonce: *challenge,
             did,
             tier: appraised.tier,
@@ -105,7 +97,7 @@ impl Verifier {
         };
         println!(
             "[verifier] AR for ..{}: tier D{}",
-            hex::encode(&req.session_pub[..3]),
+            hex::encode(&fpp_crypto::session_key_id(&session_key)[..3]),
             ar.tier as u8
         );
         EvidenceAnswer::Ar(fpp_crypto::sign(&self.key, &ar))

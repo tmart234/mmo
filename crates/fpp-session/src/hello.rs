@@ -2,14 +2,15 @@
 //! they are encrypted and authenticated by the handshake itself.
 
 use crate::{Error, MAX_ATTESTATION, MAX_HELLO, VERSION};
+use fpp_types::SessionKey;
 use fpp_wire::cbor::{self, text_map, MapView, Value};
 
 /// Joiner → host, inside Noise message 1.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct JoinHello {
     pub invite: Option<[u8; 32]>,
-    /// Ed25519 FPP session key (signs this player's InputCommits).
-    pub session_key: [u8; 32],
+    /// FPP session key, Ed25519 or P-256 (signs this player's InputCommits).
+    pub session_key: SessionKey,
     /// COSE_Sign1 `AdmitPop` by `session_key` over host ‖ joiner static keys.
     pub admit_pop: Vec<u8>,
     /// Attestation Result (empty when the device has none: tier D0).
@@ -67,7 +68,7 @@ impl JoinHello {
         let v = text_map([
             ("v", Value::Unsigned(VERSION)),
             ("invite", opt32(&self.invite)),
-            ("session_key", Value::bytes(self.session_key.to_vec())),
+            ("session_key", Value::bytes(self.session_key.to_bytes())),
             ("admit_pop", Value::bytes(self.admit_pop.clone())),
             ("attestation", Value::bytes(self.attestation.clone())),
             ("app", Value::bytes(self.app.clone())),
@@ -81,7 +82,11 @@ impl JoinHello {
         check_version(&m)?;
         Ok(Self {
             invite: read_opt32(&m, "invite")?,
-            session_key: m.fixed("session_key").map_err(|_| Error::Malformed)?,
+            session_key: m
+                .bytes("session_key")
+                .ok()
+                .and_then(SessionKey::from_bytes)
+                .ok_or(Error::Malformed)?,
             admit_pop: read_bytes(&m, "admit_pop", MAX_ADMIT_POP)?,
             attestation: read_bytes(&m, "attestation", MAX_ATTESTATION)?,
             app: read_bytes(&m, "app", MAX_HELLO)?,
