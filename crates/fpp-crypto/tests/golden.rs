@@ -46,6 +46,12 @@ fn key(name: &'static str, seed: u8, role: KeyRole, role_name: &'static str, kno
     }
 }
 
+/// The vectors' P-256 session key (ES256 signatures are deterministic,
+/// RFC 6979, so the vectors are too).
+fn p256_session() -> P256Signer {
+    P256Signer::new(p256::ecdsa::SigningKey::from_bytes(&[0x53; 32].into()).unwrap())
+}
+
 fn h(b: impl AsRef<[u8]>) -> String {
     hex::encode(b)
 }
@@ -118,7 +124,7 @@ fn ar_json(a: &AttestationResult) -> Json {
         feats.insert("os_patch_age_days".into(), json!(d));
     }
     json!({
-        "iss": a.iss, "iat": a.iat, "exp": a.exp, "cti": h(a.cti), "cnf": h(a.cnf),
+        "iss": a.iss, "iat": a.iat, "exp": a.exp, "cti": h(a.cti), "cnf": h(a.cnf.to_bytes()),
         "nonce": h(a.nonce), "did": h(a.did.0), "tier": a.tier as u8, "features": feats,
         "client_build": h(a.client_build.0), "platform": a.platform,
         "policy_ver": a.policy_ver, "warnings": a.warnings,
@@ -128,7 +134,7 @@ fn ar_json(a: &AttestationResult) -> Json {
 fn sat_json(s: &SessionAdmissionToken) -> Json {
     json!({
         "iss": s.iss, "sub": h(s.sub), "aud": h(s.aud.0), "iat": s.iat, "exp": s.exp,
-        "cti": h(s.cti), "cnf": h(s.cnf), "did": h(s.did.0), "tier": s.tier as u8,
+        "cti": h(s.cti), "cnf": h(s.cnf.to_bytes()), "did": h(s.did.0), "tier": s.tier as u8,
         "match_id": h(s.match_id.0), "slot": s.slot, "queue": s.queue,
         "policy_ver": s.policy_ver, "ar_cti": h(s.ar_cti),
     })
@@ -257,6 +263,7 @@ fn build() -> Json {
     for key in keys.iter().filter(|k| k.known) {
         keyset.insert_ed25519(key.role, key.signer.verifying_key());
     }
+    keyset.insert_session(&p256_session().session_key());
 
     let mut objects: Vec<Json> = Vec::new();
     let mut valid = |name: &str, kind: &str, cose: &[u8], payload: Json, derive: Json| {
@@ -437,7 +444,7 @@ fn build() -> Json {
 
     // ---- Tokens (§6): an AR, the SAT it backs, and a two-link SAR chain.
     const T0: u64 = 1_790_000_000;
-    let session_pub = k("session-slot0").signer.verifying_key().to_bytes();
+    let session_pub = k("session-slot0").signer.session_key();
     let instance_pub = gs.verifying_key().to_bytes();
     let ar = AttestationResult {
         iss: "ver.golden".into(),
@@ -527,6 +534,33 @@ fn build() -> Json {
         json!({"signer": "server-liveness", "prev_object": "sar/seq0"}),
     );
 
+    // ---- ES256 session keys (04 §3): a P-256 key held in a TPM, the Secure
+    // Enclave or StrongBox signs this player's InputCommits; the AR binds it.
+    let p256 = p256_session();
+    let f20 = frames(0, &[]);
+    let c20 = commit_for(2, 0, &f20, Digest::default());
+    let c20_cose = sign(&p256, &c20);
+    valid(
+        "input-commit/slot2-epoch0-es256",
+        "input-commit",
+        &c20_cose,
+        commit_json(&c20),
+        json!({"signer": "session-p256", "frames": frames_json(&f20), "prev_object": null}),
+    );
+    let ar_p256 = AttestationResult {
+        cti: *b"ar-cti-golden-p2",
+        cnf: p256.session_key(),
+        ..ar.clone()
+    };
+    let ar_p256_cose = sign(&k("verifier-ar").signer, &ar_p256);
+    valid(
+        "attestation-result/p256-cnf",
+        "attestation-result",
+        &ar_p256_cose,
+        ar_json(&ar_p256),
+        json!({"signer": "verifier-ar"}),
+    );
+
     // ---- Enforcement (§9): a kick of one account, in one region, for a day.
     let revocation = RevocationEvent {
         id: *b"revocation-gold1",
@@ -603,6 +637,40 @@ fn build() -> Json {
         "reject/alg-mismatch",
         "checkpoint",
         assemble(gs, bad_alg, cp1.to_cbor()).encode(),
+        "alg",
+    );
+    // ES256: the other valid signature (r, n - s) is refused (only low s,
+    // so a signed object has one encoding); an ES256 key under an EdDSA
+    // header is an algorithm mismatch.
+    let mut high_s = Sign1::decode(&c20_cose).unwrap();
+    let sig = p256::ecdsa::Signature::from_slice(&high_s.signature).unwrap();
+    let (r, s) = sig.split_scalars();
+    high_s.signature = p256::ecdsa::Signature::from_scalars(r, -s)
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    reject(
+        "reject/es256-high-s",
+        "input-commit",
+        high_s.encode(),
+        "signature",
+    );
+    let mut eddsa_header = Sign1::new(
+        ProtectedHeader {
+            alg: alg::EDDSA,
+            content_type: InputCommit::CONTENT_TYPE.into(),
+            kid: p256.kid(),
+            ctx: ctx::INPUT_COMMIT.into(),
+            version: FPP_VERSION,
+        },
+        c20.to_cbor(),
+    )
+    .unwrap();
+    eddsa_header.signature = p256.sign(&eddsa_header.to_be_signed());
+    reject(
+        "reject/es256-key-under-eddsa-header",
+        "input-commit",
+        eddsa_header.encode(),
         "alg",
     );
     let mut v2 = header_for(s0, ctx::INPUT_COMMIT, InputCommit::CONTENT_TYPE);
@@ -722,7 +790,7 @@ fn build() -> Json {
         "schema",
     );
     let mut stray = sar_at(1, sar_link(&sar0_cose).unwrap());
-    stray.sub = instance_id(&session_pub);
+    stray.sub = instance_id(&k("session-slot0").signer.verifying_key().to_bytes());
     reject(
         "reject/sar-sub-not-its-instance-key",
         "sar",
@@ -806,7 +874,15 @@ fn build() -> Json {
             "public": h(k.signer.verifying_key().to_bytes()),
             "kid": h(k.signer.kid().0),
             "key_digest": h(key_digest(&k.signer.verifying_key()).0),
-        })).collect::<Vec<_>>(),
+        })).chain([{
+            let key = p256_session().session_key();
+            json!({
+                "name": "session-p256", "role": "session", "alg": alg::ES256, "known": true,
+                "public": h(key.to_bytes()),
+                "kid": h(session_kid(&key).0),
+                "key_digest": h(Sha256::digest(cbor::encode(&cose_key_session(&key)).unwrap())),
+            })
+        }]).collect::<Vec<_>>(),
         "ed25519_rfc8032": [{
             "public": h(rfc_sk.verifying_key().to_bytes()), "message": "", "signature": h(rfc_sig.to_bytes()),
         }],
@@ -832,10 +908,13 @@ fn check_with_rust(v: &Json) {
             "enforcement" => KeyRole::Enforcement,
             other => panic!("role {other}"),
         };
-        let pk: [u8; 32] = hex::decode(k["public"].as_str().unwrap())
-            .unwrap()
-            .try_into()
-            .unwrap();
+        let public = hex::decode(k["public"].as_str().unwrap()).unwrap();
+        if k["alg"] == alg::ES256 {
+            assert_eq!(role, KeyRole::Session);
+            keyset.insert_session(&fpp_types::SessionKey::from_bytes(&public).unwrap());
+            continue;
+        }
+        let pk: [u8; 32] = public.try_into().unwrap();
         keyset.insert_ed25519(role, ed25519_dalek::VerifyingKey::from_bytes(&pk).unwrap());
     }
     for o in v["objects"].as_array().unwrap() {

@@ -67,7 +67,7 @@ pub fn join_request_sign_bytes(
 /// challenge and everything the AR will say.
 pub fn evidence_request_sign_bytes(
     challenge: &[u8; 32],
-    session_pub: &[u8; 32],
+    session_pub: &[u8],
     platform: &str,
     client_build: &[u8; 32],
     evidence: &[u8],

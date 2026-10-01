@@ -21,11 +21,11 @@
 //! and the clock.
 
 use common::proto::{ClientCmd, WorldSnapshot};
-use fpp_crypto::{Ed25519Signer, KeyResolver, KeyRole, KeySet};
+use fpp_crypto::{session_key_id, Ed25519Signer, KeyResolver, KeySet};
 use fpp_session::{Host, HostEvent, Transmit};
 use fpp_tokens::admission::{admit, AdmissionPolicy, Admitted, Revocations};
 use fpp_tokens::control::Control;
-use fpp_types::{BuildId, DeviceTier, Digest, GsInstanceId, MatchId, Reason};
+use fpp_types::{BuildId, DeviceTier, Digest, GsInstanceId, MatchId, Reason, SessionKey};
 use fpp_wire::msg::frame_leaf_data;
 use fpp_wire::{Checkpoint, InputCommit, InputFrame, InputLeaf, RevocationEvent, SubjectKind};
 use sha2::{Digest as _, Sha256};
@@ -55,7 +55,7 @@ pub enum Signal {
 
 struct Player {
     peer: u32,
-    session_key: [u8; 32],
+    session_key: SessionKey,
     /// The SAT and AR it was admitted with (for revocations).
     tokens: Admitted,
     x: f32,
@@ -88,7 +88,7 @@ pub struct Match {
     pub host: Host<Vec<u8>>,
     tick: u32,
     /// Joined but not yet admitted: peer → session key.
-    pending: HashMap<u32, [u8; 32]>,
+    pending: HashMap<u32, SessionKey>,
     players: BTreeMap<u16, Player>,
     slot_of: HashMap<u32, u16>,
     sar: Option<Vec<u8>>,
@@ -350,10 +350,9 @@ impl Match {
         };
         let p = self.players.get_mut(&slot).expect("slot of admitted peer");
         let mut keys = KeySet::default();
-        let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&p.session_key) else {
+        if keys.insert_session(&p.session_key).is_none() {
             return;
-        };
-        keys.insert_ed25519(KeyRole::Session, vk);
+        }
         let v = match fpp_crypto::verify::<InputCommit>(commit, &keys) {
             Ok(v) if v.payload.match_id == self.cfg.match_id && v.payload.slot == slot => v,
             _ => {
@@ -405,11 +404,11 @@ impl Match {
                 Ok(ClientCmd::SpendCoins(sc))
                     if self
                         .runtime
-                        .check_idempotency(&p.session_key, &sc.op_id)
+                        .check_idempotency(&session_key_id(&p.session_key), &sc.op_id)
                         .is_none() =>
                 {
                     self.runtime.record_op(
-                        p.session_key,
+                        session_key_id(&p.session_key),
                         sc.op_id,
                         crate::state::OpResult {
                             processed_at_ms: now_ms,
@@ -658,15 +657,28 @@ async fn sar_changed(
 
 /// Serve the match on `socket` until `stop` is set or the SAR chain lapses
 /// (then a few more ticks so kicks go out).
+/// Where a running match's products go.
+pub struct Outputs {
+    /// Every signed Checkpoint, with its epoch.
+    pub checkpoints: tokio::sync::mpsc::UnboundedSender<(u32, Vec<u8>)>,
+    /// What the server observed (`None`: logged).
+    pub signals: Option<tokio::sync::mpsc::UnboundedSender<Signal>>,
+    pub ledger: Option<crate::ledger::Ledger>,
+}
+
 pub async fn run(
     socket: tokio::net::UdpSocket,
     mut m: Match,
     sar_rx: tokio::sync::watch::Receiver<Option<Vec<u8>>>,
     mut revocations: tokio::sync::mpsc::UnboundedReceiver<RevocationEvent>,
-    cp_tx: tokio::sync::mpsc::UnboundedSender<(u32, Vec<u8>)>,
-    mut ledger: Option<crate::ledger::Ledger>,
+    out: Outputs,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
+    let Outputs {
+        checkpoints: cp_tx,
+        signals,
+        mut ledger,
+    } = out;
     use std::sync::atomic::Ordering;
     let start = std::time::Instant::now();
     let now = || start.elapsed().as_millis() as u64;
@@ -696,6 +708,14 @@ pub async fn run(
                 m.step(now());
                 for (epoch, cp) in m.checkpoints_out.drain(..) {
                     let _ = cp_tx.send((epoch, cp));
+                }
+                for s in m.signals.drain(..) {
+                    match &signals {
+                        Some(tx) => {
+                            let _ = tx.send(s);
+                        }
+                        None => eprintln!("[GS] signal: {s:?}"),
+                    }
                 }
                 if let Some(l) = ledger.as_mut() {
                     for line in m.ledger_out.drain(..) {

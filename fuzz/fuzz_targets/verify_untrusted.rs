@@ -24,7 +24,7 @@ fuzz_target!(|data: &[u8]| {
         );
     }
     let now = 1_790_000_000;
-    match selector % 2 {
+    match selector % 4 {
         0 => {
             let _ = verify_ar(body, &keys, now);
             let _ = verify_sat(body, &keys, now);
@@ -32,6 +32,24 @@ fuzz_target!(|data: &[u8]| {
                 let _ = chain.update(body, &keys, now);
                 let _ = chain.live(u64::MAX);
             }
+        }
+        // session keys from the wire (P-256 points included), and objects
+        // signed with them
+        2 => {
+            let (key, object) = body.split_at(body.len().min(65));
+            if let Some(key) = fpp_types::SessionKey::from_bytes(key) {
+                let mut session = KeySet::default();
+                if session.insert_session(&key).is_some() {
+                    let _ = fpp_crypto::verify::<fpp_wire::InputCommit>(object, &session);
+                    let _ = fpp_crypto::verify_session_raw(&key, b"msg", object);
+                }
+            }
+        }
+        // token payloads past the signature (a cnf of either kind)
+        3 => {
+            use fpp_wire::Payload as _;
+            let _ = fpp_tokens::AttestationResult::from_cbor(body);
+            let _ = fpp_tokens::SessionAdmissionToken::from_cbor(body);
         }
         _ => {
             let mid = body.len() / 2;
@@ -43,7 +61,7 @@ fuzz_target!(|data: &[u8]| {
             let _ = admit(
                 &body[..mid],
                 &body[mid..],
-                &[0; 32],
+                &fpp_types::SessionKey::Ed25519([0; 32]),
                 &keys,
                 &policy,
                 &Revocations::default(),

@@ -74,7 +74,7 @@ async fn join(trust: &ClientTrust) -> Result<(GameClient, [u8; 32], [u8; 32])> {
             Err(e) => return Err(e),
         }
     };
-    let session = creds.session.verifying_key().to_bytes();
+    let session = fpp_crypto::session_key_id(&creds.session.session_key());
     let aud = creds.sat_claims.aud.0;
     let client = GameClient::connect(creds, trust, Duration::from_secs(10)).await?;
     Ok((client, session, aud))
@@ -186,7 +186,8 @@ async fn run(players: usize) -> Result<()> {
     let refused = async {
         let deadline = Instant::now() + ENFORCEMENT_P99;
         loop {
-            let r = request_admission_with(&Services::default(), &trust, "open", key()).await;
+            let r =
+                request_admission_with(&Services::default(), &trust, "open", Box::new(key())).await;
             let end = r
                 .err()
                 .and_then(|e| e.downcast_ref::<SessionEnd>().copied());

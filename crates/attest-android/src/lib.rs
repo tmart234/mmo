@@ -1,16 +1,21 @@
 //! Android Keystore key attestation (KeyMint), Verifier side (ATT-03,
 //! roadmap P3).
 //!
-//! The device generates a key in its TEE or StrongBox with
-//! `setAttestationChallenge(attest_challenge(verifier_challenge, session_pub))`
-//! and sends the key's certificate chain. The leaf carries the
+//! The device generates a key in its TEE or StrongBox and sends the key's
+//! certificate chain. Either the key endorses a session key made before it
+//! (`setAttestationChallenge(attest_challenge(verifier_challenge,
+//! session_pub))`), or it *is* the session key (Ed25519 in the TEE on Android
+//! 13+, or P-256, TEE or StrongBox), whose public key cannot be in its own
+//! challenge: then `attest_challenge_hw_key(verifier_challenge)`, and the
+//! attested key must equal the session key. The leaf carries the
 //! KeyDescription extension (OID `1.3.6.1.4.1.11129.2.1.17`), written by the
 //! secure hardware. This crate checks:
 //!
 //! 1. the chain reaches a pinned Google root, and no certificate in it is on
 //!    Google's revocation list (leaked attestation keys are revoked there);
 //! 2. attestation and key both in hardware (TEE or StrongBox, not Software);
-//! 3. the attestation challenge is ours (this challenge, this session key);
+//! 3. the attestation challenge is ours (this challenge, this session key,
+//!    or this challenge and the attested key is the session key);
 //! 4. the key was generated in hardware (`origin == GENERATED`);
 //! 5. the root of trust is hardware-enforced: `verifiedBootState` and
 //!    `deviceLocked` give the verified-boot claim (an unlocked bootloader or
@@ -27,7 +32,7 @@ use std::collections::HashSet;
 
 use attest_core::der::{self, Tlv, CLASS_CONTEXT, TAG_SEQUENCE, TAG_SET};
 use attest_core::x509::{self, ChainOptions, OID_ED25519};
-use attest_core::{AttestError, Claims, KeyStorage};
+use attest_core::{attest_challenge, attest_challenge_hw_key, AttestError, Claims, KeyStorage};
 
 pub const OID_KEY_DESCRIPTION: &str = "1.3.6.1.4.1.11129.2.1.17";
 
@@ -231,12 +236,13 @@ pub fn parse_key_description(ext: &[u8]) -> Result<KeyDescription, AttestError> 
 
 /// Appraise an attested key's certificate chain (leaf first).
 ///
-/// `expected_challenge` is `attest_challenge(verifier_challenge, session_pub)`.
-/// `now_yyyymm` is today's month for the patch-level check.
+/// `verifier_challenge` is the Verifier's single-use challenge and
+/// `session_pub` the session key (`SessionKey::to_bytes`) the AR will be
+/// bound to. `now_yyyymm` is today's month for the patch-level check.
 pub fn appraise(
     chain: &[Vec<u8>],
-    expected_challenge: &[u8; 32],
-    session_pub: &[u8; 32],
+    verifier_challenge: &[u8; 32],
+    session_pub: &[u8],
     policy: &AndroidPolicy,
     now_unix: i64,
     now_yyyymm: u32,
@@ -273,7 +279,15 @@ pub fn appraise(
     if key_storage == KeyStorage::Software {
         return Err(AttestError::Policy("software attestation"));
     }
-    if kd.challenge != expected_challenge {
+    // The session key itself is the attested hardware key: an Ed25519 key
+    // (KeyMint 2, Android 13+, TEE) or a P-256 key (TEE or StrongBox; ES256
+    // session keys, `session_pub` as an uncompressed SEC1 point).
+    let session_key_in_hw = (leaf.key_algorithm() == OID_ED25519 || leaf.is_p256())
+        && leaf.public_key_bytes() == session_pub;
+    let endorses = kd.challenge == attest_challenge(verifier_challenge, session_pub);
+    let is_session =
+        session_key_in_hw && kd.challenge == attest_challenge_hw_key(verifier_challenge);
+    if !endorses && !is_session {
         return Err(AttestError::ChallengeMismatch);
     }
     if kd.origin != Some(ORIGIN_GENERATED) {
@@ -307,10 +321,6 @@ pub fn appraise(
     if !verified_boot {
         warnings.push("boot-not-verified".into());
     }
-    // KeyMint 2 (Android 13+) makes Ed25519 keys in the TEE: then the session
-    // key itself is the attested hardware key.
-    let session_key_in_hw =
-        leaf.key_algorithm() == OID_ED25519 && leaf.public_key_bytes() == &session_pub[..];
     if !session_key_in_hw {
         warnings.push("session-key-in-software".into());
     }

@@ -38,8 +38,12 @@ fn fx() -> Fx {
     }
 }
 
-fn pk(k: &Ed25519Signer) -> [u8; 32] {
+fn raw(k: &Ed25519Signer) -> [u8; 32] {
     k.verifying_key().to_bytes()
+}
+
+fn pk(k: &Ed25519Signer) -> fpp_types::SessionKey {
+    fpp_types::SessionKey::Ed25519(k.verifying_key().to_bytes())
 }
 
 fn ar(f: &Fx, tier: DeviceTier) -> AttestationResult {
@@ -69,7 +73,7 @@ fn sat(f: &Fx, a: &AttestationResult) -> SessionAdmissionToken {
     SessionAdmissionToken {
         iss: "broker.dev".into(),
         sub: [5; 32],
-        aud: instance_id(&pk(&f.instance)),
+        aud: instance_id(&raw(&f.instance)),
         iat: NOW,
         exp: NOW + 3600,
         cti: [6; 16],
@@ -87,10 +91,10 @@ fn sat(f: &Fx, a: &AttestationResult) -> SessionAdmissionToken {
 fn sar(f: &Fx, seq: u64, prev: Digest, iat: u64) -> ServerAttestationResult {
     ServerAttestationResult {
         iss: "live.dev".into(),
-        sub: instance_id(&pk(&f.instance)),
+        sub: instance_id(&raw(&f.instance)),
         iat,
         exp: iat + 10,
-        cnf: pk(&f.instance),
+        cnf: raw(&f.instance),
         tls_spki_sha256: None,
         noise_static: Some([9; 32]),
         server_class: ServerClass::FirstParty,
@@ -160,7 +164,7 @@ fn lifetimes_and_clock_are_enforced() {
 fn sar_must_name_its_instance_key_and_a_transport() {
     let f = fx();
     let mut r = sar(&f, 0, Digest::default(), NOW);
-    r.sub = instance_id(&pk(&f.session));
+    r.sub = instance_id(&raw(&f.session));
     assert!(SarChain::start(&sign(&f.liveness, &r), &f.keys, NOW).is_err());
     let mut r = sar(&f, 0, Digest::default(), NOW);
     r.noise_static = None;
@@ -194,7 +198,7 @@ fn sar_chain_rejects_forged_replayed_skipped_forked_and_expired_updates() {
     assert!(!chain.live(NOW + 4 + 10 + 60));
     // A SAR for another instance cannot splice in.
     let mut other = sar(&f, 3, sar_link(&s2).unwrap(), NOW + 6);
-    other.cnf = pk(&key(0x62));
+    other.cnf = raw(&key(0x62));
     other.sub = instance_id(&other.cnf);
     assert_eq!(
         chain.update(&sign(&f.liveness, &other), &f.keys, NOW + 6),
@@ -204,7 +208,7 @@ fn sar_chain_rejects_forged_replayed_skipped_forked_and_expired_updates() {
 
 fn policy(f: &Fx, min_tier: DeviceTier) -> AdmissionPolicy {
     AdmissionPolicy {
-        gs_instance_id: instance_id(&pk(&f.instance)),
+        gs_instance_id: instance_id(&raw(&f.instance)),
         matches: vec![MATCH],
         min_tier,
     }
@@ -235,7 +239,7 @@ fn admission_rejects_each_broken_rule_with_its_reason() {
     let s = sat(&f, &a);
     let run = |s: &SessionAdmissionToken,
                a: &AttestationResult,
-               key: [u8; 32],
+               key: fpp_types::SessionKey,
                min: DeviceTier,
                rev: &Revocations| {
         admit(
@@ -254,7 +258,7 @@ fn admission_rejects_each_broken_rule_with_its_reason() {
     let me = pk(&f.session);
 
     let mut other_server = s.clone();
-    other_server.aud = instance_id(&pk(&key(0x62)));
+    other_server.aud = instance_id(&raw(&key(0x62)));
     assert_eq!(
         run(&other_server, &a, me, DeviceTier::D0Unknown, &none),
         Some(Reason::SatInvalid)

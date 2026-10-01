@@ -23,3 +23,4 @@ sha2 = { workspace = true }
 
 [dev-dependencies]
 cbindgen = "0.29"
+p256 = { workspace = true }

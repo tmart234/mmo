@@ -3,7 +3,9 @@
 
 use attest_android::{appraise, parse_status_list, AllowedApp, AndroidPolicy, OID_KEY_DESCRIPTION};
 use attest_core::der::write as w;
-use attest_core::{attest_challenge, device_tier, AttestError, Claims, KeyStorage};
+use attest_core::{
+    attest_challenge, attest_challenge_hw_key, device_tier, AttestError, Claims, KeyStorage,
+};
 use fpp_types::DeviceTier;
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, CustomExtension, DistinguishedName, DnType,
@@ -168,14 +170,7 @@ fn p256() -> KeyPair {
 /// A P-256 leaf endorsing the software session key `SESSION`.
 fn run_with(f: &Fixture, kd: &Kd, policy: &AndroidPolicy) -> Result<Claims, AttestError> {
     let chain = f.chain(kd, p256());
-    appraise(
-        &chain,
-        &attest_challenge(&VS_CHALLENGE, &SESSION),
-        &SESSION,
-        policy,
-        NOW,
-        NOW_YYYYMM,
-    )
+    appraise(&chain, &VS_CHALLENGE, &SESSION, policy, NOW, NOW_YYYYMM)
 }
 
 fn run(kd: &Kd) -> Result<Claims, AttestError> {
@@ -204,17 +199,88 @@ fn ed25519_session_key_in_hardware_is_d2() {
     let f = Fixture::new();
     let key = KeyPair::generate(&rcgen::PKCS_ED25519).unwrap();
     let session: [u8; 32] = key.public_key_raw().try_into().unwrap();
-    let challenge = attest_challenge(&VS_CHALLENGE, &session);
-    let chain = f.chain(&Kd::good(challenge), key);
-    let c = appraise(&chain, &challenge, &session, &f.policy(), NOW, NOW_YYYYMM).unwrap();
+    // the key is made with the challenge, so the challenge cannot hold its
+    // public key: it binds the Verifier's challenge, and the key itself is
+    // the session key
+    let chain = f.chain(&Kd::good(attest_challenge_hw_key(&VS_CHALLENGE)), key);
+    let c = appraise(
+        &chain,
+        &VS_CHALLENGE,
+        &session,
+        &f.policy(),
+        NOW,
+        NOW_YYYYMM,
+    )
+    .unwrap();
     assert!(c.session_key_in_hw);
     assert_eq!(device_tier(&c), DeviceTier::D2Hardware);
-    // The same chain presented for another session key is refused.
-    let other = [8u8; 32];
+    // The same chain presented for another session key is refused: the key
+    // is not that session key, and the challenge does not name it.
     let err = appraise(
         &chain,
-        &attest_challenge(&VS_CHALLENGE, &other),
-        &other,
+        &VS_CHALLENGE,
+        &[8u8; 32],
+        &f.policy(),
+        NOW,
+        NOW_YYYYMM,
+    );
+    assert_eq!(err.unwrap_err(), AttestError::ChallengeMismatch);
+    // Nor for another admission.
+    let err = appraise(&chain, &[0x77; 32], &session, &f.policy(), NOW, NOW_YYYYMM);
+    assert_eq!(err.unwrap_err(), AttestError::ChallengeMismatch);
+}
+
+/// StrongBox (and the Secure Enclave, TPMs) have no Ed25519: an ES256
+/// session key that is the attested P-256 key itself earns D2 as well.
+#[test]
+fn p256_session_key_in_strongbox_is_d2() {
+    let f = Fixture::new();
+    let strongbox = |challenge| {
+        let mut kd = Kd::good(challenge);
+        kd.att_level = 2;
+        kd.key_level = 2;
+        kd
+    };
+    let key = p256();
+    let session = key.public_key_raw().to_vec();
+    assert_eq!((session.len(), session[0]), (65, 4));
+    let chain = f.chain(&strongbox(attest_challenge_hw_key(&VS_CHALLENGE)), key);
+    let c = appraise(
+        &chain,
+        &VS_CHALLENGE,
+        &session,
+        &f.policy(),
+        NOW,
+        NOW_YYYYMM,
+    )
+    .unwrap();
+    assert_eq!(c.key_storage, KeyStorage::StrongBox);
+    assert!(c.session_key_in_hw);
+    assert_eq!(device_tier(&c), DeviceTier::D2Hardware);
+    // A P-256 key that endorses a software session key (made first, so its
+    // challenge names it) is D1: the session key can be copied out.
+    let chain = f.chain(
+        &strongbox(attest_challenge(&VS_CHALLENGE, &SESSION)),
+        p256(),
+    );
+    let c = appraise(
+        &chain,
+        &VS_CHALLENGE,
+        &SESSION,
+        &f.policy(),
+        NOW,
+        NOW_YYYYMM,
+    )
+    .unwrap();
+    assert!(!c.session_key_in_hw);
+    assert_eq!(device_tier(&c), DeviceTier::D1Software);
+    // A hardware key's chain (no session key in its challenge) presented for
+    // a software session key is refused.
+    let chain = f.chain(&strongbox(attest_challenge_hw_key(&VS_CHALLENGE)), p256());
+    let err = appraise(
+        &chain,
+        &VS_CHALLENGE,
+        &SESSION,
         &f.policy(),
         NOW,
         NOW_YYYYMM,
@@ -317,7 +383,7 @@ fn untrusted_root_is_refused() {
     let chain = f.chain(&good(), p256());
     let err = appraise(
         &chain,
-        &attest_challenge(&VS_CHALLENGE, &SESSION),
+        &VS_CHALLENGE,
         &SESSION,
         &other.policy(),
         NOW,
@@ -355,7 +421,7 @@ fn tampered_leaf_is_refused() {
     chain[0][n - 1] ^= 1; // the signature
     let err = appraise(
         &chain,
-        &attest_challenge(&VS_CHALLENGE, &SESSION),
+        &VS_CHALLENGE,
         &SESSION,
         &f.policy(),
         NOW,
@@ -366,7 +432,7 @@ fn tampered_leaf_is_refused() {
     let chain = f.chain(&good(), p256());
     let err = appraise(
         &chain[..1],
-        &attest_challenge(&VS_CHALLENGE, &SESSION),
+        &VS_CHALLENGE,
         &SESSION,
         &f.policy(),
         NOW,

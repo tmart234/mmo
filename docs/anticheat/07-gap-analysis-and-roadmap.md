@@ -261,8 +261,18 @@ Device ID (DID) and tiers. IA core with platform adapters and the C ABI.
 revocation list, verified boot, app identity) and `attest-apple` (App Attest
 attestations and assertions), wired into the VS; evidence bound to the VS
 challenge and the session key; C SDK `fpp_attest_challenge` and
-`fpp_evidence_*`; reference Kotlin and Swift adapters. Next: external
-signers, P-256 session keys, Play Integrity, `attest-tpm`.
+`fpp_evidence_*`; reference Kotlin and Swift adapters. External signers
+in the C SDK; `attest-tpm` for game servers (10 §5).
+**P-256 session keys ✅ (P3.1):** a session key is Ed25519 or ES256
+(P-256, low `s`) end to end: AR/SAT `cnf`, AdmitPop, InputCommits, the
+Verifier's and Broker's proofs of possession, revocations, the C SDK
+(`fpp_signer_external_p256` and `_key` variants, additive), golden vectors
+checked by the independent Python verifier. A session test plays a whole
+match with a P-256 key and the smoke client uses one. StrongBox reaches
+D2. Fixed with it: an Android key that is itself the session key could
+not carry its own public key in its attestation challenge; it now binds
+`attest_challenge_hw_key` and must equal the session key (10 §5).
+Next: TPM client evidence, Play Integrity, a client Build Registry.
 **Exit:** red-team tests: replayed quote rejected; software TPM rejected;
 test-signing/HVCI-off machine lands in the correct tier; tier drives
 matchmaking in a staging queue.

@@ -17,9 +17,12 @@
 
 pub mod evidence;
 use ed25519_dalek::VerifyingKey;
-use fpp_crypto::{cose_key_ed25519, KeyResolver, VerifyError};
+use fpp_crypto::{
+    cose_key_ed25519, cose_key_session, session_key_from_cose, KeyResolver, VerifyError,
+};
 use fpp_types::{
-    content_type, ctx, BuildId, DeviceTier, Did, Digest, GsInstanceId, MatchId, Reason, ServerClass,
+    content_type, ctx, BuildId, DeviceTier, Did, Digest, GsInstanceId, MatchId, Reason,
+    ServerClass, SessionKey,
 };
 use fpp_wire::cbor::{self, Value};
 use fpp_wire::{Payload, WireError};
@@ -191,6 +194,13 @@ impl<'a> Claims<'a> {
         DeviceTier::from_u64(self.uint(claim::TIER, "tier")?).ok_or(schema(self.what, "tier"))
     }
 
+    /// `cnf = {1: COSE_Key}` holding a session key (Ed25519 or P-256).
+    fn session_cnf(&self, name: &'static str) -> Result<SessionKey, WireError> {
+        let v = self.get(claim::CNF, name)?;
+        session_key_from_cose(Claims::new(v, self.what)?.get(1, name)?)
+            .ok_or(schema(self.what, name))
+    }
+
     /// `cnf = {1: COSE_Key}` holding an Ed25519 key; returns the 32-byte key.
     fn cnf(&self, key: i64, name: &'static str) -> Result<[u8; 32], WireError> {
         let v = self.get(key, name)?;
@@ -239,6 +249,10 @@ fn cose_key(x: &[u8; 32]) -> Value {
 
 fn cnf(x: &[u8; 32]) -> Value {
     Value::Map(vec![(Value::int(1), cose_key(x))])
+}
+
+fn session_cnf(key: &SessionKey) -> Value {
+    Value::Map(vec![(Value::int(1), cose_key_session(key))])
 }
 
 fn map(entries: Vec<(i64, Value)>) -> Value {
@@ -344,8 +358,8 @@ pub struct AttestationResult {
     pub iat: u64,
     pub exp: u64,
     pub cti: [u8; 16],
-    /// Session public key (Ed25519) the result is bound to.
-    pub cnf: [u8; 32],
+    /// Session public key the result is bound to.
+    pub cnf: SessionKey,
     /// Echo of the Verifier's challenge.
     pub nonce: [u8; 32],
     pub did: Did,
@@ -367,7 +381,7 @@ impl Payload for AttestationResult {
             (claim::EXP, Value::Unsigned(self.exp)),
             (claim::IAT, Value::Unsigned(self.iat)),
             (claim::CTI, b(&self.cti)),
-            (claim::CNF, cnf(&self.cnf)),
+            (claim::CNF, session_cnf(&self.cnf)),
             (claim::EAT_NONCE, b(&self.nonce)),
             (claim::EAT_PROFILE, Value::text(EAT_PROFILE_AR)),
             (claim::DID, b(&self.did.0)),
@@ -412,7 +426,7 @@ impl Payload for AttestationResult {
             iat,
             exp,
             cti: c.fixed(claim::CTI, "cti")?,
-            cnf: c.cnf(claim::CNF, "cnf")?,
+            cnf: c.session_cnf("cnf")?,
             nonce: c.fixed(claim::EAT_NONCE, "eat_nonce")?,
             did: Did(c.fixed(claim::DID, "did")?),
             tier: c.tier()?,
@@ -438,7 +452,7 @@ pub struct SessionAdmissionToken {
     pub iat: u64,
     pub exp: u64,
     pub cti: [u8; 16],
-    pub cnf: [u8; 32],
+    pub cnf: SessionKey,
     pub did: Did,
     pub tier: DeviceTier,
     pub match_id: MatchId,
@@ -461,7 +475,7 @@ impl Payload for SessionAdmissionToken {
             (claim::EXP, Value::Unsigned(self.exp)),
             (claim::IAT, Value::Unsigned(self.iat)),
             (claim::CTI, b(&self.cti)),
-            (claim::CNF, cnf(&self.cnf)),
+            (claim::CNF, session_cnf(&self.cnf)),
             (claim::DID, b(&self.did.0)),
             (claim::TIER, Value::Unsigned(self.tier as u64)),
             (claim::MATCH_ID, b(&self.match_id.0)),
@@ -483,7 +497,7 @@ impl Payload for SessionAdmissionToken {
             iat,
             exp,
             cti: c.fixed(claim::CTI, "cti")?,
-            cnf: c.cnf(claim::CNF, "cnf")?,
+            cnf: c.session_cnf("cnf")?,
             did: Did(c.fixed(claim::DID, "did")?),
             tier: c.tier()?,
             match_id: MatchId(c.fixed(claim::MATCH_ID, "match_id")?),

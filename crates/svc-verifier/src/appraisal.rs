@@ -14,7 +14,7 @@ use attest_apple::{AppKey, ApplePolicy};
 use attest_core::{attest_challenge, device_tier, AttestError, Claims, Evidence, KeyStorage};
 use dashmap::DashMap;
 use fpp_tokens::Features;
-use fpp_types::DeviceTier;
+use fpp_types::{DeviceTier, SessionKey};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// What the Verifier accepts, set from the command line (`svc-verifier --help`).
@@ -128,18 +128,26 @@ fn features(c: &Claims, now_yyyymm: u32) -> Features {
 fn appraise_evidence(
     cfg: &ClientAttestation,
     evidence: Evidence,
-    challenge: &[u8; 32],
-    session_pub: &[u8; 32],
+    verifier_challenge: &[u8; 32],
+    session_pub: &[u8],
     now_unix: i64,
     now_yyyymm: u32,
 ) -> Result<Claims, AttestError> {
+    let challenge = &attest_challenge(verifier_challenge, session_pub);
     match evidence {
         Evidence::AndroidKey { chain } => {
             let policy = cfg
                 .android
                 .as_ref()
                 .ok_or(AttestError::Policy("no Android policy on this Verifier"))?;
-            attest_android::appraise(&chain, challenge, session_pub, policy, now_unix, now_yyyymm)
+            attest_android::appraise(
+                &chain,
+                verifier_challenge,
+                session_pub,
+                policy,
+                now_unix,
+                now_yyyymm,
+            )
         }
         Evidence::AppleAppAttest { attestation } => {
             let policy = cfg
@@ -171,7 +179,7 @@ fn appraise_evidence(
 pub fn appraise(
     cfg: &ClientAttestation,
     verifier_challenge: &[u8; 32],
-    session_pub: &[u8; 32],
+    session_key: &SessionKey,
     evidence: &[u8],
 ) -> Appraised {
     let evidence = match Evidence::decode(evidence) {
@@ -180,8 +188,15 @@ pub fn appraise(
         Err(e) => return unrooted(format!("evidence-rejected: {e}")),
     };
     let (now_unix, now_yyyymm) = now();
-    let challenge = attest_challenge(verifier_challenge, session_pub);
-    match appraise_evidence(cfg, evidence, &challenge, session_pub, now_unix, now_yyyymm) {
+    let session_pub = session_key.to_bytes();
+    match appraise_evidence(
+        cfg,
+        evidence,
+        verifier_challenge,
+        &session_pub,
+        now_unix,
+        now_yyyymm,
+    ) {
         Ok(claims) => Appraised {
             tier: device_tier(&claims),
             features: features(&claims, now_yyyymm),
@@ -206,10 +221,10 @@ mod tests {
     #[test]
     fn missing_and_bad_evidence_are_d0() {
         let cfg = ClientAttestation::default();
-        let a = appraise(&cfg, &[1; 32], &[2; 32], &[]);
+        let a = appraise(&cfg, &[1; 32], &SessionKey::Ed25519([2; 32]), &[]);
         assert_eq!(a.tier, DeviceTier::D0Unknown);
         assert_eq!(a.warnings, vec!["no-platform-evidence".to_string()]);
-        let a = appraise(&cfg, &[1; 32], &[2; 32], &[0xff, 0x00]);
+        let a = appraise(&cfg, &[1; 32], &SessionKey::Ed25519([2; 32]), &[0xff, 0x00]);
         assert_eq!(a.tier, DeviceTier::D0Unknown);
         assert!(a.warnings[0].starts_with("evidence-rejected"));
         // Well-formed, but this Verifier has no Android policy.
@@ -217,7 +232,7 @@ mod tests {
             chain: vec![vec![1]],
         }
         .encode();
-        let a = appraise(&cfg, &[1; 32], &[2; 32], &e);
+        let a = appraise(&cfg, &[1; 32], &SessionKey::Ed25519([2; 32]), &e);
         assert_eq!(a.tier, DeviceTier::D0Unknown);
         assert!(a.warnings[0].contains("no Android policy"));
     }

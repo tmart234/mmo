@@ -9,6 +9,8 @@ Python standard library:
 - COSE_Sign1 verification with FPP's header rules, key roles and verification
   order (04-protocol.md §2.1)
 - Ed25519 verification after RFC 8032 §5.1.7 (pure Python)
+- ECDSA P-256 / SHA-256 verification (ES256, FIPS 186-5; pure Python), for
+  session keys held in hardware, with FPP's low-s rule
 - RFC 9162 Merkle tree hashes
 
 Usage: fpp_interop.py [interop/vectors/fpp1.json]
@@ -25,6 +27,7 @@ MAX_DEPTH = 16
 HDR_ALG, HDR_CRIT, HDR_CONTENT_TYPE, HDR_KID = 1, 2, 3, 4
 HDR_FPP_CTX, HDR_FPP_V = -65537, -65538
 EDDSA = -8
+ES256 = -7
 
 ROLE_CONTEXTS = {
     "publisher_root": ["fpp/1/cert"],
@@ -247,6 +250,68 @@ def ed25519_verify(public, message, signature):
     return _equal(_mul(s, BASE), _add(r, _mul(k, a)))
 
 
+# ------------------------------------------------------------------ ECDSA P-256 (ES256)
+
+P256_P = 2**256 - 2**224 + 2**192 + 2**96 - 1
+P256_N = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+P256_B = 0x5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B
+P256_G = (0x6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296,
+          0x4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5)
+
+
+def p256_on_curve(pt):
+    x, y = pt
+    return 0 <= x < P256_P and 0 <= y < P256_P and (y * y - (x * x * x - 3 * x + P256_B)) % P256_P == 0
+
+
+def _p256_add(a, b):
+    if a is None:
+        return b
+    if b is None:
+        return a
+    (x1, y1), (x2, y2) = a, b
+    if x1 == x2:
+        if (y1 + y2) % P256_P == 0:
+            return None
+        lam = (3 * x1 * x1 - 3) * pow(2 * y1, -1, P256_P)
+    else:
+        lam = (y2 - y1) * pow(x2 - x1, -1, P256_P)
+    x3 = (lam * lam - x1 - x2) % P256_P
+    return x3, (lam * (x1 - x3) - y1) % P256_P
+
+
+def p256_mul(k, pt):
+    acc = None
+    while k:
+        if k & 1:
+            acc = _p256_add(acc, pt)
+        pt = _p256_add(pt, pt)
+        k >>= 1
+    return acc
+
+
+def p256_point(public):
+    """An uncompressed SEC1 point (0x04 || x || y) on the curve, or None."""
+    if len(public) != 65 or public[0] != 4:
+        return None
+    pt = (int.from_bytes(public[1:33], "big"), int.from_bytes(public[33:], "big"))
+    return pt if p256_on_curve(pt) else None
+
+
+def ecdsa_p256_verify(public, message, signature, low_s=True):
+    """ES256: signature is r || s (64 bytes). FPP accepts only s <= n/2."""
+    q = p256_point(public)
+    if q is None or len(signature) != 64:
+        return False
+    r, s = int.from_bytes(signature[:32], "big"), int.from_bytes(signature[32:], "big")
+    if not (0 < r < P256_N and 0 < s < P256_N) or (low_s and s > P256_N // 2):
+        return False
+    e = int.from_bytes(hashlib.sha256(message).digest(), "big")
+    w = pow(s, -1, P256_N)
+    pt = _p256_add(p256_mul(e * w % P256_N, P256_G), p256_mul(r * w % P256_N, q))
+    return pt is not None and pt[0] % P256_N == r
+
+
 # ------------------------------------------------------------------ Merkle (RFC 9162)
 
 
@@ -272,8 +337,15 @@ def cose_key_ed25519(public):
     return {1: 1, -1: 6, -2: public}
 
 
+def cose_key(public):
+    """A 32-byte Ed25519 key (OKP) or a 65-byte P-256 point (EC2)."""
+    if len(public) == 65:
+        return {1: 2, -1: 1, -2: public[1:33], -3: public[33:]}
+    return cose_key_ed25519(public)
+
+
 def key_digest(public):
-    return hashlib.sha256(cbor_encode(cose_key_ed25519(public))).digest()
+    return hashlib.sha256(cbor_encode(cose_key(public))).digest()
 
 
 def parse_protected(raw):
@@ -413,6 +485,21 @@ def _cnf(m):
     return _okp_key(v[1], "cnf").hex()
 
 
+def _session_cnf(m):
+    """AR and SAT: an Ed25519 key, or a P-256 key {1: 2, -1: 1, -2: x, -3: y}
+    on the curve (ES256 session keys); as 32 bytes or 0x04 || x || y."""
+    v = _claim(m, 8, "cnf")
+    _require(isinstance(v, dict) and set(v) == {1}, "cnf")
+    k = v[1]
+    if isinstance(k, dict) and set(k) == {1, -1, -2, -3}:
+        _require(k[1] == 2 and k[-1] == 1 and all(isinstance(k[i], bytes) and len(k[i]) == 32 for i in (-2, -3)),
+                 "cnf")
+        public = b"\x04" + k[-2] + k[-3]
+        _require(p256_point(public) is not None, "cnf")
+        return public.hex()
+    return _okp_key(k, "cnf").hex()
+
+
 def _lifetime(m, max_s):
     iat, exp = _cuint(m, 6, "iat"), _cuint(m, 4, "exp")
     _require(iat < exp <= iat + max_s, "exp: lifetime")
@@ -446,7 +533,7 @@ def parse_attestation_result(m):
                  and all(isinstance(w, str) for w in warnings), "warnings")
     return {
         "iss": _ctext(m, 1, "iss", 64), "iat": iat, "exp": exp,
-        "cti": _cbytes(m, 7, "cti", 16), "cnf": _cnf(m), "nonce": _cbytes(m, 10, "eat_nonce", 32),
+        "cti": _cbytes(m, 7, "cti", 16), "cnf": _session_cnf(m), "nonce": _cbytes(m, 10, "eat_nonce", 32),
         "did": _cbytes(m, -65601, "did", 32), "tier": _tier(m), "features": feats,
         "client_build": _cbytes(m, -65604, "client_build", 32),
         "platform": _ctext(m, -65605, "platform", 32), "policy_ver": _cuint(m, -65606, "policy_ver"),
@@ -459,7 +546,7 @@ def parse_sat(m):
     iat, exp = _lifetime(m, SAT_MAX_S)
     return {
         "iss": _ctext(m, 1, "iss", 64), "sub": _cbytes(m, 2, "sub", 32), "aud": _cbytes(m, 3, "aud", 32),
-        "iat": iat, "exp": exp, "cti": _cbytes(m, 7, "cti", 16), "cnf": _cnf(m),
+        "iat": iat, "exp": exp, "cti": _cbytes(m, 7, "cti", 16), "cnf": _session_cnf(m),
         "did": _cbytes(m, -65601, "did", 32), "tier": _tier(m),
         "match_id": _cbytes(m, -65620, "match_id", 16), "slot": _cuint(m, -65621, "slot", 16),
         "queue": _ctext(m, -65622, "queue", 64), "policy_ver": _cuint(m, -65606, "policy_ver"),
@@ -554,7 +641,13 @@ def verify(cose, kind, keys):
     if h["alg"] != key["alg"]:
         raise Reject("alg", h["alg"])
     to_be_signed = cbor_encode(["Signature1", protected_raw, b"", payload])
-    if not ed25519_verify(key["public"], to_be_signed, signature):
+    if key["alg"] == ES256:
+        # device-held session keys only (04 §3)
+        if key["role"] != "session":
+            raise Reject("alg", h["alg"])
+        if not ecdsa_p256_verify(key["public"], to_be_signed, signature):
+            raise Reject("signature", "ES256 verification failed")
+    elif not ed25519_verify(key["public"], to_be_signed, signature):
         raise Reject("signature", "Ed25519 verification failed")
     return PARSERS[kind](cbor_decode(payload)), key
 
@@ -586,6 +679,21 @@ def run(path):
     )
     r.check(ed25519_verify(rfc_pub, b"", rfc_sig), "Ed25519 RFC 8032 TEST 1")
     r.check(not ed25519_verify(rfc_pub, b"x", rfc_sig), "Ed25519 RFC 8032 TEST 1 (wrong message)")
+    # ECDSA P-256 / SHA-256 against RFC 6979 A.2.5 ("sample"), independent of
+    # the vector file: the public key from the private key, then the signature
+    # (its s is high: FPP's COSE objects refuse it, the raw check does not).
+    d = 0xC9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721
+    q = p256_mul(d, P256_G)
+    r.check(q == (0x60FED4BA255A9D31C961EB74C6356D68C049B8923B61FA6CE669622E60F29FB6,
+                  0x7903FE1008B8BC99A41AE9E95628BC64F2F1B20C2D7E9F5177A3C294D4462299), "P-256 RFC 6979 public key")
+    q_bytes = b"\x04" + q[0].to_bytes(32, "big") + q[1].to_bytes(32, "big")
+    sig = bytes.fromhex("EFD48B2AACB6A8FD1140DD9CD45E81D69D2C877B56AAF991C34D0EA84EAF3716"
+                        "F7CB1C942D657C41D436C7A1B6E29F65F3E900DBB9AFF4064DC4AB2F843ACDA8")
+    r.check(ecdsa_p256_verify(q_bytes, b"sample", sig, low_s=False), "ES256 RFC 6979 A.2.5")
+    r.check(not ecdsa_p256_verify(q_bytes, b"sample", sig), "ES256: high s refused")
+    low = sig[:32] + (P256_N - int.from_bytes(sig[32:], "big")).to_bytes(32, "big")
+    r.check(ecdsa_p256_verify(q_bytes, b"sample", low), "ES256: the low-s twin verifies")
+    r.check(not ecdsa_p256_verify(q_bytes, b"samplf", low), "ES256: wrong message")
     for t in vectors["ed25519_rfc8032"]:
         r.check(bytes.fromhex(t["public"]) == rfc_pub and bytes.fromhex(t["signature"]) == rfc_sig,
                 "vector file carries the RFC 8032 TEST 1 signature")

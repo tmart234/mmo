@@ -91,7 +91,10 @@ fn join_binds_session_key_and_carries_hellos() {
             admit_pop,
             ..
         } => {
-            assert_eq!(session_key, alice.verifying_key().to_bytes());
+            assert_eq!(
+                session_key,
+                fpp_types::SessionKey::Ed25519(alice.verifying_key().to_bytes())
+            );
             assert_eq!(attestation, b"AR(cwt)");
             assert_eq!(hello, b"alice");
             // The proof is a normal FPP object: it verifies with the session key.

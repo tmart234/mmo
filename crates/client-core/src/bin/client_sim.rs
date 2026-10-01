@@ -31,6 +31,10 @@ struct Opts {
     /// Expect the Broker to refuse this queue (e.g. `verified` without evidence).
     #[arg(long)]
     expect_refused: bool,
+    /// Session key: `ed25519`, or `p256` (ES256, as a TPM, the Secure Enclave
+    /// or StrongBox holds; here in software).
+    #[arg(long, default_value = "ed25519")]
+    session_key: String,
 }
 
 #[tokio::main]
@@ -48,7 +52,14 @@ async fn main() -> Result<()> {
     let mut attempt = 0;
     let creds = loop {
         attempt += 1;
-        match request_admission(&services, &trust, &opts.queue).await {
+        let session: SessionSigning = match opts.session_key.as_str() {
+            "ed25519" => Box::new(fpp_crypto::Ed25519Signer::new(
+                ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng),
+            )),
+            "p256" => Box::new(fpp_crypto::P256Signer::generate()),
+            other => bail!("--session-key: ed25519 or p256, not {other}"),
+        };
+        match request_admission_with(&services, &trust, &opts.queue, session).await {
             Ok(c) => break c,
             Err(e) => {
                 if let Some(SessionEnd::Refused(code)) = e.downcast_ref::<SessionEnd>() {
@@ -70,10 +81,11 @@ async fn main() -> Result<()> {
         bail!("expected the Broker to refuse queue {}", opts.queue);
     }
     println!(
-        "[CLIENT] admitted by the Broker: match {}.. slot {} on {}",
+        "[CLIENT] admitted by the Broker: match {}.. slot {} on {} ({} session key)",
         hex::encode(&creds.sat_claims.match_id.0[..4]),
         creds.sat_claims.slot,
-        creds.gs_addr
+        creds.gs_addr,
+        opts.session_key
     );
 
     let mut game = GameClient::connect(creds, &trust, Duration::from_secs(10)).await?;

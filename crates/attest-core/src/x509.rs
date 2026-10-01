@@ -72,6 +72,11 @@ impl<'a> Cert<'a> {
         self.x509.public_key().algorithm.algorithm.to_id_string()
     }
 
+    /// An ECDSA P-256 key (its `public_key_bytes` are then a SEC1 point).
+    pub fn is_p256(&self) -> bool {
+        self.key_algorithm() == OID_EC_PUBLIC_KEY && self.curve().as_deref() == Some(OID_P256)
+    }
+
     fn curve(&self) -> Option<String> {
         let params = self.x509.public_key().algorithm.parameters.as_ref()?;
         params.as_oid().ok().map(|o| o.to_id_string())

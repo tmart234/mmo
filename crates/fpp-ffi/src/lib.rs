@@ -20,7 +20,7 @@
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use fpp_crypto::{self as crypto, Ed25519Signer, KeyRole, KeySet, VerifyError};
 use fpp_tokens::evidence::{attest_challenge, Evidence, MAX_CHAIN, MAX_EVIDENCE};
-use fpp_types::{BuildId, Digest, GsInstanceId, MatchId};
+use fpp_types::{BuildId, Digest, GsInstanceId, MatchId, SessionKey};
 use fpp_wire::msg::frame_leaf_data;
 use fpp_wire::{Checkpoint, InputCommit, InputLeaf};
 use sha2::{Digest as _, Sha256};
@@ -327,6 +327,50 @@ pub unsafe extern "C" fn fpp_attest_challenge(
     })
 }
 
+/// The challenge for a key that will itself be the session key (an Android
+/// Keystore key, Ed25519 in the TEE or P-256 in the TEE or StrongBox): it
+/// is attested when it is made, so its public key cannot be in the
+/// challenge. The Verifier then requires the attested key to be the
+/// session key. `SHA-256("fpp/1/attest-challenge" || 0x00 || verifier_challenge)`.
+///
+/// # Safety
+/// `verifier_challenge` and `out` valid for 32 bytes each.
+#[no_mangle]
+pub unsafe extern "C" fn fpp_attest_challenge_hw_key(
+    verifier_challenge: *const u8,
+    out: *mut u8,
+) -> FppStatus {
+    guard(|| {
+        let challenge = unsafe { fixed::<32>(verifier_challenge) }?;
+        unsafe {
+            write_fixed(
+                out,
+                &fpp_tokens::evidence::attest_challenge_hw_key(&challenge),
+            )
+        }
+    })
+}
+
+/// [`fpp_attest_challenge`] for a session key of either kind
+/// (`fpp_signer_session_key`: 32 or 65 bytes).
+///
+/// # Safety
+/// `verifier_challenge` and `out` valid for 32 bytes; `session_key` valid
+/// for `session_key_len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn fpp_attest_challenge_key(
+    verifier_challenge: *const u8,
+    session_key: *const u8,
+    session_key_len: usize,
+    out: *mut u8,
+) -> FppStatus {
+    guard(|| {
+        let challenge = unsafe { fixed::<32>(verifier_challenge) }?;
+        let session = unsafe { session_key_in(session_key, session_key_len) }?;
+        unsafe { write_fixed(out, &attest_challenge(&challenge, &session.to_bytes())) }
+    })
+}
+
 fn write_evidence(evidence: Evidence, out: *mut u8, cap: usize, out_len: *mut usize) -> Res {
     let bytes = evidence.encode();
     if bytes.len() > MAX_EVIDENCE {
@@ -447,7 +491,8 @@ pub type FppSignCallback = Option<
 
 /// A key held outside the SDK: the SDK checks every signature it returns.
 struct ExternalSigner {
-    public: VerifyingKey,
+    session: SessionKey,
+    public: crypto::PublicKey,
     kid: fpp_types::Kid,
     callback: unsafe extern "C" fn(*mut c_void, *const u8, usize, *mut u8) -> c_int,
     ctx: *mut c_void,
@@ -461,10 +506,19 @@ enum Key {
 }
 
 impl Key {
-    fn verifying_key(&self) -> VerifyingKey {
+    fn session_key(&self) -> SessionKey {
         match self {
-            Key::Local(s) => s.verifying_key(),
-            Key::External(e) => e.public,
+            Key::Local(s) => SessionKey::Ed25519(s.verifying_key().to_bytes()),
+            Key::External(e) => e.session,
+        }
+    }
+
+    /// The Ed25519 public key. A P-256 key is a session key only: it cannot
+    /// sign as a host (Checkpoints) or be passed where 32 bytes are expected.
+    fn ed25519(&self) -> Result<VerifyingKey, FppStatus> {
+        match self.session_key() {
+            SessionKey::Ed25519(k) => verifying_key(k),
+            SessionKey::P256 { .. } => Err(FppStatus::InvalidArgument),
         }
     }
 
@@ -480,7 +534,7 @@ impl Key {
 
 impl crypto::Signer for Key {
     fn alg(&self) -> i64 {
-        fpp_wire::cose::alg::EDDSA
+        self.session_key().alg()
     }
 
     fn kid(&self) -> fpp_types::Kid {
@@ -505,11 +559,14 @@ impl crypto::Signer for Key {
                         sig.as_mut_ptr(),
                     )
                 };
-                let valid = rc == 0
-                    && e.public
-                        .verify_strict(to_be_signed, &ed25519_dalek::Signature::from_bytes(&sig))
-                        .is_ok();
-                if !valid {
+                // ES256: either valid `s` is accepted from the hardware; the
+                // SDK emits the low one, the only one verifiers accept.
+                if matches!(e.session, SessionKey::P256 { .. }) {
+                    if let Some(low) = crypto::es256_normalize(&sig) {
+                        sig = low;
+                    }
+                }
+                if rc != 0 || !e.public.verify(to_be_signed, &sig) {
                     e.failed.set(true);
                 }
                 sig.to_vec()
@@ -518,9 +575,9 @@ impl crypto::Signer for Key {
     }
 }
 
-impl crypto::Ed25519Key for Key {
-    fn public_key(&self) -> [u8; 32] {
-        self.verifying_key().to_bytes()
+impl crypto::SessionSigner for Key {
+    fn session_key(&self) -> SessionKey {
+        Key::session_key(self)
     }
 }
 
@@ -585,25 +642,61 @@ pub unsafe extern "C" fn fpp_signer_external(
     out: *mut *mut FppSigner,
 ) -> FppStatus {
     guard(|| {
-        let public = VerifyingKey::from_bytes(&unsafe { fixed::<32>(public_key) }?)
-            .map_err(|_| FppStatus::InvalidArgument)?;
-        let callback = callback.ok_or(FppStatus::NullPointer)?;
-        let signer = ExternalSigner {
-            kid: crypto::kid(&public),
-            public,
-            callback,
-            ctx,
-            failed: Cell::new(false),
-        };
-        unsafe {
-            emit(
-                out,
-                FppSigner {
-                    inner: Key::External(signer),
-                },
-            )
-        }
+        let session = SessionKey::Ed25519(unsafe { fixed::<32>(public_key) }?);
+        unsafe { external(session, callback, ctx, out) }
     })
+}
+
+/// [`fpp_signer_external`] for an ECDSA P-256 session key (ES256): a key in
+/// a TPM, the Secure Enclave or StrongBox, which have no Ed25519.
+/// `public_key` is the uncompressed SEC1 point (`0x04 ‖ x ‖ y`, 65 bytes);
+/// the callback writes the signature as `r ‖ s` (64 bytes, big-endian; not
+/// DER), over SHA-256 of the message as ES256 defines. Either `s` is
+/// accepted; the SDK emits the low one.
+///
+/// # Safety
+/// `public_key` valid for 65 bytes; `callback` safe to call as documented at
+/// `FppSignCallback`; `out` valid for a pointer write.
+#[no_mangle]
+pub unsafe extern "C" fn fpp_signer_external_p256(
+    public_key: *const u8,
+    callback: FppSignCallback,
+    ctx: *mut c_void,
+    out: *mut *mut FppSigner,
+) -> FppStatus {
+    guard(|| {
+        let bytes = unsafe { fixed::<65>(public_key) }?;
+        let session = SessionKey::from_bytes(&bytes).ok_or(FppStatus::InvalidArgument)?;
+        unsafe { external(session, callback, ctx, out) }
+    })
+}
+
+/// # Safety
+/// As [`fpp_signer_external`].
+unsafe fn external(
+    session: SessionKey,
+    callback: FppSignCallback,
+    ctx: *mut c_void,
+    out: *mut *mut FppSigner,
+) -> Res {
+    let public = crypto::PublicKey::session(&session).ok_or(FppStatus::InvalidArgument)?;
+    let callback = callback.ok_or(FppStatus::NullPointer)?;
+    let signer = ExternalSigner {
+        kid: crypto::session_kid(&session),
+        session,
+        public,
+        callback,
+        ctx,
+        failed: Cell::new(false),
+    };
+    unsafe {
+        emit(
+            out,
+            FppSigner {
+                inner: Key::External(signer),
+            },
+        )
+    }
 }
 
 /// # Safety
@@ -614,6 +707,8 @@ pub unsafe extern "C" fn fpp_signer_free(signer: *mut FppSigner) {
 }
 
 /// The key's 32-byte Ed25519 public key (what peers need to verify it).
+/// `FPP_STATUS_INVALID_ARGUMENT` for a P-256 key: use
+/// [`fpp_signer_session_key`].
 ///
 /// # Safety
 /// `signer` a live handle; `out` valid for 32 bytes.
@@ -624,8 +719,56 @@ pub unsafe extern "C" fn fpp_signer_public_key(
 ) -> FppStatus {
     guard(|| {
         let s = unsafe { handle(signer) }?;
-        unsafe { write_fixed(out, &s.inner.verifying_key().to_bytes()) }
+        unsafe { write_fixed(out, &s.inner.ed25519()?.to_bytes()) }
     })
+}
+
+/// Longest session key encoding ([`fpp_signer_session_key`]): a P-256 point.
+pub const FPP_SESSION_KEY_MAX: usize = 65;
+
+/// The key as a session key: 32 bytes for Ed25519, 65 (`0x04 ‖ x ‖ y`) for
+/// P-256. This is what `fpp_attest_challenge_key`, `fpp_verify_input_commit_key`
+/// and `fpp_ar_verify_key` take, and what the Verifier binds the AR to.
+///
+/// # Safety
+/// `signer` a live handle; `out` valid for `FPP_SESSION_KEY_MAX` bytes;
+/// `out_len` valid for a write.
+#[no_mangle]
+pub unsafe extern "C" fn fpp_signer_session_key(
+    signer: *const FppSigner,
+    out: *mut u8,
+    out_len: *mut usize,
+) -> FppStatus {
+    guard(|| {
+        let s = unsafe { handle(signer) }?;
+        unsafe { write_session_key(&s.inner.session_key(), out, out_len) }
+    })
+}
+
+/// # Safety
+/// `out` valid for `FPP_SESSION_KEY_MAX` bytes; `out_len` valid for a write.
+unsafe fn write_session_key(key: &SessionKey, out: *mut u8, out_len: *mut usize) -> Res {
+    let bytes = key.to_bytes();
+    if out.is_null() || out_len.is_null() {
+        return Err(FppStatus::NullPointer);
+    }
+    // SAFETY: caller contract above.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len());
+        *out_len = bytes.len();
+    }
+    Ok(())
+}
+
+/// A session key from C: 32 bytes (Ed25519) or 65 (P-256), a valid key.
+///
+/// # Safety
+/// `key` valid for `len` bytes.
+unsafe fn session_key_in(key: *const u8, len: usize) -> Result<SessionKey, FppStatus> {
+    let bytes = unsafe { input(key, len) }?;
+    let key = SessionKey::from_bytes(bytes).ok_or(FppStatus::InvalidArgument)?;
+    crypto::PublicKey::session(&key).ok_or(FppStatus::InvalidArgument)?;
+    Ok(key)
 }
 
 /// SHA-256 of a public key's COSE_Key: the `gs_instance_id` of a host key.
@@ -972,7 +1115,7 @@ pub unsafe extern "C" fn fpp_checkpoint_sign(
         let b = unsafe { handle(builder) }?;
         let key = unsafe { handle(instance_key) }?;
         let mut cp = b.checkpoint.clone();
-        cp.gs_instance_id = GsInstanceId(crypto::key_digest(&key.inner.verifying_key()).0);
+        cp.gs_instance_id = GsInstanceId(crypto::key_digest(&key.inner.ed25519()?).0);
         cp.inputs_root = fpp_merkle::root(&b.inputs);
         cp.inputs_n = b.inputs.len() as u32;
         cp.events_root = fpp_merkle::root(&b.events);
@@ -1055,8 +1198,43 @@ pub unsafe extern "C" fn fpp_verify_input_commit(
     info: *mut FppInputCommitInfo,
 ) -> FppStatus {
     guard(|| {
+        let key = SessionKey::Ed25519(unsafe { fixed(session_public_key) }?);
+        unsafe { verify_input_commit(object, len, &key, info) }
+    })
+}
+
+/// [`fpp_verify_input_commit`] for a session key of either kind (32 bytes
+/// Ed25519, or 65 bytes P-256: `fpp_p2p_host_peer_session_key`).
+///
+/// # Safety
+/// `object` valid for `len` bytes; `session_key` valid for
+/// `session_key_len` bytes; `info` NULL or valid for a write.
+#[no_mangle]
+pub unsafe extern "C" fn fpp_verify_input_commit_key(
+    object: *const u8,
+    len: usize,
+    session_key: *const u8,
+    session_key_len: usize,
+    info: *mut FppInputCommitInfo,
+) -> FppStatus {
+    guard(|| {
+        let key = unsafe { session_key_in(session_key, session_key_len) }?;
+        unsafe { verify_input_commit(object, len, &key, info) }
+    })
+}
+
+/// # Safety
+/// As [`fpp_verify_input_commit`].
+unsafe fn verify_input_commit(
+    object: *const u8,
+    len: usize,
+    key: &SessionKey,
+    info: *mut FppInputCommitInfo,
+) -> Res {
+    {
         let object = unsafe { input(object, len) }?;
-        let keys = keyset(KeyRole::Session, unsafe { fixed(session_public_key) }?)?;
+        let mut keys = KeySet::default();
+        keys.insert_session(key).ok_or(FppStatus::InvalidArgument)?;
         let v = crypto::verify::<InputCommit>(object, &keys)?;
         if let Some(info) = unsafe { info.as_mut() } {
             let c = v.payload;
@@ -1073,7 +1251,7 @@ pub unsafe extern "C" fn fpp_verify_input_commit(
             };
         }
         Ok(())
-    })
+    }
 }
 
 /// Verify a signed Checkpoint against a host's 32-byte instance public key,
@@ -1200,47 +1378,109 @@ pub unsafe extern "C" fn fpp_ar_verify(
     info: *mut FppArInfo,
 ) -> FppStatus {
     guard(|| {
-        let ar = unsafe { input(ar, len) }?;
-        if ar.is_empty() || verifier_key_count == 0 || verifier_key_count > 64 || minimum_tier > 3 {
-            return Err(FppStatus::InvalidArgument);
+        let session = SessionKey::Ed25519(unsafe { fixed(session_public_key) }?);
+        unsafe {
+            ar_verify(
+                ar,
+                len,
+                verifier_keys,
+                verifier_key_count,
+                &session,
+                now_s,
+                minimum_tier,
+                info,
+            )
         }
-        let raw = unsafe { input(verifier_keys, 32 * verifier_key_count) }?;
-        let session: [u8; 32] = unsafe { fixed(session_public_key) }?;
-        let mut keys = KeySet::default();
-        for key in raw.as_chunks::<32>().0 {
-            keys.insert_ed25519(KeyRole::VerifierAr, verifying_key(*key)?);
-        }
-        let result = fpp_tokens::verify_ar(ar, &keys, now_s).map_err(|e| match e {
-            fpp_tokens::TokenError::Verify(v) => FppStatus::from(v),
-            fpp_tokens::TokenError::Expired => FppStatus::TokenExpired,
-            fpp_tokens::TokenError::NotYetValid => FppStatus::TokenNotYetValid,
-            _ => FppStatus::Schema,
-        })?;
-        if result.cnf != session {
-            return Err(FppStatus::TokenBinding);
-        }
-        if let Some(info) = unsafe { info.as_mut() } {
-            let mut platform = [0u8; 33];
-            let name = result.platform.as_bytes();
-            let n = name.len().min(32);
-            platform[..n].copy_from_slice(&name[..n]);
-            *info = FppArInfo {
-                tier: result.tier as u8,
-                features: feature_bits(&result.features),
-                iat: result.iat,
-                exp: result.exp,
-                policy_ver: result.policy_ver,
-                did: result.did.0,
-                client_build: result.client_build.0,
-                cti: result.cti,
-                platform,
-            };
-        }
-        if (result.tier as u8) < minimum_tier {
-            return Err(FppStatus::TokenTier);
-        }
-        Ok(())
     })
+}
+
+/// [`fpp_ar_verify`] for a session key of either kind (32 bytes Ed25519,
+/// or 65 bytes P-256: `fpp_p2p_host_peer_session_key`).
+///
+/// # Safety
+/// As [`fpp_ar_verify`], with `session_key` valid for `session_key_len`
+/// bytes.
+#[no_mangle]
+pub unsafe extern "C" fn fpp_ar_verify_key(
+    ar: *const u8,
+    len: usize,
+    verifier_keys: *const u8,
+    verifier_key_count: usize,
+    session_key: *const u8,
+    session_key_len: usize,
+    now_s: u64,
+    minimum_tier: u8,
+    info: *mut FppArInfo,
+) -> FppStatus {
+    guard(|| {
+        let session = unsafe { session_key_in(session_key, session_key_len) }?;
+        unsafe {
+            ar_verify(
+                ar,
+                len,
+                verifier_keys,
+                verifier_key_count,
+                &session,
+                now_s,
+                minimum_tier,
+                info,
+            )
+        }
+    })
+}
+
+/// # Safety
+/// As [`fpp_ar_verify`].
+#[allow(clippy::too_many_arguments)]
+unsafe fn ar_verify(
+    ar: *const u8,
+    len: usize,
+    verifier_keys: *const u8,
+    verifier_key_count: usize,
+    session: &SessionKey,
+    now_s: u64,
+    minimum_tier: u8,
+    info: *mut FppArInfo,
+) -> Res {
+    let ar = unsafe { input(ar, len) }?;
+    if ar.is_empty() || verifier_key_count == 0 || verifier_key_count > 64 || minimum_tier > 3 {
+        return Err(FppStatus::InvalidArgument);
+    }
+    let raw = unsafe { input(verifier_keys, 32 * verifier_key_count) }?;
+    let mut keys = KeySet::default();
+    for key in raw.as_chunks::<32>().0 {
+        keys.insert_ed25519(KeyRole::VerifierAr, verifying_key(*key)?);
+    }
+    let result = fpp_tokens::verify_ar(ar, &keys, now_s).map_err(|e| match e {
+        fpp_tokens::TokenError::Verify(v) => FppStatus::from(v),
+        fpp_tokens::TokenError::Expired => FppStatus::TokenExpired,
+        fpp_tokens::TokenError::NotYetValid => FppStatus::TokenNotYetValid,
+        _ => FppStatus::Schema,
+    })?;
+    if result.cnf != *session {
+        return Err(FppStatus::TokenBinding);
+    }
+    if let Some(info) = unsafe { info.as_mut() } {
+        let mut platform = [0u8; 33];
+        let name = result.platform.as_bytes();
+        let n = name.len().min(32);
+        platform[..n].copy_from_slice(&name[..n]);
+        *info = FppArInfo {
+            tier: result.tier as u8,
+            features: feature_bits(&result.features),
+            iat: result.iat,
+            exp: result.exp,
+            policy_ver: result.policy_ver,
+            did: result.did.0,
+            client_build: result.client_build.0,
+            cti: result.cti,
+            platform,
+        };
+    }
+    if (result.tier as u8) < minimum_tier {
+        return Err(FppStatus::TokenTier);
+    }
+    Ok(())
 }
 
 impl From<fpp_wire::WireError> for FppStatus {

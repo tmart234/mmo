@@ -111,6 +111,72 @@ fixed_id!(
     Digest, 32
 );
 
+/// A player's session key (the `cnf` of ARs and SATs, 04 §3): Ed25519, or
+/// ECDSA P-256 (ES256) for keys held in hardware that has no Ed25519 (TPMs,
+/// Secure Enclave, StrongBox). Only the format is checked here; whether a
+/// P-256 point is on the curve is checked where it is used (`fpp-crypto`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SessionKey {
+    Ed25519([u8; 32]),
+    /// Affine coordinates, big-endian.
+    P256 {
+        x: [u8; 32],
+        y: [u8; 32],
+    },
+}
+
+impl SessionKey {
+    /// The canonical bytes: an Ed25519 key's 32 bytes, or a P-256 point as
+    /// uncompressed SEC1 (`0x04 ‖ x ‖ y`, 65 bytes). Bound into evidence
+    /// challenges and proof-of-possession messages.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            SessionKey::Ed25519(k) => k.to_vec(),
+            SessionKey::P256 { x, y } => {
+                let mut v = Vec::with_capacity(65);
+                v.push(4);
+                v.extend_from_slice(x);
+                v.extend_from_slice(y);
+                v
+            }
+        }
+    }
+
+    /// Inverse of [`SessionKey::to_bytes`].
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        match bytes.len() {
+            32 => Some(SessionKey::Ed25519(bytes.try_into().ok()?)),
+            65 if bytes[0] == 4 => Some(SessionKey::P256 {
+                x: bytes[1..33].try_into().ok()?,
+                y: bytes[33..].try_into().ok()?,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The COSE algorithm this key signs with (`EdDSA` -8 or `ES256` -7).
+    pub fn alg(&self) -> i64 {
+        match self {
+            SessionKey::Ed25519(_) => -8,
+            SessionKey::P256 { .. } => -7,
+        }
+    }
+}
+
+impl core::fmt::Debug for SessionKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let (name, b) = match self {
+            SessionKey::Ed25519(k) => ("Ed25519", &k[..4]),
+            SessionKey::P256 { x, .. } => ("P256", &x[..4]),
+        };
+        write!(f, "SessionKey::{name}(")?;
+        for b in b {
+            write!(f, "{b:02x}")?;
+        }
+        write!(f, "..)")
+    }
+}
+
 /// Device Trust Tier, computed by the Verifier (03-architecture.md §4.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]

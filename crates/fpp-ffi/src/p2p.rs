@@ -13,6 +13,7 @@ use super::{emit, fixed, free, guard, handle, handle_mut, input, FppSigner, FppS
 use fpp_session::{
     Error, Host, HostConfig, HostEvent, JoinConfig, Joiner, JoinerEvent, StaticKeypair, Transmit,
 };
+use fpp_types::SessionKey;
 
 /// Largest datagram the SDK produces or accepts (no IP fragmentation).
 pub const FPP_P2P_MAX_PACKET: usize = 1452;
@@ -60,8 +61,10 @@ impl From<Error> for FppStatus {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FppP2pEventKind {
-    /// Host: a player joined. `peer`; `key` = its session key (verify its
-    /// InputCommits with it); data = attestation ‖ admit_pop ‖ hello.
+    /// Host: a player joined. `peer`; `key` = its Ed25519 session key (verify
+    /// its InputCommits with it), or a P-256 session key's 32-byte id (get
+    /// the key with `fpp_p2p_host_peer_session_key`); data = attestation ‖
+    /// admit_pop ‖ hello.
     PeerJoined = 1,
     /// Host (`peer` set) or joiner: an application datagram; data = payload.
     Data = 2,
@@ -129,7 +132,10 @@ fn host_event(e: &HostEvent) -> (FppP2pEvent, Vec<u8>) {
             let mut ev = FppP2pEvent::new(FppP2pEventKind::PeerJoined);
             ev.peer = *peer;
             ev.has_key = 1;
-            ev.key = *session_key;
+            ev.key = match session_key {
+                SessionKey::Ed25519(k) => *k,
+                p256 => fpp_crypto::session_key_id(p256),
+            };
             ev.attestation_len = attestation.len();
             ev.admit_pop_len = admit_pop.len();
             (ev, [&attestation[..], admit_pop, hello].concat())
@@ -517,6 +523,31 @@ pub unsafe extern "C" fn fpp_p2p_host_poll_event(
             h.inner.poll_event();
         }
         Ok(())
+    })
+}
+
+/// The session key `peer` proved in its handshake, 32 bytes (Ed25519) or 65
+/// (P-256), for `fpp_verify_input_commit_key` and `fpp_ar_verify_key`.
+/// (`FppP2pEvent.key` holds a P-256 key's 32-byte id, `0x02/0x03`-compressed
+/// point hashed, as revocations name it.)
+///
+/// # Safety
+/// `host` a live handle; `out` valid for `FPP_SESSION_KEY_MAX` bytes;
+/// `out_len` valid for a write.
+#[no_mangle]
+pub unsafe extern "C" fn fpp_p2p_host_peer_session_key(
+    host: *const FppP2pHost,
+    peer: u32,
+    out: *mut u8,
+    out_len: *mut usize,
+) -> FppStatus {
+    guard(|| {
+        let h = unsafe { handle(host) }?;
+        let key = h
+            .inner
+            .peer_session_key(peer)
+            .ok_or(FppStatus::P2pUnknownPeer)?;
+        unsafe { crate::write_session_key(&key, out, out_len) }
     })
 }
 
