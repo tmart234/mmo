@@ -33,6 +33,7 @@ because several **chain together**.
 | F17 | Low | `.gitignore` ignores `*.lock` while `Cargo.lock` is tracked. Lockfiles for binaries must be tracked for reproducible builds. | `.gitignore:23` | ✅ Fixed (P0) |
 | F18 | Info | Revocation state lives in three places. | `vs/src/ctx.rs:22`, `vs/src/enforcer.rs:33`, `gs-sim/src/state.rs:103` | ✅ P2.2: one source, the Revocation Feed's signed events; the Broker, Server Liveness and game servers each keep a cache of it |
 | F19 | Info | GS client port is hard-coded to `127.0.0.1:50000`. | `crates/gs-sim/src/client_port.rs:78` | ✅ Fixed (P1): `--game-addr`, advertised to the VS in the signed JoinRequest and to clients by the Broker |
+| F22 | Medium | Post-quantum authenticity is claimed further than it reaches. The Log key signs hybrid (Ed25519 + ML-DSA-65), but the only verifiers of the ML-DSA half are the witness and the log itself (checking its own checkpoint on reopening). Clients, game servers and the cell services never call hybrid verification, and the C SDK is built without `s1h`, so it cannot; `LogReceipt`s are hybrid-signed but checked by no one; Go's sumdb, like any C2SP verifier, checks only the Ed25519 line of a checkpoint; the independent Python verifier has no ML-DSA. Every object a relying party checks today (AR, SAT, SAR, Checkpoint, RevocationEvent) is Ed25519-only (FPP-S1, as 04 §3 intends for short-lived objects). Against a quantum forger, the log is protected only as far as its witness is. | `crates/fpp-log/src/witness.rs:83`, callers of `verify_hybrid` / `Note::verify_hybrid` (only fpp-log) | Open. Docs corrected (04 §3, P2.1 below). Closed when a relying party verifies an S1H object: the client log check (open, see P2 status), build manifests and policies (P3); ML-DSA vectors for the independent verifier |
 | F21 | **Critical** | `verify_quote` checked a quote's signature with the attestation key *carried in the quote*. Anyone could sign a "quote" for any PCR values, including the configured baselines, with a key they made up; PCR baselines gave no assurance. | `crates/common/src/tpm.rs` `verify_quote` | ✅ Fixed for TPM 2.0: an AK counts only after credential activation against an EK certified by a pinned manufacturer root, at every join. The simulated TPM path is removed |
 | F20 | **High** | Vulnerable dependencies, hidden by the non-blocking audit (F16): quinn-proto remote DoS and memory exhaustion (RUSTSEC-2026-0037, -0185), rustls accepting TLS 1.3 handshake messages across encryption levels (RUSTSEC-2026-0285), rustls-webpki name-constraint and CRL flaws, aws-lc-sys X.509/PKCS7 bypasses, unsound `lru` used directly by gs-sim, protobuf recursion crash via prometheus 0.13, plus bytes, time and anyhow issues. | `Cargo.lock`, `crates/gs-sim/Cargo.toml`, `Cargo.toml` | ✅ Fixed (P0): lockfile updates, lru 0.18, prometheus 0.14; remaining ignores documented in `deny.toml` (bincode, until P1 replaces it) |
 
@@ -47,7 +48,7 @@ because several **chain together**.
 | ATT (attestation) | ◐ | Game servers: real TPM 2.0 admission (EK chain, credential activation, quote, boot and IMA logs, a Build Registry of CI builds with provenance; F05/F06/F21), tested end to end against swtpm; re-attestation during a session is TBD (the simulated TPM path is removed). Freshness (F04) and self-asserted AKs (F21) fixed in the prototype. No client attestation yet, but player-hosted joins now carry an AR slot (04 §7.7). |
 | ID (identity) | ✗ | Self-generated client keys; no account, device, or ban-durable identity. |
 | PROTO (protocol/crypto) | ◐ | QUIC + Ed25519 are good foundations. Unverified TLS, bincode tuples, no domain separation or versioning, no PQ, no datagrams. |
-| EVD (evidence) | ◐ | Hash-chained Checkpoints and InputCommits, players' evidence bundles and `fpp-audit` (P1, M4); a Transparency Log with a witness (P2.1); a content-addressed Evidence Store (P2.3). Not yet replicated or encrypted at rest. |
+| EVD (evidence) | ◐ | Hash-chained Checkpoints and InputCommits, players' evidence bundles and `fpp-audit` (P1, M4); a Transparency Log with a witness (P2.1); a content-addressed Evidence Store (P2.3). Checkpoints are not in the log and clients check nothing against it (EVD-02, EVD-03 open); not yet replicated or encrypted at rest. |
 | IA (Integrity Agent) | ✗ | Not started. |
 | DET (detection) | ✗ | Only the VS speed check. |
 | ENF (enforcement) | ◐ | Signed revocation events for accounts, devices, sessions, SATs, instances and builds, through a logged feed to Brokers, Server Liveness and game servers (P2.2); instance revocation also by SAR starvation. No appeals or two-person rule yet. |
@@ -174,7 +175,9 @@ rogue GS that ignores revocation.
 (`cosignature/v1`), hybrid-signed `LogReceipt`s and inclusion/consistency
 proofs. Suite FPP-S1H (Ed25519 + ML-DSA-65 `COSE_Sign`, `fpp-crypto`
 feature `s1h`) is implemented for it: the Log key is hybrid, as §4
-requires. `svc-log` and `svc-witness` run as separate processes with their
+requires. It is *verified* hybrid only by the witness (and by the log on
+reopening): no relying party checks an S1H object yet, and standard C2SP
+verifiers (Go's sumdb included) check only the Ed25519 line (F22). `svc-log` and `svc-witness` run as separate processes with their
 own keys; `fpp-svc` gives every service a cell identity, mutual TLS over
 QUIC and per-request caller authorization (only configured writers append,
 only witnesses cosign). The witness refuses rollbacks and split views and
@@ -221,7 +224,13 @@ Checkpoints back as an auditor and checks they form one chain. Open:
 replication across the region, retention, encryption at rest.
 **P2 status:** all four parts and the exit tests are done, in one regional
 cell of separate processes and keys (`tools::cell`, `deploy/cell` in CI,
-`deploy/pi`). What P2 left open is listed under each part above; the
+`deploy/pi`). **Not closed: client-verifiable transparency.** The log
+holds revocation events and enforcement records, but not Checkpoints
+(EVD-02), and clients never check anything against it: the
+`CheckpointHead`s they receive are unsigned and go unchecked (EVD-03,
+04 §7.6). So today the log protects Enforcement's accountability, not
+players against a split view; that still rests on `fpp-audit` comparing
+bundles after the fact. What P2 left open is listed under each part above; the
 cross-cutting gaps are multi-region deployment, service metrics, and TPM
 2.0 re-attestation during a session.
 
