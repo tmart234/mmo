@@ -325,7 +325,10 @@ Bye  = [ 11, {} ]
 Failure yields `Reject{code}` and the connection closes. Codes are listed in §11.
 Implemented by `fpp_tokens::admission::admit` (both transports) with the
 revocation cache fed by the revocation feed (P2); a SAT's `cti` is also
-revoked locally once admitted, so it cannot be used twice in one match.
+revoked locally once admitted, so it cannot be used twice in one match. C game servers
+get the same checks through the SDK (`fpp_admission_*`, with a client-build
+list and device bans on top), the control messages as `fpp_control_*`, and
+players the SAR chain as `fpp_sar_chain_*` (`fpp.h`).
 
 **On fpp-session (native clients, ADR-002)** the same messages travel on the
 reliable channel after the Noise handshake, which already proved the session
