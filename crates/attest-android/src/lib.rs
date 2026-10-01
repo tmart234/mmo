@@ -332,6 +332,7 @@ pub fn appraise(
         session_key_in_hw,
         os_patch_level: kd.os_patch_level,
         hardware_identity: None,
+        boot: Default::default(),
         warnings,
     })
 }

@@ -16,7 +16,7 @@ pub type OpId = [u8; 16];
 
 /// Version in `ChallengeRequest`; bump on any admission-flow change (7:
 /// a purpose, and players' equivocation reports to Server Liveness).
-pub const ADMISSION_VERSION: u32 = 8;
+pub const ADMISSION_VERSION: u32 = 9;
 
 /// First message on a connection to a public service (Server Liveness, the
 /// Verifier, the Broker): asks for a single-use challenge.
@@ -153,6 +153,10 @@ pub enum EvidenceAnswer {
         /// `fpp_types::Reason` code.
         code: u16,
     },
+    /// TPM evidence: open this credential with the TPM
+    /// (`TPM2_ActivateCredential`) and answer with a `CredentialResponse`;
+    /// the AR follows.
+    Activate(CredentialChallenge),
 }
 
 /// Client → Broker after `AttestChallenge`: an AR and a queue, for a match.

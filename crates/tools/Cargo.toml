@@ -28,6 +28,10 @@ path = "src/split_view.rs"
 name = "revocation_load"
 path = "src/revocation_load.rs"
 
+[[bin]]
+name = "attestation_exit"
+path = "src/attestation_exit.rs"
+
 [dependencies]
 ctrlc = { workspace = true }
 anyhow = { workspace = true }
@@ -43,3 +47,6 @@ sha2 = { workspace = true }
 tokio = { workspace = true }
 svc-evidence = { path = "../svc-evidence" }
 hex = { workspace = true }
+fpp-tokens = { path = "../fpp-tokens" }
+attest-core = { path = "../attest-core" }
+attest-tpm = { path = "../attest-tpm" }

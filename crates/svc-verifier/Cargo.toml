@@ -24,6 +24,7 @@ fpp-svc        = { path = "../fpp-svc" }
 attest-core    = { path = "../attest-core" }
 attest-android = { path = "../attest-android" }
 attest-apple   = { path = "../attest-apple" }
+attest-tpm     = { path = "../attest-tpm" }
 
 [[bin]]
 name = "svc-verifier"

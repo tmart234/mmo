@@ -9,6 +9,9 @@
 //! - [`credential`]: `TPM2_MakeCredential` in software, which ties an AK to
 //!   the EK (credential activation).
 //! - [`eventlog`]: the measured-boot log, replayed, and Secure Boot's state.
+//! - [`wbcl`]: Windows' boot configuration in that log (test-signing, the
+//!   kernel debugger, VBS and HVCI).
+//! - [`certify`]: a session key that lives in the TPM, certified by the AK.
 //! - [`ima`]: the kernel's IMA log, replayed into PCR 10.
 //! - [`appraise`]: all of it with a policy and a Build Registry: the
 //!   program a machine runs, as the kernel measured it, is a registered
@@ -18,6 +21,7 @@
 //! `tests/swtpm.rs`.
 
 pub mod appraise;
+pub mod certify;
 pub mod credential;
 pub mod ek;
 pub mod eventlog;
@@ -25,6 +29,7 @@ pub mod ima;
 mod marshal;
 pub mod public;
 pub mod quote;
+pub mod wbcl;
 
 pub use appraise::{appraise, Appraisal, Evidence, Policy, Registry};
 pub use credential::{make_credential, CredentialChallenge};

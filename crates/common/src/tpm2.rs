@@ -8,8 +8,8 @@
 //! that measures executables (boot with `ima_policy=tcb`, or a policy with
 //! `measure func=BPRM_CHECK`) and `ima_hash=sha256`.
 
+use crate::proto::{CredentialChallenge, Tpm2Evidence};
 use anyhow::{bail, Context, Result};
-use common::proto::{CredentialChallenge, Tpm2Evidence};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -249,6 +249,189 @@ impl Tpm2 {
         })
         .context("credential activation")?;
         Ok(std::fs::read(dir.join("secret.out"))?)
+    }
+}
+
+/// A player's session key in the TPM (roadmap P3): an ECDSA P-256 signing
+/// key the TPM made under the owner hierarchy and keeps (`fixedTPM`,
+/// `fixedParent`, `sensitiveDataOrigin`), certified by the AK. It signs
+/// every FPP object of the session (ES256) through `tpm2_sign`.
+#[derive(Clone)]
+pub struct TpmSessionKey {
+    dir: PathBuf,
+    tcti: Option<String>,
+    key: fpp_types::SessionKey,
+    kid: fpp_types::Kid,
+    /// `TPM2B_PUBLIC`, for the Verifier.
+    pub public_area: Vec<u8>,
+}
+
+impl TpmSessionKey {
+    fn tools(&self) -> Tools<'_> {
+        Tools {
+            dir: &self.dir,
+            tcti: self.tcti.as_deref(),
+        }
+    }
+
+    fn try_sign(&self, msg: &[u8]) -> Result<[u8; 64]> {
+        let t = self.tools();
+        std::fs::write(self.dir.join("skey.msg"), msg)?;
+        t.run(&[
+            "tpm2_sign",
+            "-c",
+            "skey.ctx",
+            "-g",
+            "sha256",
+            "-s",
+            "ecdsa",
+            "-o",
+            "skey.sig",
+            "skey.msg",
+        ])?;
+        let tss = std::fs::read(self.dir.join("skey.sig"))?;
+        // TPMT_SIGNATURE: ECDSA, SHA-256, TPM2B r, TPM2B s
+        let field = |at: usize| -> Result<(&[u8], usize)> {
+            let size = u16::from_be_bytes(
+                tss.get(at..at + 2)
+                    .context("signature")?
+                    .try_into()
+                    .expect("2 bytes"),
+            ) as usize;
+            Ok((
+                tss.get(at + 2..at + 2 + size).context("signature")?,
+                at + 2 + size,
+            ))
+        };
+        if tss.get(..4) != Some(&[0x00, 0x18, 0x00, 0x0b]) {
+            bail!("not an ECDSA/SHA-256 signature");
+        }
+        let (r, next) = field(4)?;
+        let (s, _) = field(next)?;
+        let pad = |v: &[u8]| -> Result<[u8; 32]> {
+            let v = &v[v.iter().take_while(|b| **b == 0).count()..];
+            if v.len() > 32 {
+                bail!("ECDSA value size");
+            }
+            let mut out = [0u8; 32];
+            out[32 - v.len()..].copy_from_slice(v);
+            Ok(out)
+        };
+        let mut rs = [0u8; 64];
+        rs[..32].copy_from_slice(&pad(r)?);
+        rs[32..].copy_from_slice(&pad(s)?);
+        // (the TPM's s may be high; FPP takes the low twin)
+        fpp_crypto::es256_normalize(&rs).context("ECDSA signature")
+    }
+}
+
+impl fpp_crypto::Signer for TpmSessionKey {
+    fn alg(&self) -> i64 {
+        self.key.alg()
+    }
+
+    fn kid(&self) -> fpp_types::Kid {
+        self.kid
+    }
+
+    /// A failed signature comes back as zeros, which no verifier accepts.
+    fn sign(&self, msg: &[u8]) -> Vec<u8> {
+        match self.try_sign(msg) {
+            Ok(sig) => sig.to_vec(),
+            Err(e) => {
+                eprintln!("[tpm] signing with the session key: {e:#}");
+                vec![0; 64]
+            }
+        }
+    }
+}
+
+impl fpp_crypto::SessionSigner for TpmSessionKey {
+    fn session_key(&self) -> fpp_types::SessionKey {
+        self.key
+    }
+}
+
+impl Tpm2 {
+    /// Make a session key in the TPM (replacing any earlier one).
+    pub fn session_key(&self) -> Result<TpmSessionKey> {
+        let t = self.tools();
+        t.run(&[
+            "tpm2_createprimary",
+            "-C",
+            "o",
+            "-g",
+            "sha256",
+            "-G",
+            "ecc",
+            "-c",
+            "primary.ctx",
+        ])?;
+        t.run(&[
+            "tpm2_create",
+            "-C",
+            "primary.ctx",
+            "-G",
+            "ecc256:ecdsa-sha256",
+            "-a",
+            "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|sign",
+            "-u",
+            "skey.pub",
+            "-r",
+            "skey.priv",
+        ])?;
+        t.run(&[
+            "tpm2_load",
+            "-C",
+            "primary.ctx",
+            "-u",
+            "skey.pub",
+            "-r",
+            "skey.priv",
+            "-c",
+            "skey.ctx",
+        ])?;
+        let public_area = std::fs::read(self.opts.workdir.join("skey.pub"))?;
+        // TPM2B_PUBLIC of an ECC key ends with TPM2B x and TPM2B y
+        let n = public_area.len();
+        if n < 4 + 32 + 2 + 32 {
+            bail!("session key public area");
+        }
+        let mut sec1 = vec![4u8];
+        sec1.extend_from_slice(&public_area[n - 66..n - 34]);
+        sec1.extend_from_slice(&public_area[n - 32..]);
+        let key = fpp_types::SessionKey::from_bytes(&sec1).context("session key")?;
+        Ok(TpmSessionKey {
+            dir: self.opts.workdir.clone(),
+            tcti: self.opts.tcti.clone(),
+            kid: fpp_crypto::session_kid(&key),
+            key,
+            public_area,
+        })
+    }
+
+    /// `TPM2_Certify` of the session key by the AK: (`TPMS_ATTEST`,
+    /// `TPMT_SIGNATURE`).
+    pub fn certify(&self, _key: &TpmSessionKey) -> Result<(Vec<u8>, Vec<u8>)> {
+        let t = self.tools();
+        t.run(&[
+            "tpm2_certify",
+            "-c",
+            "skey.ctx",
+            "-C",
+            "ak.ctx",
+            "-g",
+            "sha256",
+            "-o",
+            "certify.attest",
+            "-s",
+            "certify.sig",
+        ])?;
+        let dir = &self.opts.workdir;
+        Ok((
+            std::fs::read(dir.join("certify.attest"))?,
+            std::fs::read(dir.join("certify.sig"))?,
+        ))
     }
 }
 

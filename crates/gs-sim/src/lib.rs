@@ -1,6 +1,7 @@
 pub mod game;
 pub mod ledger;
 pub mod state;
-pub mod tpm2;
+// (moved to `common`, where clients use it too)
+pub use common::tpm2;
 
 pub use common::crypto;

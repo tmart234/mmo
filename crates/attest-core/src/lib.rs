@@ -51,6 +51,21 @@ pub enum KeyStorage {
     StrongBox,
     /// Apple's Secure Enclave.
     SecureEnclave,
+    /// A PC's TPM 2.0 (with an EK certified by its manufacturer).
+    Tpm,
+}
+
+/// What a PC's measured boot showed beyond Secure Boot (Windows' boot
+/// configuration). `None`: not measured.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BootClaims {
+    /// A measured-boot log replayed to the quoted PCRs.
+    pub measured_boot: Option<bool>,
+    /// The secure kernel (VBS) and hypervisor-enforced code integrity.
+    pub vbs: Option<bool>,
+    pub hvci: Option<bool>,
+    /// Boot DMA protection by the IOMMU.
+    pub iommu: Option<bool>,
 }
 
 /// What an appraiser established from valid evidence.
@@ -75,6 +90,8 @@ pub struct Claims {
     /// Stable hardware-rooted identity for the DID (04 §5), when the platform
     /// gives one. Android key attestation has none by design (privacy).
     pub hardware_identity: Option<Vec<u8>>,
+    /// PCs: what measured boot showed (`Default` elsewhere).
+    pub boot: BootClaims,
     pub warnings: Vec<String>,
 }
 
@@ -86,11 +103,28 @@ pub struct Claims {
 ///   "software fallback ⇒ tier ≤ D1");
 /// - anything else → D0.
 ///
-/// D3 needs a hardened, runtime-attested platform (Windows 25H2+); no mobile
-/// evidence reaches it.
+/// PCs (a TPM, 03 §4.2 "TPM 2.0 EK chain + measured boot + Secure Boot"):
+/// there is no app attestation, so the rule is the boot and the key:
+///
+/// - the kernel can run unsigned code or a debugger (test-signing, Secure
+///   Boot off, ...) → D0;
+/// - Windows booted measured and locked, and the session key is in the
+///   TPM → D2;
+/// - the session key in the TPM, the OS not measured (Linux) → D1;
+/// - anything else → D0.
+///
+/// D3 needs a hardened, runtime-attested platform (Windows 25H2+,
+/// `GetRuntimeAttestationReport`); nothing here reaches it, HVCI included.
 pub fn device_tier(c: &Claims) -> DeviceTier {
     if c.verified_boot == Some(false) {
         return DeviceTier::D0Unknown;
+    }
+    if c.key_storage == KeyStorage::Tpm {
+        return match (c.verified_boot, c.session_key_in_hw) {
+            (Some(true), true) => DeviceTier::D2Hardware,
+            (None, true) => DeviceTier::D1Software,
+            _ => DeviceTier::D0Unknown,
+        };
     }
     let hw = c.key_storage > KeyStorage::Software;
     match (hw && c.app_attested, c.session_key_in_hw) {
@@ -146,6 +180,7 @@ mod tests {
             session_key_in_hw: true,
             os_patch_level: None,
             hardware_identity: None,
+            boot: BootClaims::default(),
             warnings: vec![],
         }
     }
