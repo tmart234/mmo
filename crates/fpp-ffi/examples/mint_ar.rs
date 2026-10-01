@@ -8,6 +8,10 @@
 //!     cargo run -p fpp-ffi --example mint_ar -- session <seed hex>
 //!     cargo run -p fpp-ffi --example mint_ar -- ar <seed hex> <session public hex> <tier> <out>
 //!         [platform] [issued seconds from now]
+//!
+//! `MINT_AR_DID` and `MINT_AR_BUILD` (64 hex digits each) set the AR's
+//! Device ID (random otherwise) and client build (zeros otherwise), for a
+//! host's device bans and client-build list.
 
 use ed25519_dalek::SigningKey;
 use fpp_crypto::{sign, Ed25519Signer};
@@ -63,14 +67,14 @@ fn main() {
                 cti: rand::random(),
                 cnf: fpp_types::SessionKey::Ed25519(session),
                 nonce: [0; 32],
-                did: Did(rand::random()),
+                did: Did(std::env::var("MINT_AR_DID").map_or_else(|_| rand::random(), |d| hex32(&d))),
                 tier,
                 features: Features {
                     secure_boot: Some(tier >= DeviceTier::D2Hardware),
                     key_in_hw: Some(tier >= DeviceTier::D2Hardware),
                     ..Features::default()
                 },
-                client_build: BuildId([0; 32]),
+                client_build: BuildId(std::env::var("MINT_AR_BUILD").map_or([0; 32], |b| hex32(&b))),
                 platform,
                 policy_ver: 0,
                 warnings: vec!["dev-verifier".into()],

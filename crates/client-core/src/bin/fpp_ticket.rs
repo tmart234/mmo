@@ -11,12 +11,14 @@
 //! gs_noise_static <64 hex>   its fpp_p2p host key (its SARs must name it)
 //! sat <hex>
 //! ar <hex>
+//! liveness_key <64 hex>      the region's Server Liveness key (SARs verify under it)
+//! did <64 hex>               the device's ID in the AR (what a ban names)
 //! ```
 //!
 //! The game joins with `fpp_signer_from_seed(session_seed)` and
 //! `fpp_p2p_joiner_new(gs_noise_static, no invite secret, ...)`, checks the
-//! server's SAR chain (`fpp_sar_chain_*`: it names `gs_noise_static` and the
-//! SAT's audience) and sends `Admit{sat, ar}` (`fpp_control_admit`).
+//! server's SAR chain (`fpp_sar_chain_*` under `liveness_key`: it names
+//! `gs_noise_static`) and sends `Admit{sat, ar}` (`fpp_control_admit`).
 //!
 //! This build has no platform evidence: its AR is tier D0, so it gets
 //! places only in queues open to D0 (`open`).
@@ -101,12 +103,14 @@ async fn main() -> Result<()> {
     };
 
     let text = format!(
-        "fpp-ticket 1\nsession_seed {}\ngs_addr {}\ngs_noise_static {}\nsat {}\nar {}\n",
+        "fpp-ticket 1\nsession_seed {}\ngs_addr {}\ngs_noise_static {}\nsat {}\nar {}\nliveness_key {}\ndid {}\n",
         hex::encode(seed),
         creds.gs_addr,
         hex::encode(creds.gs_noise_static),
         hex::encode(&creds.sat),
         hex::encode(&creds.ar),
+        hex::encode(trust.bundle.server_liveness.to_bytes()),
+        hex::encode(creds.sat_claims.did.0),
     );
     let mut file = {
         let mut o = std::fs::OpenOptions::new();

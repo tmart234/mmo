@@ -36,6 +36,10 @@ path = "src/attestation_exit.rs"
 name = "verified_exit"
 path = "src/verified_exit.rs"
 
+[[bin]]
+name = "dev-cell"
+path = "src/dev_cell.rs"
+
 [dependencies]
 ctrlc = { workspace = true }
 anyhow = { workspace = true }
