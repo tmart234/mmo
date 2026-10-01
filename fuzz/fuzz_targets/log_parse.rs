@@ -1,5 +1,5 @@
 //! Transparency Log inputs from the network or storage (notes, checkpoints,
-//! entry bundles, hybrid COSE_Sign receipts): never panic.
+//! entry bundles, hybrid COSE_Sign receipts, Checkpoint leaves): never panic.
 #![no_main]
 
 use fpp_crypto::{KeyRole, KeySet};
@@ -10,7 +10,7 @@ fuzz_target!(|data: &[u8]| {
     let Some((&selector, body)) = data.split_first() else {
         return;
     };
-    match selector % 4 {
+    match selector % 5 {
         0 => {
             if let Ok(text) = std::str::from_utf8(body) {
                 if let Ok(note) = Note::parse(text) {
@@ -27,6 +27,9 @@ fuzz_target!(|data: &[u8]| {
         }
         2 => {
             let _ = fpp_wire::cose::SignMulti::decode(body);
+        }
+        3 => {
+            let _ = fpp_log::leaf::parse_checkpoint(body);
         }
         _ => {
             let mut keys = KeySet::default();

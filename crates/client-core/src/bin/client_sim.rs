@@ -12,6 +12,16 @@ struct Opts {
     /// The Broker's address.
     #[arg(long, default_value = "127.0.0.1:4446")]
     broker: std::net::SocketAddr,
+    /// The Transparency Log's public address (gossip).
+    #[arg(long, default_value = "127.0.0.1:4447")]
+    log: std::net::SocketAddr,
+    /// Server Liveness's address (split-view reports).
+    #[arg(long, default_value = "127.0.0.1:4444")]
+    liveness: std::net::SocketAddr,
+    /// After the match, check every Checkpoint the server sent against the
+    /// Transparency Log (waiting up to this many seconds for the last).
+    #[arg(long)]
+    check_log: Option<u64>,
     /// Queue to join: `open` (any device) or `verified` (tier D2+).
     #[arg(long, default_value = "open")]
     queue: String,
@@ -30,6 +40,8 @@ async fn main() -> Result<()> {
     let services = Services {
         verifier: opts.verifier,
         broker: opts.broker,
+        log: opts.log,
+        liveness: opts.liveness,
     };
 
     // The GS needs a moment to join Server Liveness and sign its first Checkpoint.
@@ -87,6 +99,7 @@ async fn main() -> Result<()> {
         }
     }
     let sar_seq = game.sar_seq().unwrap_or(0);
+    let (match_id, checked) = (game.match_id(), game.heads.clone());
     game.bye().await?;
     let x = last.as_ref().map_or(0.0, |s| s.you.0);
     println!(
@@ -99,6 +112,28 @@ async fn main() -> Result<()> {
             );
         }
         println!("[CLIENT] smoke test passed");
+    }
+    if let Some(wait) = opts.check_log {
+        let deadline = std::time::Instant::now() + Duration::from_secs(wait);
+        let audit = transparency::audit(
+            &trust,
+            opts.log,
+            opts.liveness,
+            match_id,
+            &checked,
+            deadline,
+        )
+        .await?;
+        println!(
+            "[CLIENT] Transparency Log: {} of {} Checkpoints proven logged (Ed25519 + ML-DSA, witness, inclusion); pending {:?}; split views {:?}",
+            audit.included,
+            checked.len(),
+            audit.pending,
+            audit.split_views
+        );
+        if audit.included != checked.len() {
+            bail!("Checkpoints not proven logged");
+        }
     }
     Ok(())
 }

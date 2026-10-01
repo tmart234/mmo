@@ -27,6 +27,10 @@ struct Opts {
     /// verified but not kept).
     #[arg(long)]
     evidence: Option<std::net::SocketAddr>,
+    /// The Transparency Log's cell address (without one, Checkpoints are not
+    /// logged, and players cannot check theirs).
+    #[arg(long)]
+    log: Option<std::net::SocketAddr>,
     /// TLS certificate (DER) presented to game servers; must chain to the CA they pin.
     #[arg(long, default_value = "keys/liveness_tls.der")]
     tls_cert: String,
@@ -90,6 +94,7 @@ async fn main() -> Result<()> {
             callers: o.callers,
             feed: o.feed,
             evidence: o.evidence,
+            log: o.log,
         },
         config,
     )?;

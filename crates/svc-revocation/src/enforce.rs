@@ -127,7 +127,11 @@ impl Enforcer {
             "note": order.note,
         }))?;
         let record_index = match &self.log {
-            Some(log) => Some(log.append(record.clone()).await.context("log the record")?),
+            Some(log) => Some(
+                log.append(vec![record.clone()])
+                    .await
+                    .context("log the record")?,
+            ),
             None => None,
         };
         let mut id = [0u8; 16];

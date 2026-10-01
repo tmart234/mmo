@@ -3,7 +3,7 @@
 //! fpp-session as reliable-channel messages. Each is `[type, {fields}]` in
 //! deterministic CBOR, capped at [`MAX_CONTROL`] bytes before decoding.
 
-use fpp_types::{Digest, MatchId, Reason};
+use fpp_types::Reason;
 use fpp_wire::cbor::{self, text_map, MapView, Value};
 use fpp_wire::{AdmitPop, WireError};
 use sha2::{Digest as _, Sha256};
@@ -42,11 +42,11 @@ pub enum Control {
         code: u16,
     },
     Bye,
-    /// §7.6: digest of the Checkpoint the server just signed.
+    /// §7.6: the Checkpoint the server just signed (players check it
+    /// against the Transparency Log; signed, so a different one there is a
+    /// proof against the server).
     CheckpointHead {
-        match_id: MatchId,
-        epoch: u32,
-        digest: Digest,
+        checkpoint: Vec<u8>,
     },
     /// §7.4 over fpp-session: the client's signed InputCommit.
     InputCommit {
@@ -133,17 +133,9 @@ impl Control {
                 text_map([("code", Value::Unsigned((*code).into()))]),
             ),
             Control::Bye => (ty::BYE, Value::Map(Vec::new())),
-            Control::CheckpointHead {
-                match_id,
-                epoch,
-                digest,
-            } => (
+            Control::CheckpointHead { checkpoint } => (
                 ty::CHECKPOINT_HEAD,
-                text_map([
-                    ("match_id", b(&match_id.0)),
-                    ("epoch", Value::Unsigned((*epoch).into())),
-                    ("digest", b(&digest.0)),
-                ]),
+                text_map([("checkpoint", b(checkpoint))]),
             ),
             Control::InputCommit { commit } => {
                 (ty::INPUT_COMMIT, text_map([("commit", b(commit))]))
@@ -202,9 +194,7 @@ impl Control {
             },
             ty::BYE => Control::Bye,
             ty::CHECKPOINT_HEAD => Control::CheckpointHead {
-                match_id: MatchId(m.fixed("match_id")?),
-                epoch: m.u32("epoch")?,
-                digest: Digest(m.fixed("digest")?),
+                checkpoint: m.bytes("checkpoint")?.to_vec(),
             },
             ty::INPUT_COMMIT => Control::InputCommit {
                 commit: m.bytes("commit")?.to_vec(),

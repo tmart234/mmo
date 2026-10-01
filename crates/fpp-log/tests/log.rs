@@ -285,3 +285,69 @@ fn witness_cosigns_one_history_only() {
     ));
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn the_cosigned_checkpoint_outlives_appends_and_reopening() {
+    let d = dir("cosigned");
+    let mut log = Log::open(&d, ORIGIN, key(1), 60).unwrap();
+    let mut witness = Witness::open(
+        "witness.test",
+        wkey(9),
+        ORIGIN,
+        log.public_key(),
+        log.ml_dsa_public_key().to_vec(),
+        d.join("w"),
+    )
+    .unwrap();
+    log.set_witnesses(vec![("witness.test".into(), witness.public_key())]);
+    assert_eq!(log.cosigned_checkpoint(), None);
+    log.append(&entries(0, 300), 1).unwrap();
+    let line = witness.cosign(&log.checkpoint(), &[], 10).unwrap();
+    log.add_cosignature(&Note::parse(&log.checkpoint()).unwrap().text, &line)
+        .unwrap();
+    let cosigned = log.cosigned_checkpoint().unwrap();
+    log.append(&entries(300, 5), 2).unwrap();
+    // the published checkpoint moved on; the cosigned one did not
+    assert_ne!(log.checkpoint(), cosigned);
+    assert_eq!(
+        log.cosigned_checkpoint().as_deref(),
+        Some(cosigned.as_str())
+    );
+    let c = Checkpoint::parse(&Note::parse(&cosigned).unwrap().text).unwrap();
+    assert_eq!(c.size, 300);
+    // and entries read back from disk, from anywhere
+    assert_eq!(log.entries(0).unwrap(), entries(0, 305));
+    assert_eq!(log.entries(299).unwrap(), entries(299, 6));
+    // a cosignature for a checkpoint the log has since moved past still
+    // counts (re-signed), and the published checkpoint is left alone
+    let older = log.checkpoint();
+    log.append(&entries(305, 3), 3).unwrap();
+    let proof = log.consistency_proof(300, 305).unwrap();
+    let line = witness.cosign(&older, &proof, 11).unwrap();
+    let published = log.checkpoint();
+    log.add_cosignature(&Note::parse(&older).unwrap().text, &line)
+        .unwrap();
+    assert_eq!(log.checkpoint(), published);
+    let now = Note::parse(&log.cosigned_checkpoint().unwrap()).unwrap();
+    assert_eq!(Checkpoint::parse(&now.text).unwrap().size, 305);
+    now.verify_hybrid(ORIGIN, &log.public_key(), log.ml_dsa_public_key())
+        .unwrap();
+    now.verify_cosignature("witness.test", &witness.public_key())
+        .unwrap();
+    // but not one for a tree this log never had
+    let mut fork = Log::open(d.join("fork"), ORIGIN, key(1), 60).unwrap();
+    fork.append(&entries(1, 5), 1).unwrap();
+    let forged = Note::parse(&fork.checkpoint()).unwrap().text;
+    assert!(matches!(
+        log.add_cosignature(&forged, &line),
+        Err(LogError::Stale)
+    ));
+    let cosigned = log.cosigned_checkpoint().unwrap();
+    drop(log);
+    let log = Log::open(&d, ORIGIN, key(1), 60).unwrap();
+    assert_eq!(
+        log.cosigned_checkpoint().as_deref(),
+        Some(cosigned.as_str())
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}

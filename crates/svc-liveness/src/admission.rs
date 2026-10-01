@@ -26,6 +26,9 @@ use common::{
 pub async fn admit_and_run(incoming: quinn::Incoming, ctx: Ctx) -> Result<()> {
     let deadline = deadline_of(&ctx);
     let o = accept_challenge(incoming, deadline).await?;
+    if o.purpose == common::proto::Purpose::Report {
+        return crate::transparency::report(o, ctx, deadline).await;
+    }
     let (conn, send, mut recv) = (o.conn, o.send, o.recv);
     let jr: JoinRequest = timeout(deadline, recv_msg_max(&mut recv, MAX_JOIN_FRAME))
         .await
@@ -134,6 +137,7 @@ async fn admit_game_server(
             last_seen_ms: now_ms(),
             revoked: false,
             last_checkpoint: None,
+            verified: Vec::new(),
             next_slot: 0,
         },
     );

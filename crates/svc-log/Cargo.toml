@@ -16,6 +16,7 @@ fpp-log = { path = "../fpp-log" }
 fpp-crypto = { path = "../fpp-crypto", features = ["s1h"] }
 fpp-types = { path = "../fpp-types" }
 fpp-svc = { path = "../fpp-svc" }
+common = { path = "../common" }
 
 [[bin]]
 name = "svc-log"

@@ -1,5 +1,5 @@
-# One regional cell of the trust plane (development): the Transparency Log,
-# the Revocation Feed, the Evidence Store, Server Liveness, the Verifier and the Broker, each in
+# One regional cell of the trust plane (development): the Transparency Log
+# and a witness, the Revocation Feed, the Evidence Store, Server Liveness, the Verifier and the Broker, each in
 # its own container with its own key; Enforcement's key in a tool container.
 # Each service mounts only its own directory of the cell (its signing seed,
 # cell identity and public TLS identity), the cell CA certificate, and the
@@ -44,13 +44,13 @@ services:
       - |
         [ -f cellca/ca.der ] && exit 0
         gen_keys
-        for s in liveness verifier broker; do
+        for s in log liveness verifier broker; do
           mv keys/$${s}_tls.der cell/$$s/public_tls.der
           mv keys/$${s}_tls.key.der cell/$$s/public_tls.key.der
           chmod 600 cell/$$s/public_tls.key.der
         done
         mkdir -p cell/public
-        for s in log revocation evidence liveness verifier broker enforcement audit public; do mkdir -p cellca/$$s; done
+        for s in log witness revocation evidence liveness verifier broker enforcement audit public; do mkdir -p cellca/$$s; done
         cp cell/ca.der cellca/
 
   log:
@@ -58,12 +58,27 @@ services:
     networks:
       cell:
         ipv4_address: 172.30.0.13
+    ports:
+      - "4447:4447/udp"
     command: >-
       svc-log --cell /cell --bind 0.0.0.0:7201 --data /cell/log/data
-      --writers revocation,enforcement,liveness
+      --writers revocation,enforcement,liveness --public 0.0.0.0:4447
+      --tls-cert /cell/log/public_tls.der --tls-key /cell/log/public_tls.key.der
     volumes:
       - {type: volume, source: state, target: /cell, read_only: true, volume: {subpath: cellca}}
       - {type: volume, source: state, target: /cell/log, volume: {subpath: cell/log}}
+      - {type: volume, source: state, target: /cell/public, volume: {subpath: cell/public}}
+
+  # Cosigns the log's checkpoints (players count only cosigned ones). In
+  # production a witness is run by someone other than the cell's operator.
+  witness:
+    <<: *service
+    depends_on: [log]
+    networks: [cell]
+    command: svc-witness --cell /cell --log 172.30.0.13:7201 --interval-s 1
+    volumes:
+      - {type: volume, source: state, target: /cell, read_only: true, volume: {subpath: cellca}}
+      - {type: volume, source: state, target: /cell/witness, volume: {subpath: cell/witness}}
       - {type: volume, source: state, target: /cell/public, volume: {subpath: cell/public}}
 
   revocation:
@@ -128,7 +143,7 @@ services:
       - "4444:4444/udp"
     command: >-
       svc-liveness --cell /cell --bind 0.0.0.0:4444 --rpc 0.0.0.0:4454 --feed 172.30.0.14:4460
-      --evidence 172.30.0.15:4470
+      --evidence 172.30.0.15:4470 --log 172.30.0.13:7201
       --tls-cert /cell/liveness/public_tls.der --tls-key /cell/liveness/public_tls.key.der
     volumes:
       - {type: volume, source: state, target: /cell, read_only: true, volume: {subpath: cellca}}
@@ -169,7 +184,7 @@ services:
   # services and Enforcement have published their keys (retried until they have).
   bundle:
     <<: *service
-    depends_on: [liveness, verifier, broker, enforcement-init]
+    depends_on: [witness, liveness, verifier, broker, enforcement-init]
     networks: [cell]
     command: fpp-cell bundle /cell /var/lib/fpp/keys/fpp_key_bundle.json
     volumes:

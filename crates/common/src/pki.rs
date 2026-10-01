@@ -20,8 +20,9 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::{fs, path::Path, sync::Arc};
 
 /// The trust-plane services with public endpoints: Server Liveness (game
-/// servers join it), the Verifier and the Broker (clients).
-pub const PUBLIC_SERVICES: [&str; 3] = ["liveness", "verifier", "broker"];
+/// servers join it), the Verifier and the Broker (clients), and the
+/// Transparency Log (clients check Checkpoints against it).
+pub const PUBLIC_SERVICES: [&str; 4] = ["liveness", "verifier", "broker", "log"];
 
 /// TLS server name of a public service (`liveness.dev`, ...).
 pub fn server_name(service: &str) -> String {

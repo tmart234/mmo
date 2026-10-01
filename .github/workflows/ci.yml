@@ -87,9 +87,10 @@ jobs:
             sleep 2
           done
           $compose ps -a bundle --format '{{.State}} {{.ExitCode}}' | grep -q '^exited 0$'
-          test "$($compose ps --status running --services | sort | tr '\n' ' ')" = "broker evidence liveness log revocation verifier "
+          test "$($compose ps --status running --services | sort | tr '\n' ' ')" = "broker evidence liveness log revocation verifier witness "
           $compose run --rm enforce kick "session:$(printf '07%.0s' $(seq 32))" --note "CI"
           $compose logs revocation | grep -q "log index"
+          $compose logs witness | grep -q "cosigned size"
           $compose logs
       - name: Stop the cell
         if: always()

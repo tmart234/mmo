@@ -14,7 +14,7 @@ use tokio::time::timeout;
 
 use crate::framing::{recv_msg, send_msg_continue};
 use crate::pki::{self, ServerIdentity};
-use crate::proto::{AttestChallenge, ChallengeRequest, ADMISSION_VERSION};
+use crate::proto::{AttestChallenge, ChallengeRequest, Purpose, ADMISSION_VERSION};
 
 /// Default deadline for a new connection to finish the QUIC handshake, the
 /// challenge and its request. Idle connections are dropped (F08).
@@ -27,6 +27,8 @@ pub struct Opened {
     pub send: SendStream,
     pub recv: RecvStream,
     pub challenge: [u8; 32],
+    /// What the peer opened the connection for.
+    pub purpose: Purpose,
 }
 
 /// A public endpoint presenting `identity`, on all interfaces at `bind`'s port.
@@ -87,6 +89,7 @@ pub async fn accept_challenge(incoming: Incoming, deadline: Duration) -> Result<
             send,
             recv,
             challenge,
+            purpose: hello.purpose,
         })
     })
     .await
@@ -96,26 +99,23 @@ pub async fn accept_challenge(incoming: Incoming, deadline: Duration) -> Result<
 /// Peer side: connect to public service `service` at `addr` (its certificate
 /// must chain to `ca_der` and name it) and get its challenge.
 pub async fn request_challenge(ca_der: &[u8], addr: SocketAddr, service: &str) -> Result<Opened> {
-    let bind: SocketAddr = if addr.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    }
-    .parse()?;
-    let endpoint = Endpoint::client(bind)?;
-    let conn = endpoint
-        .connect_with(
-            pki::quic_client_config(ca_der)?,
-            addr,
-            &pki::server_name(service),
-        )?
-        .await
-        .with_context(|| format!("connect to {service} at {addr}"))?;
+    request_challenge_for(ca_der, addr, service, Purpose::Join).await
+}
+
+/// [`request_challenge`] for another `purpose`.
+pub async fn request_challenge_for(
+    ca_der: &[u8],
+    addr: SocketAddr,
+    service: &str,
+    purpose: Purpose,
+) -> Result<Opened> {
+    let conn = connect(ca_der, addr, service).await?;
     let (mut send, mut recv) = conn.open_bi().await?;
     send_msg_continue(
         &mut send,
         &ChallengeRequest {
             version: ADMISSION_VERSION,
+            purpose,
         },
     )
     .await?;
@@ -127,5 +127,41 @@ pub async fn request_challenge(ca_der: &[u8], addr: SocketAddr, service: &str) -
         send,
         recv,
         challenge: nonce,
+        purpose,
     })
+}
+
+/// A QUIC connection to public service `service` at `addr`.
+async fn connect(ca_der: &[u8], addr: SocketAddr, service: &str) -> Result<Connection> {
+    let bind: SocketAddr = if addr.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    }
+    .parse()?;
+    let endpoint = Endpoint::client(bind)?;
+    endpoint
+        .connect_with(
+            pki::quic_client_config(ca_der)?,
+            addr,
+            &pki::server_name(service),
+        )?
+        .await
+        .with_context(|| format!("connect to {service} at {addr}"))
+}
+
+/// One request and its answer to public service `service` at `addr`, with
+/// no challenge (read-only queries, such as gossip to the log).
+pub async fn query<Req: serde::Serialize, Resp: serde::de::DeserializeOwned>(
+    ca_der: &[u8],
+    addr: SocketAddr,
+    service: &str,
+    request: &Req,
+) -> Result<Resp> {
+    let conn = connect(ca_der, addr, service).await?;
+    let (mut send, mut recv) = conn.open_bi().await?;
+    crate::framing::send_msg(&mut send, request).await?;
+    let answer = recv_msg(&mut recv).await;
+    conn.close(0u32.into(), b"done");
+    answer
 }

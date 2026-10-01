@@ -1,10 +1,13 @@
 //! F07: frame lengths are checked against a cap before any allocation.
 
 use common::framing::{decode_frame, frame_len, MAX_CONTROL_FRAME};
-use common::proto::ChallengeRequest;
+use common::proto::{ChallengeRequest, Purpose};
 
 fn hello() -> ChallengeRequest {
-    ChallengeRequest { version: 1 }
+    ChallengeRequest {
+        version: 1,
+        purpose: Purpose::Join,
+    }
 }
 
 fn frame(payload: &[u8]) -> Vec<u8> {

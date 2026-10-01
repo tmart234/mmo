@@ -104,9 +104,12 @@ parties implement exactly one signature algorithm on the hot path.
 Post-quantum: confidentiality (harvest-now-decrypt-later of PII and telemetry)
 is addressed now via hybrid key exchange. Long-lived roots sign hybrid
 (implemented for the Log key), but that buys post-quantum authenticity only
-where the ML-DSA half is verified: in the prototype that is the witness
-alone, since no relying party verifies an S1H object yet and C2SP
-checkpoint verifiers check only the Ed25519 line (07, F22). Short-lived
+where the ML-DSA half is verified: in the prototype that is the witness and
+the Rust client's log check (§7.6), which requires both halves of every
+checkpoint it relies on. The C SDK, game servers and the cell services
+verify no S1H object, witness cosignatures (C2SP `cosignature/v1`) are
+Ed25519, and other C2SP checkpoint verifiers check only the Ed25519 line
+(07, F22). Short-lived
 objects (TTL of seconds to minutes) migrate when platform and hardware
 support allows.
 
@@ -331,7 +334,7 @@ sends `SarUpdate` first; the client checks the SAR (signature, chain, `exp`,
 then sends `Admit{sat, ar}` (empty `pop`); the server answers `Admitted` or
 `Reject`. Hello/HelloAck are unnecessary there: the Noise prologue carries
 the version. Two additional control messages carry evidence on that channel:
-`CheckpointHead = [12, {match_id, epoch, digest}]` (§7.6) and
+`CheckpointHead = [12, {checkpoint: COSE_Sign1}]` (§7.6) and
 `InputCommit = [13, {commit: COSE_Sign1}]` (§7.4).
 
 ### 7.3 Input frames (DATAGRAM)
@@ -404,12 +407,38 @@ ModuleResult = { "id" => tstr, "ver" => uint, "code" => uint, ? "digest" => bstr
 
 ### 7.6 Checkpoint heads
 
-After signing each checkpoint the GS sends `CheckpointHead {match_id, epoch,
-digest}` (digest = SHA-256 of the signed Checkpoint) to every client. The IA
-keeps the last *N* heads and, after the match, submits a random sample through
-`POST /v1/gossip`. The Log answers with an inclusion proof, or with an
-equivocation proof if it holds a different checkpoint for the same
-`(match_id, epoch)`.
+After signing each checkpoint the GS sends `CheckpointHead {checkpoint}`, the
+signed Checkpoint itself, to every client. The client verifies it under the
+instance key its SAR binds (`cnf`) and keeps `(match_id, epoch, digest)`, digest
+= SHA-256 of the signed Checkpoint, with the signed bytes. The head is signed so
+that a different checkpoint in the log is a proof against the server, not the
+client's word.
+
+Server Liveness appends a **checkpoint leaf** for every Checkpoint it verifies
+(§8.2): `"fpp/1/checkpoint-leaf\0" ‖ match_id ‖ u32le(epoch) ‖ digest`.
+
+During the match or right after it, the IA asks the Log about its heads
+(`POST /v1/gossip`, `{match_id, epoch, digest}`). The Log answers against its
+latest witness-cosigned checkpoint:
+
+- `Included {checkpoint, index, proof}`: the head is logged.
+- `Conflict {checkpoint, index, logged, proof}`: the leaf at `index` names
+  another digest for this `(match_id, epoch)`.
+- `Pending`: not in a cosigned checkpoint yet; ask again before the MMD.
+
+The IA verifies the checkpoint note under **both** halves of the Log's hybrid
+key (Ed25519 and ML-DSA-65, FPP-S1H), requires a cosignature from a witness in
+its key bundle, rebuilds the leaf and checks the inclusion proof against the
+note's root. A `Conflict` that verifies is a split view: two Checkpoints signed
+by the same instance key for the same `(match_id, epoch)`. The IA sends its
+signed Checkpoint to Server Liveness (`EquivocationReport`); Server Liveness
+checks it is the match's instance key, the epoch's logged digest differs,
+logs an **equivocation leaf** (`"fpp/1/equivocation\0" ‖ match_id ‖
+u32le(epoch) ‖ logged ‖ reported`), revokes the instance (no more SARs) and
+answers `Revoked`. Every player of that server is gone within one SAR
+lifetime (EVD-03). A head still `Pending` after the MMD proves nothing on its
+own (the server may never have submitted it), but is reportable to the
+title's support channel.
 
 ### 7.7 Player-hosted sessions (P2P profile)
 
@@ -561,6 +590,9 @@ LogReceipt = {                         ; fpp-ctx "fpp/1/log-receipt"
 - A `LogReceipt` is a promise of inclusion within `mmd_s`. Failure to include is
   itself provable misbehavior by the log.
 - Proof APIs: inclusion (`leaf_hash`, tree size) and consistency (two tree sizes).
+- Prototype: Server Liveness, which verifies every Checkpoint, appends one
+  checkpoint leaf per Checkpoint (§7.6) instead of `HostBatch`es, and the Log
+  serves players' gossip on a public endpoint. One witness.
 
 ### 8.3 Evidence Store
 
@@ -672,7 +704,8 @@ action = &( kick: 0, deny_admission: 1, downgrade_tier: 2, segregate: 3,
 | `POST /v1/server/attest` | GS / Host Agent | CVM or measured-boot evidence → `SAR` (then renewed on a stream) |
 | `POST /v1/log/add` | Host Agent | `HostBatch` → `LogReceipt` |
 | `GET /tile/...`, `/checkpoint` | anyone authorized | C2SP tiles and tree heads |
-| `POST /v1/gossip` | IA | sampled `CheckpointHead`s → inclusion or equivocation proofs |
+| `POST /v1/gossip` | IA | `{match_id, epoch, digest}` of a `CheckpointHead` → inclusion or conflict proof against a cosigned checkpoint (§7.6) |
+| `POST /v1/report` (Server Liveness) | IA | `EquivocationReport {checkpoint}` → `Revoked` or `Rejected` (§7.6) |
 
 Verifier nonces are single-use (atomic check-and-delete in the regional nonce
 store) and expire after 60 s (ATT-02).

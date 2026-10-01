@@ -1,5 +1,6 @@
-//! A development cell on this machine: the Transparency Log, the Revocation
-//! Feed, the Evidence Store, Server Liveness, the Verifier and the Broker as separate
+//! A development cell on this machine: the Transparency Log and its
+//! witness, the Revocation Feed, the Evidence Store, Server Liveness, the
+//! Verifier and the Broker as separate
 //! processes, each with its own key in `cell/<service>/`, calling each
 //! other over the cell's mutual TLS; the public ones (Liveness, Verifier,
 //! Broker) with their own certificates in `keys/`. Enforcement's key is
@@ -13,8 +14,9 @@ use std::time::{Duration, Instant};
 
 pub const CELL_DIR: &str = "cell";
 /// The services a dev cell runs, in start order (each after those it calls).
-pub const SERVICES: [&str; 6] = [
+pub const SERVICES: [&str; 7] = [
     "log",
+    "witness",
     "revocation",
     "evidence",
     "liveness",
@@ -22,8 +24,9 @@ pub const SERVICES: [&str; 6] = [
     "broker",
 ];
 /// Cell identities: the services, Enforcement and auditors (tools).
-pub const IDENTITIES: [&str; 8] = [
+pub const IDENTITIES: [&str; 9] = [
     "log",
+    "witness",
     "revocation",
     "evidence",
     "liveness",
@@ -35,6 +38,8 @@ pub const IDENTITIES: [&str; 8] = [
 
 /// Cell addresses of the internal services.
 pub const LOG_ADDR: &str = "127.0.0.1:7201";
+/// The log's public address (players' gossip).
+pub const LOG_PUBLIC_ADDR: &str = "127.0.0.1:4447";
 pub const FEED_ADDR: &str = "127.0.0.1:4460";
 pub const EVIDENCE_ADDR: &str = "127.0.0.1:4470";
 
@@ -48,10 +53,20 @@ fn args(service: &str) -> Vec<String> {
             "cell/log/data",
             "--writers",
             "revocation,enforcement,liveness",
+            "--public",
+            LOG_PUBLIC_ADDR,
         ],
+        "witness" => &["--log", LOG_ADDR, "--interval-s", "1"],
         "revocation" => &["--bind", FEED_ADDR, "--log", LOG_ADDR],
         "evidence" => &["--bind", EVIDENCE_ADDR],
-        "liveness" => &["--feed", FEED_ADDR, "--evidence", EVIDENCE_ADDR],
+        "liveness" => &[
+            "--feed",
+            FEED_ADDR,
+            "--evidence",
+            EVIDENCE_ADDR,
+            "--log",
+            LOG_ADDR,
+        ],
         "broker" => &["--feed", FEED_ADDR],
         _ => &[],
     };
@@ -180,10 +195,12 @@ impl Cell {
         let deadline = Instant::now() + Duration::from_secs(30);
         let bundle = loop {
             cell.check_running()?;
+            // (the log's witness too: players count only cosigned checkpoints)
             match fpp_svc::keys::bundle(Path::new(CELL_DIR)) {
-                Ok(b) => break b,
+                Ok(b) if b.log.as_ref().is_some_and(|l| !l.witnesses.is_empty()) => break b,
+                Ok(_) if Instant::now() > deadline => bail!("the log's witness published no key"),
                 Err(e) if Instant::now() > deadline => return Err(e),
-                Err(_) => std::thread::sleep(Duration::from_millis(100)),
+                _ => std::thread::sleep(Duration::from_millis(100)),
             }
         };
         bundle.save(common::keys::DEFAULT_BUNDLE)?;

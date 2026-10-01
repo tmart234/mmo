@@ -78,6 +78,9 @@ pub struct MatchConfig {
     pub min_tier: DeviceTier,
     /// No SAR for this long: kick everyone (default [`SAR_GRACE_MS`]).
     pub sar_grace_ms: u64,
+    /// Test only: from this epoch on, show players another Checkpoint than
+    /// the one sent to Server Liveness (a rogue server's split view).
+    pub equivocate_from: Option<u32>,
 }
 
 pub struct Match {
@@ -494,11 +497,17 @@ impl Match {
         let digest = fpp_crypto::object_digest(&signed);
         self.prev_checkpoint = digest;
         self.next_checkpoint_epoch = epoch + 1;
-        let head = Control::CheckpointHead {
-            match_id: self.cfg.match_id,
-            epoch,
-            digest,
+        // (test only: a rogue server shows its players another Checkpoint
+        // than the one it gives Server Liveness: a split view)
+        let shown = match self.cfg.equivocate_from {
+            Some(from) if epoch >= from => {
+                let mut other = cp.clone();
+                other.state_root.0[0] ^= 1;
+                fpp_crypto::sign(&self.cfg.instance, &other)
+            }
+            _ => signed.clone(),
         };
+        let head = Control::CheckpointHead { checkpoint: shown };
         let peers: Vec<u32> = self.players.values().map(|p| p.peer).collect();
         for peer in peers {
             self.control(peer, &head);

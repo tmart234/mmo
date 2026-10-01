@@ -21,13 +21,17 @@ Client <-> GS <-> trust plane, speaking the Fair-Play Protocol (FPP v1).
     Log first.
   - **Evidence Store** (`svc-evidence`) keeps the Checkpoints Server
     Liveness verified, content addressed, for auditors (`fpp-evidence`).
-  - **Transparency Log** and its **witness** (`svc-log`, `svc-witness`).
+  - **Transparency Log** and its **witness** (`svc-log`, `svc-witness`):
+    revocation events, enforcement records and every Checkpoint Server
+    Liveness verified; players check theirs against it.
 - **GS** – runs the match. Clients join over **fpp-session** (Noise over UDP,
   ADR-002): the GS shows its current SAR, checks `Admit{SAT, AR}`, applies
   clients' *intent* (never positions), and signs a Checkpoint per epoch.
 - **Client** – refuses to play unless the GS's SAR chain certifies the exact
   key it connected to, and stops the moment that chain lapses. It commits to
-  its inputs every epoch with a signed **InputCommit**.
+  its inputs every epoch with a signed **InputCommit**, and checks the
+  Checkpoints the GS showed it against the Transparency Log: a different
+  one there is a split view, which it reports and Server Liveness revokes.
 
 Flow:
 1. **GS join** (QUIC, TLS 1.3 with X25519MLKEM768, to Server Liveness):

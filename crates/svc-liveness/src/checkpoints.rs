@@ -2,7 +2,8 @@
 //! key certified in this session's SARs, be for this session's match, and
 //! extend the `prev` chain epoch by epoch. Anything else is misbehavior and
 //! revokes the instance. Verified Checkpoints go to the Evidence Store
-//! ([`crate::evidence`]).
+//! ([`crate::evidence`]), and a leaf naming each to the Transparency Log
+//! ([`crate::transparency`]), where players check theirs.
 
 use anyhow::{bail, Result};
 use common::framing::recv_msg;
@@ -84,8 +85,10 @@ pub fn spawn_checkpoint_listener(conn: &Connection, ctx: Ctx, session_id: [u8; 1
                 }
             };
             ctx.keep_evidence(session_id, submit.checkpoint);
+            ctx.log_entry(fpp_log::leaf::checkpoint(&session_id, epoch, &digest.0));
             if let Some(mut s) = ctx.sessions.get_mut(&session_id) {
                 s.last_checkpoint = Some((epoch, digest));
+                s.verified.push(digest);
                 s.last_seen_ms = common::crypto::now_ms();
             }
         }
