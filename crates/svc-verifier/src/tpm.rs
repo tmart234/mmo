@@ -187,6 +187,8 @@ pub fn appraise_tpm(
             hvci: windows.hvci,
             iommu: windows.dma_protection,
         },
+        // (Windows does not measure the game: the build is self-reported)
+        app: None,
         warnings,
     };
     Ok((

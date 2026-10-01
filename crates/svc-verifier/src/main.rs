@@ -41,6 +41,16 @@ struct Opts {
     /// it, TPM evidence earns D0.
     #[arg(long)]
     tpm_ek_roots: Option<PathBuf>,
+    /// The app's Play Integrity response keys from the Play Console: a file
+    /// with the decryption key and the verification key (base64), one per
+    /// line. Set: Android D2 needs a MEETS_STRONG_INTEGRITY verdict.
+    #[arg(long)]
+    play_integrity_keys: Option<PathBuf>,
+    /// The client Build Registry: lines `<build id hex> <app id> <version>`
+    /// (e.g. `android:com.halo.decomp 42`). Set: an attested build must be
+    /// in it, and the AR states the registry's build id.
+    #[arg(long)]
+    client_builds: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -58,6 +68,24 @@ async fn main() -> Result<()> {
         &o.apple_app_ids,
         o.apple_allow_development,
     )?;
+    if let Some(path) = &o.play_integrity_keys {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+        let (Some(decryption), Some(verification)) = (lines.next(), lines.next()) else {
+            anyhow::bail!("--play-integrity-keys: two lines (decryption, verification key)");
+        };
+        attestation.play_integrity = Some(
+            attest_android::integrity::IntegrityKeys::from_console(decryption, verification)
+                .map_err(|e| anyhow::anyhow!("--play-integrity-keys: {e}"))?,
+        );
+    }
+    if let Some(path) = &o.client_builds {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        attestation.client_builds = svc_verifier::appraisal::ClientBuilds::parse(&text)
+            .with_context(|| format!("--client-builds {}", path.display()))?;
+    }
     if let Some(path) = &o.tpm_ek_roots {
         let pem =
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
@@ -66,10 +94,12 @@ async fn main() -> Result<()> {
     }
     let on = |b: bool| if b { "on" } else { "off" };
     println!(
-        "[verifier] client evidence: android {}, apple {}, TPM {} manufacturer root(s)",
+        "[verifier] client evidence: android {} (Play Integrity {}), apple {}, TPM {} manufacturer root(s); client Build Registry: {} build(s)",
         on(attestation.android.is_some()),
+        on(attestation.play_integrity.is_some()),
         on(attestation.apple.is_some()),
-        attestation.tpm_ek_roots.len()
+        attestation.tpm_ek_roots.len(),
+        attestation.client_builds.builds.len()
     );
     let identity = common::pki::ServerIdentity::load(&o.tls_cert, &o.tls_key)?;
     let (verifier, endpoint) = svc_verifier::start(&o.cell, &identity, o.bind, attestation)?;

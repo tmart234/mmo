@@ -192,6 +192,14 @@ fn tee_key_with_software_session_key_is_d1() {
     assert!(!c.session_key_in_hw);
     assert_eq!(c.os_patch_level, Some(202608));
     assert_eq!(device_tier(&c), DeviceTier::D1Software);
+    // the app and its versionCode, for the client Build Registry
+    assert_eq!(
+        c.app,
+        Some(attest_core::AttestedApp {
+            id: format!("android:{PACKAGE}"),
+            version: 42,
+        })
+    );
 }
 
 #[test]

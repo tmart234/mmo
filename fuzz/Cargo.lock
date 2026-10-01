@@ -64,6 +64,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "attest-android"
+version = "0.1.0"
+dependencies = [
+ "attest-core",
+ "aws-lc-rs",
+ "serde_json",
+]
+
+[[package]]
 name = "attest-core"
 version = "0.1.0"
 dependencies = [
@@ -801,6 +810,7 @@ dependencies = [
 name = "mmo-fuzz"
 version = "0.0.0"
 dependencies = [
+ "attest-android",
  "attest-tpm",
  "bincode",
  "common",

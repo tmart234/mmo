@@ -140,9 +140,28 @@ quirks.
    iOS stays D1: an App Attest key signs only assertions, so the session
    key is a separate key, and App Attest cannot prove it is in the Secure
    Enclave.
-3. **Play Integrity** (Android): a server-side decrypted verdict for
-   `MEETS_STRONG_INTEGRITY` and device recall, for bans that survive
-   reinstalls.
+3. ✅ **Play Integrity** (Android, `attest_android::integrity`): the app
+   requests a token with `nonce = base64url(attest_challenge(...))` and
+   sends it beside the key attestation chain
+   (`fpp_evidence_android_key_integrity`). The Verifier decrypts it itself
+   with the app's response keys (`--play-integrity-keys`; JWE `A256KW` /
+   `A256GCM`), checks Google's ES256 signature, the nonce, freshness (10
+   min), `PLAY_RECOGNIZED`, the package and signing certificate, and that
+   its `versionCode` is the build key attestation reported. With the keys
+   configured, D2 needs `MEETS_STRONG_INTEGRITY` (03 §4.2); a missing,
+   rejected or merely `MEETS_DEVICE_INTEGRITY` verdict caps the device at
+   D1, no device integrity is D0; the AR carries `strong_integrity`.
+   Tests mint tokens as Google does (forged signature, another app's keys,
+   tampered, stale, replayed, wrong app or signer). Open: device recall
+   (beta), and a real token from a device.
+3b. ✅ **Client Build Registry** (`svc-verifier --client-builds`, lines
+   `<build id> <app id> <version>`): where the platform attests the app and
+   its version (Android key attestation's package and versionCode), the AR
+   states the registry's build id instead of the client's claim, and a
+   version we did not build caps the device at D1 (`build-unregistered`).
+   So a revoked build (Enforcement, `build:<id>`) is refused by the Broker
+   on evidence, not on the client's word. Where nothing attests the build
+   (Windows, iOS), the claim stands, warned `build-not-attested`.
 4. ✅ **`attest-tpm`** (game servers and PC clients). Done, in
    `crates/attest-tpm`:
    - `TPMS_ATTEST` quotes, verified with the AK's `TPMT_PUBLIC` (RSA-SSA,

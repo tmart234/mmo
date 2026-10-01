@@ -54,8 +54,13 @@ impl core::fmt::Display for EvidenceError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Evidence {
     /// Android Keystore key attestation: the certificate chain of a key made
-    /// with the attestation challenge, leaf first (`x5c`).
-    AndroidKey { chain: Vec<Vec<u8>> },
+    /// with the attestation challenge, leaf first (`x5c`), and optionally a
+    /// Play Integrity token requested with the same challenge as its nonce
+    /// (`pit`).
+    AndroidKey {
+        chain: Vec<Vec<u8>>,
+        integrity: Option<String>,
+    },
     /// Apple App Attest: the attestation object from `attestKey` (`att`),
     /// sent once per app key.
     AppleAppAttest { attestation: Vec<u8> },
@@ -99,13 +104,17 @@ impl Evidence {
 
     pub fn encode(&self) -> Vec<u8> {
         let v = match self {
-            Evidence::AndroidKey { chain } => cbor::text_map([
-                ("fmt", Value::text(Self::FMT_ANDROID_KEY)),
-                (
+            Evidence::AndroidKey { chain, integrity } => {
+                let fmt = ("fmt", Value::text(Self::FMT_ANDROID_KEY));
+                let x5c = (
                     "x5c",
                     Value::Array(chain.iter().map(|c| Value::bytes(c.clone())).collect()),
-                ),
-            ]),
+                );
+                match integrity {
+                    Some(token) => cbor::text_map([fmt, x5c, ("pit", Value::text(token))]),
+                    None => cbor::text_map([fmt, x5c]),
+                }
+            }
             Evidence::AppleAppAttest { attestation } => cbor::text_map([
                 ("att", Value::bytes(attestation.clone())),
                 ("fmt", Value::text(Self::FMT_APPLE_ATTEST)),
@@ -180,7 +189,16 @@ impl Evidence {
                     .map(|c| c.as_bytes().map(<[u8]>::to_vec))
                     .collect::<Option<Vec<_>>>()
                     .ok_or(EvidenceError("x5c entry"))?;
-                Ok(Some(Evidence::AndroidKey { chain }))
+                let integrity = match m.field("pit") {
+                    Ok(t) => Some(
+                        t.as_text()
+                            .filter(|t| t.len() <= 8 * 1024)
+                            .ok_or(EvidenceError("pit"))?
+                            .to_string(),
+                    ),
+                    Err(_) => None,
+                };
+                Ok(Some(Evidence::AndroidKey { chain, integrity }))
             }
             Self::FMT_APPLE_ATTEST => Ok(Some(Evidence::AppleAppAttest {
                 attestation: bytes_of("att")?,

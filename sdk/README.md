@@ -17,12 +17,19 @@ cannot be replayed into another admission or used for another session key. Wrap 
 `fpp_evidence_apple_attest` or `fpp_evidence_apple_assert`, and send it as
 `EvidenceRequest.evidence` to the Verifier.
 
+On Android, add a Play Integrity token (`FppKeyAttestation.integrityToken`,
+`fpp_evidence_android_key_integrity`): a Verifier with the app's response
+keys (`--play-integrity-keys`) decrypts and verifies it itself and needs
+`MEETS_STRONG_INTEGRITY` for D2.
+
 The Verifier needs the app's identity to accept the evidence:
 
 ```bash
 svc-verifier --android-app com.halo.decomp:<sha256 of the signing certificate> \
              --android-status attestation_status.json \
-             --apple-app-id TEAMID.com.halo.decomp
+             --apple-app-id TEAMID.com.halo.decomp \
+             --play-integrity-keys play_integrity_keys.txt \
+             --client-builds client_builds.txt   # <build id> android:com.halo.decomp <versionCode>
 # refresh the revocation list daily:
 curl -sSo attestation_status.json https://android.googleapis.com/attestation/status
 ```

@@ -411,7 +411,9 @@ dependencies = [
 name = "attest-android"
 version = "0.1.0"
 dependencies = [
+ "attest-android",
  "attest-core",
+ "aws-lc-rs",
  "fpp-types",
  "rcgen",
  "serde_json",
@@ -5630,6 +5632,7 @@ dependencies = [
  "hex",
  "quinn",
  "rand 0.8.8",
+ "serde_json",
  "sha2",
  "tokio",
 ]

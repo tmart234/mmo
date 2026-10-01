@@ -26,6 +26,7 @@ fn free_addr() -> SocketAddr {
 }
 
 struct TestCell {
+    broker: std::sync::Arc<svc_broker::Broker>,
     services: Services,
     trust: ClientTrust,
     liveness: svc_liveness::ctx::Ctx,
@@ -92,10 +93,12 @@ async fn start(dir: &Path) -> TestCell {
     ));
     tokio::spawn(
         broker
+            .clone()
             .serve(common::admission::server_endpoint(pki.service("broker"), broker_addr).unwrap()),
     );
 
     TestCell {
+        broker,
         services: Services {
             verifier: verifier_addr,
             broker: broker_addr,
@@ -140,6 +143,10 @@ fn refused(answer: MatchAnswer) -> u16 {
 
 /// An AR for `session`, signed by `key`.
 fn ar(key: &Ed25519Signer, session: &Ed25519Signer) -> Vec<u8> {
+    ar_for_build(key, session, [0; 32])
+}
+
+fn ar_for_build(key: &Ed25519Signer, session: &Ed25519Signer, build: [u8; 32]) -> Vec<u8> {
     let now = now_ms() / 1000;
     fpp_crypto::sign(
         key,
@@ -153,7 +160,7 @@ fn ar(key: &Ed25519Signer, session: &Ed25519Signer) -> Vec<u8> {
             did: Did([2; 32]),
             tier: DeviceTier::D3Hardened,
             features: Features::default(),
-            client_build: BuildId([0; 32]),
+            client_build: BuildId(build),
             platform: "linux".into(),
             policy_ver: 1,
             warnings: vec![],
@@ -218,6 +225,30 @@ async fn a_cell_of_three_services() {
         Reason::PopInvalid as u16
     );
     // (and by its own key: granted, the next slot)
+    match ask_broker(&cell, &good, &session).await {
+        MatchAnswer::Granted { .. } => {}
+        other => panic!("{other:?}"),
+    }
+
+    // a build Enforcement denied (the AR's build is attested where the
+    // Verifier has a client Build Registry): refused, other builds not
+    let now = now_ms() / 1000;
+    cell.broker.on_revocation(fpp_wire::RevocationEvent {
+        id: [3; 16],
+        subject_kind: fpp_wire::SubjectKind::Build,
+        subject_id: vec![0xbb; 32],
+        action: fpp_wire::Action::DenyAdmission,
+        scope: Default::default(),
+        effective_at: now,
+        expires_at: None,
+        reason: Reason::PolicyKick as u16,
+        record: fpp_types::Digest::default(),
+    });
+    let denied = ar_for_build(&verifier, &session, [0xbb; 32]);
+    assert_eq!(
+        refused(ask_broker(&cell, &denied, &session).await),
+        Reason::Revoked as u16
+    );
     match ask_broker(&cell, &good, &session).await {
         MatchAnswer::Granted { .. } => {}
         other => panic!("{other:?}"),

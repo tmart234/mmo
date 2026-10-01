@@ -21,6 +21,12 @@
 //      2. key       = FppKeyAttestation.attestEndorsement(challenge, ...)
 //      3. evidence  = fpp_evidence_android_key(key.chain)
 //
+// With either, a Play Integrity verdict (a Verifier with the app's
+// response keys needs MEETS_STRONG_INTEGRITY for D2):
+//      nonce    = base64url(fpp_attest_challenge_key(verifier_challenge, session_pub))
+//      token    = FppKeyAttestation.integrityToken(context, nonce)
+//      evidence = fpp_evidence_android_key_integrity(key.chain, token)
+//
 // Send the evidence in the EvidenceRequest; the Verifier appraises it
 // (crates/attest-android).
 package dev.fpp.attest
@@ -31,6 +37,10 @@ import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.security.keystore.StrongBoxUnavailableException
+import android.util.Base64
+import com.google.android.play.core.integrity.IntegrityManagerFactory
+import com.google.android.play.core.integrity.IntegrityTokenRequest
+import com.google.android.gms.tasks.Tasks
 import java.math.BigInteger
 import java.security.KeyPairGenerator
 import java.security.KeyStore
@@ -136,6 +146,18 @@ object FppKeyAttestation {
             sign()
         }
         return if (ed25519) sig else derToRawEcdsa(sig)
+    }
+
+    /**
+     * A Play Integrity token (classic request) whose nonce is [challenge]
+     * (32 bytes from fpp_attest_challenge_key), base64url without padding.
+     * Blocks: call it off the main thread.
+     */
+    fun integrityToken(context: Context, challenge: ByteArray): String {
+        require(challenge.size == 32) { "challenge must be 32 bytes" }
+        val nonce = Base64.encodeToString(challenge, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+        val request = IntegrityTokenRequest.builder().setNonce(nonce).build()
+        return Tasks.await(IntegrityManagerFactory.create(context).requestIntegrityToken(request)).token()
     }
 
     /** DER `SEQUENCE { INTEGER r, INTEGER s }` → r ‖ s, 32 bytes each. */

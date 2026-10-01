@@ -86,7 +86,13 @@ impl Verifier {
         }
 
         // Platform evidence, bound to this challenge and session key.
-        match appraisal::appraise(&self.attestation, challenge, &session_key, &req.evidence) {
+        match appraisal::appraise(
+            &self.attestation,
+            challenge,
+            &session_key,
+            &req.client_build,
+            &req.evidence,
+        ) {
             appraisal::Outcome::Done(appraised) => {
                 Step::Answer(self.issue(challenge, req, session_key, appraised))
             }
@@ -149,7 +155,7 @@ impl Verifier {
             did,
             tier: appraised.tier,
             features: appraised.features,
-            client_build: BuildId(req.client_build),
+            client_build: BuildId(appraised.client_build.unwrap_or(req.client_build)),
             platform: appraised
                 .platform
                 .map_or_else(|| req.platform.clone(), str::to_string),

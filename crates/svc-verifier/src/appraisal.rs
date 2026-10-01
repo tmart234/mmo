@@ -31,6 +31,11 @@ pub struct ClientAttestation {
     /// TPM manufacturers' roots (DER): EK certificates must chain to one.
     /// Empty: TPM evidence earns D0.
     pub tpm_ek_roots: Vec<Vec<u8>>,
+    /// The app's Play Integrity response keys. Set: Android D2 needs a
+    /// `MEETS_STRONG_INTEGRITY` verdict as well as key attestation.
+    pub play_integrity: Option<attest_android::integrity::IntegrityKeys>,
+    /// The client Build Registry. Empty: builds are self-reported.
+    pub client_builds: ClientBuilds,
 }
 
 impl ClientAttestation {
@@ -79,6 +84,8 @@ impl ClientAttestation {
             apple,
             apple_keys: DashMap::new(),
             tpm_ek_roots: Vec::new(),
+            play_integrity: None,
+            client_builds: ClientBuilds::default(),
         })
     }
 }
@@ -92,6 +99,9 @@ pub struct Appraised {
     pub features: Features,
     /// Hardware-rooted identity for the DID, when the platform gives one.
     pub identity: Option<Vec<u8>>,
+    /// The build the evidence attests (from the client Build Registry),
+    /// which the AR states instead of the client's own claim.
+    pub client_build: Option<[u8; 32]>,
     pub warnings: Vec<String>,
 }
 
@@ -101,6 +111,7 @@ fn unrooted(warning: String) -> Appraised {
         tier: DeviceTier::D0Unknown,
         features: Features::default(),
         identity: None,
+        client_build: None,
         warnings: vec![warning],
     }
 }
@@ -123,7 +134,7 @@ fn now() -> (i64, u32) {
     (secs, (year * 100 + month) as u32)
 }
 
-fn features(c: &Claims, now_yyyymm: u32) -> Features {
+fn features(c: &Claims, strong_integrity: Option<bool>, now_yyyymm: u32) -> Features {
     Features {
         secure_boot: c.verified_boot,
         measured_boot: c.boot.measured_boot,
@@ -133,10 +144,159 @@ fn features(c: &Claims, now_yyyymm: u32) -> Features {
         key_in_hw: Some(c.session_key_in_hw),
         app_attested: Some(c.app_attested),
         strongbox: (c.key_storage == KeyStorage::StrongBox).then_some(true),
+        strong_integrity,
         os_patch_age_days: c
             .os_patch_level
             .map(|p| u64::from(attest_core::patch_age_months(p, now_yyyymm)) * 30),
         ..Features::default()
+    }
+}
+
+/// Claims, and what else bounds the tier.
+struct Assessed {
+    claims: Claims,
+    /// The highest tier the rest of the evidence allows.
+    max_tier: DeviceTier,
+    /// Play Integrity's `MEETS_STRONG_INTEGRITY`, when a verdict was checked.
+    strong_integrity: Option<bool>,
+}
+
+impl Assessed {
+    fn of(claims: Claims) -> Self {
+        Assessed {
+            claims,
+            max_tier: DeviceTier::D3Hardened,
+            strong_integrity: None,
+        }
+    }
+
+    fn cap(&mut self, tier: DeviceTier, warning: String) {
+        self.max_tier = self.max_tier.min(tier);
+        self.claims.warnings.push(warning);
+    }
+}
+
+/// How old a Play Integrity verdict may be.
+pub const INTEGRITY_MAX_AGE_MS: u64 = 10 * 60 * 1000;
+
+/// Play Integrity on top of key attestation (03 §4.2: Android D2 is
+/// `MEETS_STRONG_INTEGRITY` + key attestation). With response keys
+/// configured, a missing or rejected verdict, or one short of strong
+/// integrity, caps the device at D1; a device Google does not recognise is
+/// D0.
+fn play_integrity(
+    cfg: &ClientAttestation,
+    a: &mut Assessed,
+    token: Option<&str>,
+    nonce: &[u8; 32],
+    now_unix: i64,
+) {
+    let (Some(keys), Some(policy)) = (&cfg.play_integrity, &cfg.android) else {
+        return;
+    };
+    let Some(token) = token else {
+        a.cap(DeviceTier::D1Software, "no-play-integrity".into());
+        return;
+    };
+    let now_ms = (now_unix.max(0) as u64) * 1000;
+    match attest_android::integrity::verify(
+        token,
+        keys,
+        nonce,
+        &policy.apps,
+        now_ms,
+        INTEGRITY_MAX_AGE_MS,
+    ) {
+        Ok(v) => {
+            a.strong_integrity = Some(v.strong);
+            if !v.device {
+                a.claims.verified_boot = Some(false);
+                a.claims.warnings.push("device-integrity-failed".into());
+            } else if !v.strong {
+                a.cap(DeviceTier::D1Software, "integrity-not-strong".into());
+            }
+            // (the two attest the same install: the same build)
+            if let (Some(app), Some(code)) = (&a.claims.app, v.version_code) {
+                if app.version != code {
+                    a.cap(
+                        DeviceTier::D0Unknown,
+                        "play-integrity-version-differs".into(),
+                    );
+                }
+            }
+        }
+        Err(e) => a.cap(
+            DeviceTier::D1Software,
+            format!("play-integrity-rejected: {e}"),
+        ),
+    }
+}
+
+/// The client Build Registry (P3): which attested app versions are builds
+/// we made, as `(app id, version) → build id` (`svc-verifier
+/// --client-builds`: lines `<build id hex> <app id> <version>`, e.g.
+/// `4f…  android:com.halo.decomp 42`).
+#[derive(Clone, Debug, Default)]
+pub struct ClientBuilds {
+    pub builds: std::collections::HashMap<(String, u64), [u8; 32]>,
+}
+
+impl ClientBuilds {
+    pub fn parse(text: &str) -> anyhow::Result<Self> {
+        let mut builds = std::collections::HashMap::new();
+        for line in text.lines() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let [id, app, version] = f.as_slice() else {
+                anyhow::bail!("client build line: {line}");
+            };
+            let id: [u8; 32] = hex::decode(id)?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("build id must be 32 bytes: {line}"))?;
+            builds.insert((app.to_string(), version.parse()?), id);
+        }
+        Ok(ClientBuilds { builds })
+    }
+}
+
+/// The tier, features, identity and build of assessed evidence. With a
+/// client Build Registry, an attested build must be in it (else the device
+/// is capped at D1: the binary is not one we built); evidence that attests
+/// no build leaves the client's claim, marked as such.
+fn finish(
+    cfg: &ClientAttestation,
+    mut a: Assessed,
+    claimed_build: &[u8; 32],
+    now_yyyymm: u32,
+) -> Appraised {
+    let mut client_build = None;
+    if !cfg.client_builds.builds.is_empty() {
+        match &a.claims.app {
+            Some(app) => match cfg.client_builds.builds.get(&(app.id.clone(), app.version)) {
+                Some(id) => {
+                    if id != claimed_build {
+                        a.claims.warnings.push("build-claim-differs".into());
+                    }
+                    client_build = Some(*id);
+                }
+                None => a.cap(
+                    DeviceTier::D1Software,
+                    format!("build-unregistered: {} {}", app.id, app.version),
+                ),
+            },
+            None => a.claims.warnings.push("build-not-attested".into()),
+        }
+    }
+    Appraised {
+        platform: Some(a.claims.platform),
+        tier: device_tier(&a.claims).min(a.max_tier),
+        features: features(&a.claims, a.strong_integrity, now_yyyymm),
+        identity: a.claims.hardware_identity.clone(),
+        client_build,
+        warnings: a.claims.warnings,
     }
 }
 
@@ -147,22 +307,25 @@ fn appraise_evidence(
     session_pub: &[u8],
     now_unix: i64,
     now_yyyymm: u32,
-) -> Result<Claims, AttestError> {
+) -> Result<Assessed, AttestError> {
     let challenge = &attest_challenge(verifier_challenge, session_pub);
     match evidence {
-        Evidence::AndroidKey { chain } => {
+        Evidence::AndroidKey { chain, integrity } => {
             let policy = cfg
                 .android
                 .as_ref()
                 .ok_or(AttestError::Policy("no Android policy on this Verifier"))?;
-            attest_android::appraise(
+            let claims = attest_android::appraise(
                 &chain,
                 verifier_challenge,
                 session_pub,
                 policy,
                 now_unix,
                 now_yyyymm,
-            )
+            )?;
+            let mut a = Assessed::of(claims);
+            play_integrity(cfg, &mut a, integrity.as_deref(), challenge, now_unix);
+            Ok(a)
         }
         Evidence::AppleAppAttest { attestation } => {
             let policy = cfg
@@ -172,7 +335,7 @@ fn appraise_evidence(
             let (claims, key) =
                 attest_apple::appraise_attestation(&attestation, challenge, policy, now_unix)?;
             cfg.apple_keys.insert(key.key_id, key);
-            Ok(claims)
+            Ok(Assessed::of(claims))
         }
         Evidence::AppleAppAssert { key_id, assertion } => {
             let policy = cfg
@@ -186,6 +349,7 @@ fn appraise_evidence(
                 "unknown App Attest key: attest it first",
             ))?;
             attest_apple::appraise_assertion(&assertion, challenge, &mut key, policy)
+                .map(Assessed::of)
         }
         // (appraised in `appraise`: it needs a second round trip)
         Evidence::Tpm(_) => Err(AttestError::Envelope("tpm")),
@@ -200,27 +364,19 @@ pub enum Outcome {
     Activate(Appraised, crate::tpm::Activation),
 }
 
-fn appraised(claims: &Claims, now_yyyymm: u32) -> Appraised {
-    Appraised {
-        platform: Some(claims.platform),
-        tier: device_tier(claims),
-        features: features(claims, now_yyyymm),
-        identity: claims.hardware_identity.clone(),
-        warnings: claims.warnings.clone(),
-    }
-}
-
 /// The outcome when credential activation fails: the AK is not in the TPM
 /// that holds the certified EK.
 pub fn activation_failed() -> Appraised {
     unrooted("evidence-rejected: credential activation failed".into())
 }
 
-/// Appraise an admission's evidence (empty: D0).
+/// Appraise an admission's evidence (empty: D0). `claimed_build` is the
+/// client's own `client_build`.
 pub fn appraise(
     cfg: &ClientAttestation,
     verifier_challenge: &[u8; 32],
     session_key: &SessionKey,
+    claimed_build: &[u8; 32],
     evidence: &[u8],
 ) -> Outcome {
     let evidence = match Evidence::decode(evidence) {
@@ -238,41 +394,26 @@ pub fn appraise(
             &session_pub,
             now_unix,
         ) {
-            Ok((claims, activation)) => {
-                Outcome::Activate(appraised(&claims, now_yyyymm), activation)
-            }
+            Ok((claims, activation)) => Outcome::Activate(
+                finish(cfg, Assessed::of(claims), claimed_build, now_yyyymm),
+                activation,
+            ),
             Err(e) => Outcome::Done(unrooted(format!("evidence-rejected: {e}"))),
         };
     }
-    Outcome::Done(appraise_once(
-        cfg,
-        evidence,
-        verifier_challenge,
-        &session_pub,
-        now_unix,
-        now_yyyymm,
-    ))
-}
-
-fn appraise_once(
-    cfg: &ClientAttestation,
-    evidence: Evidence,
-    verifier_challenge: &[u8; 32],
-    session_pub: &[u8],
-    now_unix: i64,
-    now_yyyymm: u32,
-) -> Appraised {
-    match appraise_evidence(
-        cfg,
-        evidence,
-        verifier_challenge,
-        session_pub,
-        now_unix,
-        now_yyyymm,
-    ) {
-        Ok(claims) => appraised(&claims, now_yyyymm),
-        Err(e) => unrooted(format!("evidence-rejected: {e}")),
-    }
+    Outcome::Done(
+        match appraise_evidence(
+            cfg,
+            evidence,
+            verifier_challenge,
+            &session_pub,
+            now_unix,
+            now_yyyymm,
+        ) {
+            Ok(a) => finish(cfg, a, claimed_build, now_yyyymm),
+            Err(e) => unrooted(format!("evidence-rejected: {e}")),
+        },
+    )
 }
 
 #[cfg(test)]
@@ -296,13 +437,20 @@ mod tests {
     #[test]
     fn missing_and_bad_evidence_are_d0() {
         let cfg = ClientAttestation::default();
-        let a = done(appraise(&cfg, &[1; 32], &SessionKey::Ed25519([2; 32]), &[]));
+        let a = done(appraise(
+            &cfg,
+            &[1; 32],
+            &SessionKey::Ed25519([2; 32]),
+            &[0; 32],
+            &[],
+        ));
         assert_eq!(a.tier, DeviceTier::D0Unknown);
         assert_eq!(a.warnings, vec!["no-platform-evidence".to_string()]);
         let a = done(appraise(
             &cfg,
             &[1; 32],
             &SessionKey::Ed25519([2; 32]),
+            &[0; 32],
             &[0xff, 0x00],
         ));
         assert_eq!(a.tier, DeviceTier::D0Unknown);
@@ -310,9 +458,16 @@ mod tests {
         // Well-formed, but this Verifier has no Android policy.
         let e = Evidence::AndroidKey {
             chain: vec![vec![1]],
+            integrity: None,
         }
         .encode();
-        let a = done(appraise(&cfg, &[1; 32], &SessionKey::Ed25519([2; 32]), &e));
+        let a = done(appraise(
+            &cfg,
+            &[1; 32],
+            &SessionKey::Ed25519([2; 32]),
+            &[0; 32],
+            &e,
+        ));
         assert_eq!(a.tier, DeviceTier::D0Unknown);
         assert!(a.warnings[0].contains("no Android policy"));
     }
@@ -332,5 +487,124 @@ mod tests {
         assert!(android.revoked.contains("a1b"));
         assert!(!cfg.apple.unwrap().allow_development);
         assert!(ClientAttestation::from_options(&["nodigest".into()], None, &[], false).is_err());
+    }
+
+    // ---- Play Integrity and the client Build Registry, on claims as key
+    // attestation would give them (attest-android's own tests cover that)
+
+    use attest_android::integrity::{b64url, testing::Google};
+    use attest_core::AttestedApp;
+
+    const NONCE: [u8; 32] = [0x11; 32];
+    const PACKAGE: &str = "com.halo.decomp";
+    const SIGNER: [u8; 32] = [0x5a; 32];
+
+    fn android_d2() -> Claims {
+        Claims {
+            platform: "android",
+            key_storage: KeyStorage::StrongBox,
+            verified_boot: Some(true),
+            app_attested: true,
+            session_key_in_hw: true,
+            os_patch_level: None,
+            hardware_identity: None,
+            boot: Default::default(),
+            app: Some(AttestedApp {
+                id: format!("android:{PACKAGE}"),
+                version: 42,
+            }),
+            warnings: vec![],
+        }
+    }
+
+    fn cfg_with(google: Option<&Google>, builds: &str) -> ClientAttestation {
+        let mut cfg = ClientAttestation::from_options(
+            &[format!("{PACKAGE}:{}", hex::encode(SIGNER))],
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+        cfg.play_integrity = google.map(Google::keys);
+        cfg.client_builds = ClientBuilds::parse(builds).unwrap();
+        cfg
+    }
+
+    fn token(g: &Google, labels: &[&str], version: &str) -> String {
+        g.token(&serde_json::json!({
+            "requestDetails": {
+                "requestPackageName": PACKAGE,
+                "nonce": b64url(&NONCE),
+                "timestampMillis": (now().0 as u64 * 1000).to_string(),
+            },
+            "appIntegrity": {
+                "appRecognitionVerdict": "PLAY_RECOGNIZED",
+                "packageName": PACKAGE,
+                "certificateSha256Digest": [b64url(&SIGNER)],
+                "versionCode": version,
+            },
+            "deviceIntegrity": {"deviceRecognitionVerdict": labels},
+        }))
+    }
+
+    fn assess(cfg: &ClientAttestation, token: Option<String>) -> Appraised {
+        let mut a = Assessed::of(android_d2());
+        play_integrity(cfg, &mut a, token.as_deref(), &NONCE, now().0);
+        finish(cfg, a, &[0; 32], now().1)
+    }
+
+    #[test]
+    fn android_d2_needs_strong_integrity_when_configured() {
+        let g = Google::new();
+        // not configured: key attestation alone
+        assert_eq!(
+            assess(&cfg_with(None, ""), None).tier,
+            DeviceTier::D2Hardware
+        );
+        let cfg = cfg_with(Some(&g), "");
+        let strong = &["MEETS_DEVICE_INTEGRITY", "MEETS_STRONG_INTEGRITY"][..];
+        let a = assess(&cfg, Some(token(&g, strong, "42")));
+        assert_eq!(a.tier, DeviceTier::D2Hardware);
+        assert_eq!(a.features.strong_integrity, Some(true));
+        let a = assess(&cfg, None);
+        assert_eq!(
+            (a.tier, a.warnings[0].as_str()),
+            (DeviceTier::D1Software, "no-play-integrity")
+        );
+        let a = assess(&cfg, Some(token(&g, &["MEETS_DEVICE_INTEGRITY"], "42")));
+        assert_eq!(a.tier, DeviceTier::D1Software);
+        assert_eq!(a.features.strong_integrity, Some(false));
+        let a = assess(&cfg, Some(token(&g, &[], "42")));
+        assert_eq!(a.tier, DeviceTier::D0Unknown);
+        // another install's verdict (another build than the one attested)
+        let a = assess(&cfg, Some(token(&g, strong, "41")));
+        assert_eq!(a.tier, DeviceTier::D0Unknown);
+        // a verdict minted with another app's keys
+        let a = assess(&cfg, Some(token(&Google::new(), strong, "42")));
+        assert_eq!(a.tier, DeviceTier::D1Software);
+        assert!(a.warnings[0].starts_with("play-integrity-rejected"));
+    }
+
+    #[test]
+    fn the_registry_names_the_attested_build() {
+        let id = "ab".repeat(32);
+        let cfg = cfg_with(None, &format!("{id} android:{PACKAGE} 42 # release 1.0\n"));
+        let a = assess(&cfg, None);
+        assert_eq!(a.client_build, Some([0xab; 32]));
+        assert_eq!(a.tier, DeviceTier::D2Hardware);
+        assert!(a.warnings.contains(&"build-claim-differs".to_string()));
+        // a version we did not build
+        let cfg = cfg_with(None, &format!("{id} android:{PACKAGE} 41\n"));
+        let a = assess(&cfg, None);
+        assert_eq!((a.tier, a.client_build), (DeviceTier::D1Software, None));
+        assert!(a.warnings[0].starts_with("build-unregistered"));
+        // evidence that attests no build: the claim stands, marked
+        let cfg = cfg_with(None, &format!("{id} android:{PACKAGE} 42\n"));
+        let mut claims = android_d2();
+        claims.app = None;
+        let a = finish(&cfg, Assessed::of(claims), &[0; 32], now().1);
+        assert_eq!(a.client_build, None);
+        assert_eq!(a.warnings, vec!["build-not-attested".to_string()]);
+        assert!(ClientBuilds::parse("zz android:x 1").is_err());
     }
 }

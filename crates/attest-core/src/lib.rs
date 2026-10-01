@@ -55,6 +55,14 @@ pub enum KeyStorage {
     Tpm,
 }
 
+/// An app build as a platform attests it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttestedApp {
+    /// `android:<package>`, ...
+    pub id: String,
+    pub version: u64,
+}
+
 /// What a PC's measured boot showed beyond Secure Boot (Windows' boot
 /// configuration). `None`: not measured.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -92,6 +100,10 @@ pub struct Claims {
     pub hardware_identity: Option<Vec<u8>>,
     /// PCs: what measured boot showed (`Default` elsewhere).
     pub boot: BootClaims,
+    /// The app and its version, when the platform attests them (Android:
+    /// package and versionCode). The Verifier looks the build up in its
+    /// client Build Registry.
+    pub app: Option<AttestedApp>,
     pub warnings: Vec<String>,
 }
 
@@ -155,6 +167,11 @@ mod tests {
         for e in [
             Evidence::AndroidKey {
                 chain: vec![vec![1, 2], vec![3]],
+                integrity: None,
+            },
+            Evidence::AndroidKey {
+                chain: vec![vec![1]],
+                integrity: Some("a.b.c.d.e".into()),
             },
             Evidence::AppleAppAttest {
                 attestation: vec![9; 40],
@@ -181,6 +198,7 @@ mod tests {
             os_patch_level: None,
             hardware_identity: None,
             boot: BootClaims::default(),
+            app: None,
             warnings: vec![],
         }
     }
