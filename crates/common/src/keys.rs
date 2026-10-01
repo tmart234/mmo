@@ -15,6 +15,17 @@ use std::path::Path;
 
 pub const DEFAULT_BUNDLE: &str = "keys/fpp_key_bundle.json";
 
+/// The Transparency Log's keys (hybrid, FPP-S1H) and its witnesses'.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogKeys {
+    /// The log's name in its checkpoints.
+    pub origin: String,
+    pub ed25519: [u8; 32],
+    pub ml_dsa: Vec<u8>,
+    /// Witnesses (name, Ed25519 key) whose cosignatures count.
+    pub witnesses: Vec<(String, [u8; 32])>,
+}
+
 /// Public keys relying parties trust, by role.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyBundle {
@@ -22,6 +33,8 @@ pub struct KeyBundle {
     pub broker_sat: VerifyingKey,
     pub server_liveness: VerifyingKey,
     pub enforcement: VerifyingKey,
+    /// The region's Transparency Log, if it has one.
+    pub log: Option<LogKeys>,
 }
 
 impl KeyBundle {
@@ -40,6 +53,14 @@ impl KeyBundle {
             "broker_sat": hex::encode(self.broker_sat.to_bytes()),
             "server_liveness": hex::encode(self.server_liveness.to_bytes()),
             "enforcement": hex::encode(self.enforcement.to_bytes()),
+            "log": self.log.as_ref().map(|l| serde_json::json!({
+                "origin": l.origin,
+                "ed25519": hex::encode(l.ed25519),
+                "ml_dsa": hex::encode(&l.ml_dsa),
+                "witnesses": l.witnesses.iter()
+                    .map(|(n, k)| serde_json::json!({"name": n, "ed25519": hex::encode(k)}))
+                    .collect::<Vec<_>>(),
+            })),
         });
         let path = path.as_ref();
         std::fs::write(path, serde_json::to_string_pretty(&json)? + "\n")
@@ -61,11 +82,36 @@ impl KeyBundle {
                 .map_err(|_| anyhow::anyhow!("{name}: not 32 bytes"))?;
             VerifyingKey::from_bytes(&bytes).with_context(|| format!("{name}: invalid key"))
         };
+        let fixed = |v: &serde_json::Value, name: &str| -> Result<[u8; 32]> {
+            hex::decode(v[name].as_str().context(name.to_owned())?)?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("{name}: not 32 bytes"))
+        };
+        let log = match &v["log"] {
+            serde_json::Value::Null => None,
+            l => Some(LogKeys {
+                origin: l["origin"].as_str().context("log origin")?.to_string(),
+                ed25519: fixed(l, "ed25519")?,
+                ml_dsa: hex::decode(l["ml_dsa"].as_str().context("log ml_dsa")?)?,
+                witnesses: l["witnesses"]
+                    .as_array()
+                    .context("log witnesses")?
+                    .iter()
+                    .map(|w| {
+                        Ok((
+                            w["name"].as_str().context("witness name")?.to_string(),
+                            fixed(w, "ed25519")?,
+                        ))
+                    })
+                    .collect::<Result<_>>()?,
+            }),
+        };
         Ok(Self {
             verifier_ar: key("verifier_ar")?,
             broker_sat: key("broker_sat")?,
             server_liveness: key("server_liveness")?,
             enforcement: key("enforcement")?,
+            log,
         })
     }
 }
@@ -83,6 +129,12 @@ mod tests {
             broker_sat: key(2),
             server_liveness: key(3),
             enforcement: key(4),
+            log: Some(LogKeys {
+                origin: "fpp.test/log".into(),
+                ed25519: [5; 32],
+                ml_dsa: vec![6; 1952],
+                witnesses: vec![("fpp.test/witness".into(), [7; 32])],
+            }),
         };
         let dir = std::env::temp_dir().join(format!("bundle-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

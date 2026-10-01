@@ -331,9 +331,7 @@ fn control_messages_round_trip() {
         Control::kick(Reason::SarLapsed),
         Control::Bye,
         Control::CheckpointHead {
-            match_id: MATCH,
-            epoch: 7,
-            digest: Digest([8; 32]),
+            checkpoint: vec![8; 400],
         },
         Control::InputCommit {
             commit: vec![7; 300],

@@ -15,6 +15,8 @@
 
 pub use anyhow::{anyhow, bail, Context, Result};
 
+pub mod transparency;
+
 use common::{
     admission::request_challenge,
     crypto::{evidence_request_sign_bytes, match_request_sign_bytes},
@@ -108,6 +110,10 @@ fn unix_s() -> u64 {
 pub struct Services {
     pub verifier: SocketAddr,
     pub broker: SocketAddr,
+    /// The Transparency Log (gossip) and Server Liveness (split-view
+    /// reports).
+    pub log: SocketAddr,
+    pub liveness: SocketAddr,
 }
 
 impl Default for Services {
@@ -116,6 +122,8 @@ impl Default for Services {
         Self {
             verifier: "127.0.0.1:4445".parse().expect("addr"),
             broker: "127.0.0.1:4446".parse().expect("addr"),
+            log: "127.0.0.1:4447".parse().expect("addr"),
+            liveness: "127.0.0.1:4444".parse().expect("addr"),
         }
     }
 }
@@ -239,13 +247,44 @@ pub struct GameClient {
     epoch: u32,
     epoch_frames: Vec<(u32, Vec<u8>)>,
     prev_commit: Digest,
-    /// Checkpoint heads received (for gossip, 04 §7.6).
-    pub heads: Vec<(u32, Digest)>,
+    /// Checkpoints the server sent, verified under its instance key (to
+    /// check against the Transparency Log, 04 §7.6: [`transparency`]).
+    pub heads: Vec<transparency::Head>,
 }
 
 impl GameClient {
     pub fn slot(&self) -> u16 {
         self.slot
+    }
+
+    /// The match this client was admitted to.
+    pub fn match_id(&self) -> [u8; 16] {
+        self.creds.sat_claims.match_id.0
+    }
+
+    /// A Checkpoint from the server: signed by the instance key its SAR
+    /// certifies, for this match. One that is not is the server lying.
+    fn on_checkpoint(&mut self, signed: Vec<u8>) -> Result<transparency::Head> {
+        let Some(chain) = self.sar.as_ref() else {
+            bail!("a Checkpoint before any SAR");
+        };
+        let mut keys = KeySet::default();
+        keys.insert_ed25519(
+            fpp_crypto::KeyRole::GsInstance,
+            ed25519_dalek::VerifyingKey::from_bytes(&chain.current().cnf)?,
+        );
+        let v = fpp_crypto::verify::<fpp_wire::Checkpoint>(&signed, &keys)
+            .map_err(|e| anyhow!("the server sent a Checkpoint it did not sign: {e}"))?;
+        if v.payload.match_id != self.creds.sat_claims.match_id {
+            bail!("the server sent a Checkpoint of another match");
+        }
+        let head = transparency::Head {
+            epoch: v.payload.epoch,
+            digest: v.digest,
+            signed,
+        };
+        self.heads.push(head.clone());
+        Ok(head)
     }
 
     /// Highest SAR sequence seen.
@@ -488,9 +527,12 @@ impl GameClient {
                     }
                     JoinerEvent::Message { payload } => match Control::decode(&payload) {
                         Ok(Control::SarUpdate { sar }) => self.on_sar(&sar)?,
-                        Ok(Control::CheckpointHead { epoch, digest, .. }) => {
-                            self.heads.push((epoch, digest));
-                            events.push(ClientEvent::CheckpointHead { epoch, digest });
+                        Ok(Control::CheckpointHead { checkpoint }) => {
+                            let head = self.on_checkpoint(checkpoint)?;
+                            events.push(ClientEvent::CheckpointHead {
+                                epoch: head.epoch,
+                                digest: head.digest,
+                            });
                         }
                         Ok(Control::Kick { code }) => return Err(SessionEnd::Kicked(code).into()),
                         _ => {}

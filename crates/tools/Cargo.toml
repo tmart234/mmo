@@ -21,6 +21,10 @@ name = "play"
 path = "src/play.rs"
 
 [[bin]]
+name = "split_view"
+path = "src/split_view.rs"
+
+[[bin]]
 name = "revocation_load"
 path = "src/revocation_load.rs"
 

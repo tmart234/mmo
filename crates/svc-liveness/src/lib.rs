@@ -12,6 +12,8 @@
 //! - `watchdog`: revoke when Checkpoints stop
 //! - `placement`: the cell API the Broker places players with
 //! - `revocation`: following the Revocation Feed
+//! - `transparency`: Checkpoints to the Transparency Log, and players'
+//!   equivocation reports
 
 pub mod admission;
 pub mod checkpoints;
@@ -22,6 +24,7 @@ pub mod liveness;
 pub mod placement;
 pub mod revocation;
 pub mod tpm2;
+pub mod transparency;
 pub mod watchdog;
 
 use anyhow::Result;
@@ -39,6 +42,9 @@ pub struct Addrs {
     pub feed: Option<SocketAddr>,
     /// The Evidence Store (none: Checkpoints are verified, not kept).
     pub evidence: Option<SocketAddr>,
+    /// The Transparency Log (none: Checkpoints are not logged, and players
+    /// cannot check theirs).
+    pub log: Option<SocketAddr>,
 }
 
 /// Start Server Liveness with the key in `cell`, presenting `identity` to
@@ -57,6 +63,14 @@ pub fn start(
         ctx.evidence = Some(tx);
         tokio::spawn(evidence::upload(
             svc_evidence::Client::new(&cell_identity, store)?,
+            rx,
+        ));
+    }
+    if let Some(log) = addrs.log {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        ctx.log = Some(tx);
+        tokio::spawn(transparency::upload(
+            svc_log::Writer::new(&cell_identity, log)?,
             rx,
         ));
     }

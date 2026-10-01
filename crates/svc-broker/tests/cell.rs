@@ -51,6 +51,7 @@ async fn start(dir: &Path) -> TestCell {
             callers: vec!["broker".into()],
             feed: None,
             evidence: None,
+            log: None,
         },
         LivenessConfig::default(),
     )
@@ -65,6 +66,7 @@ async fn start(dir: &Path) -> TestCell {
             last_seen_ms: now_ms(),
             revoked: false,
             last_checkpoint: Some((0, Digest::default())),
+            verified: vec![Digest::default()],
             next_slot: 0,
         },
     );
@@ -97,6 +99,7 @@ async fn start(dir: &Path) -> TestCell {
         services: Services {
             verifier: verifier_addr,
             broker: broker_addr,
+            ..Services::default()
         },
         trust: ClientTrust {
             ca_der: pki.ca_cert_der.clone(),

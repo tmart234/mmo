@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::Parser;
 use fpp_crypto::hybrid::HybridSigner;
-use svc_log::{serve_log, LogConfig, PublicKeys};
+use svc_log::{LogConfig, LogService, PublicKeys};
 
 #[derive(Parser)]
 struct Opts {
@@ -31,6 +31,15 @@ struct Opts {
     /// Witness services.
     #[arg(long, value_delimiter = ',', default_value = "witness")]
     witnesses: Vec<String>,
+    /// Public UDP address for players' gossip (QUIC; none: cell only).
+    #[arg(long)]
+    public: Option<std::net::SocketAddr>,
+    /// TLS certificate (DER) for `--public`; must chain to the CA players pin.
+    #[arg(long, default_value = "keys/log_tls.der")]
+    tls_cert: String,
+    /// PKCS#8 private key (DER) for `--tls-cert`.
+    #[arg(long, default_value = "keys/log_tls.key.der")]
+    tls_key: String,
 }
 
 #[tokio::main]
@@ -55,15 +64,20 @@ async fn main() -> Result<()> {
         o.bind
     );
     let endpoint = fpp_svc::mtls::server_endpoint(&id, o.bind)?;
-    serve_log(
-        endpoint,
+    let svc = LogService::new(
         log,
         LogConfig {
             writers: o.writers,
             witnesses: o.witnesses,
             cell: o.cell,
         },
-    )
-    .await;
+    )?;
+    if let Some(public) = o.public {
+        let identity = common::pki::ServerIdentity::load(&o.tls_cert, &o.tls_key)?;
+        let endpoint = common::admission::server_endpoint(&identity, public)?;
+        println!("[log] gossip for players on {public}");
+        tokio::spawn(svc.clone().serve_public(endpoint));
+    }
+    svc.serve_cell(endpoint).await;
     Ok(())
 }

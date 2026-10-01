@@ -2,7 +2,9 @@
 //! directory, a signed checkpoint, receipts, and proofs.
 //!
 //! The directory is the log: `checkpoint` (the signed note, with witness
-//! cosignatures), `tile/...` (hash tiles and entry bundles). Tiles and
+//! cosignatures), `checkpoint.cosigned` (the latest checkpoint a witness
+//! cosigned: the one relying parties take proofs against), `tile/...`
+//! (hash tiles and entry bundles). Tiles and
 //! entries are written before the checkpoint that covers them, so a
 //! published checkpoint never names a tree its tiles cannot rebuild. On
 //! open, the tree is rebuilt from the entry bundles and must hash to the
@@ -45,6 +47,9 @@ pub struct Log {
     note: Note,
     /// Witnesses whose cosignatures it publishes: name and key.
     witnesses: Vec<(String, [u8; 32])>,
+    /// The latest checkpoint with a witness cosignature (the published one
+    /// moves on with every append; this one stays until the next cosign).
+    cosigned: Option<Note>,
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), LogError> {
@@ -116,6 +121,7 @@ impl Log {
                 signatures: Vec::new(),
             },
             witnesses: Vec::new(),
+            cosigned: None,
         };
         let path = log.dir.join("checkpoint");
         if path.exists() {
@@ -142,6 +148,18 @@ impl Log {
                 ));
             }
             log.note = note;
+            let cosigned = log.dir.join("checkpoint.cosigned");
+            if cosigned.exists() {
+                let note = Note::parse(&std::fs::read_to_string(&cosigned)?)?;
+                note.verify_hybrid(&log.origin, &log.public_key(), log.key.ml_dsa_public())?;
+                let c = Checkpoint::parse(&note.text)?;
+                if c.size > log.size()
+                    || root_from_leaf_hashes(&log.leaves()[..c.size as usize]).0 != c.root
+                {
+                    return Err(LogError::Storage("cosigned checkpoint of another tree"));
+                }
+                log.cosigned = Some(note);
+            }
         } else {
             log.publish()?;
         }
@@ -215,6 +233,28 @@ impl Log {
     /// The published checkpoint (a signed note, with any cosignatures).
     pub fn checkpoint(&self) -> String {
         self.note.encode()
+    }
+
+    /// The latest checkpoint a witness cosigned, if any.
+    pub fn cosigned_checkpoint(&self) -> Option<String> {
+        self.cosigned.as_ref().map(Note::encode)
+    }
+
+    /// Entries from index `from` on, read back from the entry bundles.
+    pub fn entries(&self, from: u64) -> Result<Vec<Vec<u8>>, LogError> {
+        let mut out = Vec::new();
+        for (index, width) in tiles_at(self.size()) {
+            if (index + 1) * WIDTH <= from {
+                continue;
+            }
+            let bytes = std::fs::read(self.dir.join(entries_path(index, width)))?;
+            for (i, e) in decode_bundle(&bytes)?.into_iter().enumerate() {
+                if index * WIDTH + i as u64 >= from {
+                    out.push(e);
+                }
+            }
+        }
+        Ok(out)
     }
 
     fn publish(&mut self) -> Result<(), LogError> {
@@ -335,12 +375,47 @@ impl Log {
         consistency_proof(&self.leaves()[..new as usize], old as usize).ok_or(LogError::Range)
     }
 
-    /// Add a witness's cosignature line for the current checkpoint (the one
-    /// it cosigned must still be current); replaces an older one by the
-    /// same witness.
+    /// Add a witness's cosignature line for a checkpoint of this log: the
+    /// current one (it is published with it, replacing an older line by the
+    /// same witness), or an earlier one of the same tree (it then becomes
+    /// the cosigned checkpoint, re-signed, while the published one moves
+    /// on: a busy log never outruns its witness).
     pub fn add_cosignature(&mut self, text: &str, line: &str) -> Result<(), LogError> {
         if text != self.note.text {
-            return Err(LogError::Stale);
+            let c = Checkpoint::parse(text).map_err(|_| LogError::Stale)?;
+            let newer = self
+                .cosigned
+                .as_ref()
+                .and_then(|n| Checkpoint::parse(&n.text).ok())
+                .is_none_or(|old| c.size > old.size);
+            if c.origin != self.origin
+                || c.size > self.size()
+                || root_from_leaf_hashes(&self.leaves()[..c.size as usize]).0 != c.root
+            {
+                return Err(LogError::Stale);
+            }
+            if !newer {
+                return Ok(());
+            }
+            let parsed = Note::parse(&format!("{text}\n{line}"))?;
+            let [(name, _)] = parsed.signatures.as_slice() else {
+                return Err(LogError::Note("one cosignature line"));
+            };
+            let key = self
+                .witnesses
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, k)| *k)
+                .ok_or(LogError::Note("not a witness of this log"))?;
+            parsed.verify_cosignature(name, &key)?;
+            let mut note = Note::parse(&note::sign_hybrid(text, &self.origin, &self.key)?)?;
+            note.signatures.extend(parsed.signatures);
+            write_atomic(
+                &self.dir.join("checkpoint.cosigned"),
+                note.encode().as_bytes(),
+            )?;
+            self.cosigned = Some(note);
+            return Ok(());
         }
         let parsed = Note::parse(&format!("{text}\n{line}"))?;
         let [(name, sig)] = parsed.signatures.as_slice() else {
@@ -356,6 +431,11 @@ impl Log {
         self.note.signatures.retain(|(n, _)| n != name);
         self.note.signatures.push((name.clone(), sig.clone()));
         write_atomic(&self.dir.join("checkpoint"), self.note.encode().as_bytes())?;
+        write_atomic(
+            &self.dir.join("checkpoint.cosigned"),
+            self.note.encode().as_bytes(),
+        )?;
+        self.cosigned = Some(self.note.clone());
         Ok(())
     }
 }

@@ -50,6 +50,7 @@ impl ServiceKeys {
             broker_sat: self.broker.verifying_key(),
             server_liveness: self.liveness.verifying_key(),
             enforcement: SigningKey::from_bytes(&[4; 32]).verifying_key(),
+            log: None,
         }
     }
 }
@@ -83,6 +84,7 @@ async fn start_server(keys: &Arc<ServiceKeys>, sar_noise_static: Option<[u8; 32]
             keys: keys.bundle().keyset(),
             min_tier: DeviceTier::D0Unknown,
             sar_grace_ms: 1_500,
+            equivocate_from: None,
         },
         Host::new(HostConfig::new(noise)),
     );

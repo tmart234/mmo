@@ -14,15 +14,16 @@ pub type Sig = Vec<u8>;
 
 pub type OpId = [u8; 16];
 
-/// Version in `ChallengeRequest`; bump on any admission-flow change (6:
-/// Server Liveness pushes revocation events to game servers).
-pub const ADMISSION_VERSION: u32 = 6;
+/// Version in `ChallengeRequest`; bump on any admission-flow change (7:
+/// a purpose, and players' equivocation reports to Server Liveness).
+pub const ADMISSION_VERSION: u32 = 7;
 
 /// First message on a connection to a public service (Server Liveness, the
 /// Verifier, the Broker): asks for a single-use challenge.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ChallengeRequest {
     pub version: u32,
+    pub purpose: Purpose,
 }
 
 /// Service → peer: single-use nonce. A GS's join TPM quote must cover it (F04);
@@ -176,6 +177,68 @@ pub enum MatchAnswer {
         /// `fpp_types::Reason` code.
         code: u16,
     },
+}
+
+// ---------------------------------------------------------------- client <-> Transparency Log
+
+/// Client → Transparency Log (public, read only): is this Checkpoint the
+/// one Server Liveness logged for its match and epoch? (EVD-03, 04 §7.6)
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct GossipRequest {
+    pub match_id: [u8; 16],
+    pub epoch: u32,
+    /// SHA-256 of the signed Checkpoint the client holds.
+    pub digest: [u8; 32],
+}
+
+/// Transparency Log → client. Proofs are against `checkpoint`, the log's
+/// latest witness-cosigned checkpoint (a signed note).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum GossipAnswer {
+    /// The client's Checkpoint is logged at `index`.
+    Included {
+        checkpoint: String,
+        index: u64,
+        proof: Vec<[u8; 32]>,
+    },
+    /// Another Checkpoint (`logged`) is logged for this match and epoch, at
+    /// `index`: the server showed this client something else.
+    Conflict {
+        checkpoint: String,
+        index: u64,
+        logged: [u8; 32],
+        proof: Vec<[u8; 32]>,
+    },
+    /// Nothing for this match and epoch in a cosigned checkpoint yet.
+    Pending,
+}
+
+// ---------------------------------------------------------------- client -> Server Liveness
+
+/// What a connection to Server Liveness is for (in `ChallengeRequest`).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Purpose {
+    /// A game server joins (then `JoinRequest`).
+    Join,
+    /// A player reports a split view (then `EquivocationReport`).
+    Report,
+}
+
+/// Player → Server Liveness: a Checkpoint the game server signed and sent
+/// this player, which the log shows differs from the one it gave Server
+/// Liveness for the same match and epoch.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct EquivocationReport {
+    pub checkpoint: Vec<u8>,
+}
+
+/// Server Liveness → player.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum ReportAnswer {
+    /// Proven: the instance is revoked (no more SARs).
+    Revoked,
+    /// Not a proof of equivocation, and why.
+    Rejected(String),
 }
 
 // ---------------------------------------------------------------- title payloads

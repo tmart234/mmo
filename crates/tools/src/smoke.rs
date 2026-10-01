@@ -122,7 +122,7 @@ fn run_smoke_pass() -> Result<(bool, bool, bool)> {
             .with_context(|| format!("run {:?}", client_bin))
     };
     let refused = client(&["--queue", "verified", "--expect-refused"])?;
-    let played = client(&["--smoke-test"])?;
+    let played = client(&["--smoke-test", "--check-log", "30"])?;
     let client_ok = played.success() && refused.success();
     println!(
         "[SMOKE] clients: smoke {:?}, verified-queue refusal {:?}",

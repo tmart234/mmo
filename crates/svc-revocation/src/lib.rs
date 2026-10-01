@@ -23,7 +23,6 @@ use fpp_svc::Caller;
 use fpp_wire::RevocationEvent;
 use std::collections::HashMap;
 use std::io::Write;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,54 +46,8 @@ pub struct FeedConfig {
     pub log: Option<LogLink>,
 }
 
-/// The feed's connection to the Transparency Log.
-pub struct LogLink {
-    endpoint: fpp_svc::quinn::Endpoint,
-    addr: SocketAddr,
-    conn: Mutex<Option<fpp_svc::quinn::Connection>>,
-}
-
-impl LogLink {
-    pub fn new(identity: &fpp_svc::Identity, addr: SocketAddr) -> Result<Self> {
-        Ok(Self {
-            endpoint: fpp_svc::mtls::client_endpoint(identity)?,
-            addr,
-            conn: Mutex::new(None),
-        })
-    }
-
-    /// Append one entry; its index in the log.
-    pub async fn append(&self, entry: Vec<u8>) -> Result<u64> {
-        let mut guard = self.conn.lock().await;
-        let conn = match guard.as_ref().filter(|c| c.close_reason().is_none()) {
-            Some(c) => c.clone(),
-            None => {
-                let c = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    fpp_svc::mtls::connect(&self.endpoint, self.addr, "log"),
-                )
-                .await
-                .map_err(|_| anyhow!("Transparency Log unreachable"))??;
-                *guard = Some(c.clone());
-                c
-            }
-        };
-        let answer = tokio::time::timeout(
-            Duration::from_secs(10),
-            fpp_svc::call(&conn, &svc_log::Request::Add(vec![entry])),
-        )
-        .await
-        .map_err(|_| anyhow!("Transparency Log timed out"));
-        match answer {
-            Ok(Ok(svc_log::Response::Added(added))) if added.len() == 1 => Ok(added[0].0),
-            Ok(Ok(other)) => Err(anyhow!("Transparency Log: {other:?}")),
-            Ok(Err(e)) | Err(e) => {
-                *guard = None;
-                Err(e)
-            }
-        }
-    }
-}
+/// The feed's connection to the Transparency Log, as this service.
+pub type LogLink = svc_log::Writer;
 
 struct State {
     events: Vec<Vec<u8>>,
@@ -197,7 +150,7 @@ impl Feed {
             return Ok((*seq, None));
         }
         let log_index = match &self.config.log {
-            Some(log) => Some(log.append(cose.clone()).await?),
+            Some(log) => Some(log.append(vec![cose.clone()]).await?),
             None => None,
         };
         state.file.write_all(&(cose.len() as u32).to_le_bytes())?;

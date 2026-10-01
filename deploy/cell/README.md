@@ -1,7 +1,7 @@
 # A cell in containers
 
 One regional cell of the trust plane (docs/anticheat/03 §3): the
-**Transparency Log**, the **Revocation Feed**, the **Evidence Store**,
+**Transparency Log** and a **witness**, the **Revocation Feed**, the **Evidence Store**,
 **Server Liveness**, the **Verifier** and the **Broker**, each in its own
 container with its own keys and its own cell identity (mutual TLS between
 services); the public ones with their own TLS certificates. Enforcement
@@ -16,7 +16,8 @@ Needs Docker Engine 26 or later (volume subpaths). CI runs this
 
 | Container | Port (UDP, QUIC) | Mounts (from the `state` volume) |
 |-----------|------------------|----------------------------------|
-| `log` | 7201 (cell) | `cell/log/` (keys and tiles), `cell/public/`, the cell CA |
+| `log` | 7201 (cell); 4447: players (checks of Checkpoints) | `cell/log/` (keys and tiles), `cell/public/`, the cell CA |
+| `witness` | | `cell/witness/`, `cell/public/`, the cell CA |
 | `revocation` | 4460 (cell) | `cell/revocation/`, `cell/public/`, the cell CA |
 | `evidence` | 4470 (cell) | `cell/evidence/` (identity and objects), the cell CA |
 | `liveness` | 4444: game servers; 4454: cell API for the Broker | `cell/liveness/`, `cell/public/`, the cell CA |
@@ -44,7 +45,8 @@ use the machine's LAN address to play from elsewhere):
 ```bash
 docker compose -f deploy/cell/docker-compose.yml cp bundle:/var/lib/fpp/keys ./keys
 cargo run -p gs-sim -- --liveness 127.0.0.1:4444
-cargo run -p client-core --bin client-sim -- --verifier 127.0.0.1:4445 --broker 127.0.0.1:4446 --smoke-test
+cargo run -p client-core --bin client-sim -- --verifier 127.0.0.1:4445 --broker 127.0.0.1:4446 \
+  --log 127.0.0.1:4447 --liveness 127.0.0.1:4444 --smoke-test --check-log 30
 ```
 
 Stop Server Liveness (`docker compose -f deploy/cell/docker-compose.yml

@@ -87,6 +87,10 @@ struct Opts {
     /// own, once its SAR chain goes stale.
     #[arg(long, hide = true)]
     ignore_revocations: bool,
+    /// Test only: from this epoch on, show players another Checkpoint than
+    /// the one sent to Server Liveness (a split view, for players to catch).
+    #[arg(long, hide = true)]
+    equivocate_from: Option<u32>,
 
     /// CA certificate (DER) Server Liveness's TLS certificate must chain to.
     #[arg(long, default_value = common::pki::DEFAULT_CA_CERT)]
@@ -290,6 +294,7 @@ async fn main() -> Result<()> {
             } else {
                 game::SAR_GRACE_MS
             },
+            equivocate_from: opts.equivocate_from,
         },
         Host::new(host_cfg),
     );

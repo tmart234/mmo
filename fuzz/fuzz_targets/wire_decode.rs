@@ -5,8 +5,9 @@
 use common::framing::{decode_frame, MAX_CONTROL_FRAME};
 use common::proto::{
     AttestChallenge, ChallengeRequest, CheckpointSubmit, ClientCmd, CredentialChallenge,
-    CredentialResponse, EvidenceAnswer, EvidenceRequest, JoinAccept, JoinRequest, MatchAnswer,
-    MatchRequest, ToGameServer, WorldSnapshot,
+    CredentialResponse, EquivocationReport, EvidenceAnswer, EvidenceRequest, GossipAnswer,
+    GossipRequest, JoinAccept, JoinRequest, MatchAnswer, MatchRequest, ReportAnswer, ToGameServer,
+    WorldSnapshot,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -19,7 +20,7 @@ fuzz_target!(|data: &[u8]| {
     let Some((&selector, body)) = data.split_first() else {
         return;
     };
-    match selector % 14 {
+    match selector % 18 {
         0 => decode::<JoinRequest>(body),
         1 => decode::<JoinAccept>(body),
         2 => decode::<ChallengeRequest>(body),
@@ -33,6 +34,10 @@ fuzz_target!(|data: &[u8]| {
         10 => decode::<ClientCmd>(body),
         11 => decode::<WorldSnapshot>(body),
         12 => decode::<CredentialChallenge>(body),
+        13 => decode::<GossipRequest>(body),
+        14 => decode::<GossipAnswer>(body),
+        15 => decode::<EquivocationReport>(body),
+        16 => decode::<ReportAnswer>(body),
         _ => decode::<CredentialResponse>(body),
     }
 });

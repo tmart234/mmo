@@ -11,6 +11,7 @@
 //! tests check this log against Go's implementation (`tests/go/`).
 
 pub mod b64;
+pub mod leaf;
 pub mod log;
 pub mod note;
 pub mod tiles;

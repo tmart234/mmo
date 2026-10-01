@@ -23,6 +23,8 @@ pub struct Ctx {
     pub revocations: Arc<std::sync::Mutex<Revocations>>,
     /// Verified Checkpoints on their way to the Evidence Store (none: not kept).
     pub evidence: Option<tokio::sync::mpsc::UnboundedSender<([u8; 16], Vec<u8>)>>,
+    /// Entries on their way to the Transparency Log (none: not logged).
+    pub log: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
 }
 
 /// One admitted game server instance; its session id is also the id of the
@@ -39,6 +41,8 @@ pub struct Session {
     pub revoked: bool,
     /// Epoch and digest of the last verified Checkpoint (the `prev` chain).
     pub last_checkpoint: Option<(u32, Digest)>,
+    /// Digest of every verified Checkpoint, by epoch (what the log holds).
+    pub verified: Vec<Digest>,
     /// Next player slot handed out (to the Broker) for this match.
     pub next_slot: u16,
 }
@@ -52,6 +56,7 @@ impl Ctx {
             links: Arc::new(DashMap::new()),
             revocations: Arc::default(),
             evidence: None,
+            log: None,
         }
     }
 
@@ -59,6 +64,13 @@ impl Ctx {
     pub fn keep_evidence(&self, session_id: [u8; 16], checkpoint: Vec<u8>) {
         if let Some(tx) = &self.evidence {
             let _ = tx.send((session_id, checkpoint));
+        }
+    }
+
+    /// Append an entry to the Transparency Log.
+    pub fn log_entry(&self, entry: Vec<u8>) {
+        if let Some(tx) = &self.log {
+            let _ = tx.send(entry);
         }
     }
 

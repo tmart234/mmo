@@ -23,6 +23,8 @@ fpp-crypto    = { path = "../fpp-crypto" }
 fpp-tokens    = { path = "../fpp-tokens" }
 fpp-svc       = { path = "../fpp-svc" }
 svc-evidence  = { path = "../svc-evidence" }
+svc-log       = { path = "../svc-log" }
+fpp-log       = { path = "../fpp-log" }
 attest-tpm    = { path = "../attest-tpm" }
 attest-core   = { path = "../attest-core" }
 

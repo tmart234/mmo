@@ -88,5 +88,29 @@ pub fn bundle(cell: &Path) -> Result<common::keys::KeyBundle> {
         broker_sat: key("broker")?,
         server_liveness: key("liveness")?,
         enforcement: key("enforcement")?,
+        log: log_keys(cell)?,
     })
+}
+
+/// The log's keys and its witnesses', if the cell runs a log.
+fn log_keys(cell: &Path) -> Result<Option<common::keys::LogKeys>> {
+    let Ok(log) = PublicKeys::read(cell, "log") else {
+        return Ok(None);
+    };
+    let ml_dsa = log
+        .ml_dsa
+        .context("the log publishes no ML-DSA key (FPP-S1H)")?;
+    let witnesses = std::fs::read_dir(cell.join("public"))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("witness") && !n.ends_with(".tmp"))
+        .filter_map(|n| PublicKeys::read(cell, &n).ok())
+        .map(|w| (w.name, w.ed25519))
+        .collect();
+    Ok(Some(common::keys::LogKeys {
+        origin: log.name,
+        ed25519: log.ed25519,
+        ml_dsa,
+        witnesses,
+    }))
 }

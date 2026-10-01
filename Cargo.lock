@@ -2061,6 +2061,7 @@ dependencies = [
  "common",
  "ed25519-dalek",
  "fpp-crypto",
+ "fpp-log",
  "fpp-merkle",
  "fpp-session",
  "fpp-tokens",
@@ -5423,6 +5424,7 @@ dependencies = [
  "dashmap",
  "ed25519-dalek",
  "fpp-crypto",
+ "fpp-log",
  "fpp-svc",
  "fpp-tokens",
  "fpp-types",
@@ -5433,6 +5435,7 @@ dependencies = [
  "rand 0.8.8",
  "sha2",
  "svc-evidence",
+ "svc-log",
  "tokio",
 ]
 
@@ -5442,6 +5445,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "common",
  "ed25519-dalek",
  "fpp-crypto",
  "fpp-log",

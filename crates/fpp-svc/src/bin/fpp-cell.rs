@@ -6,12 +6,14 @@
 //! `init` issues a CA and a TLS identity for each service (default: all of
 //! them) into `<dir>`. The CA's private key is not kept.
 //!
-//! `bundle` gathers the public keys the Verifier, the Broker and Server
-//! Liveness published in `<dir>` (each makes its own key on first start)
-//! into the key bundle clients and game servers trust (default
-//! `keys/fpp_key_bundle.json`).
+//! `bundle` gathers the public keys the Verifier, the Broker, Server
+//! Liveness, the Transparency Log and its witness published in `<dir>` (each
+//! makes its own key on first start) into the key bundle clients and game
+//! servers trust (default `keys/fpp_key_bundle.json`). It fails until the
+//! log and a witness have published theirs: players count only cosigned
+//! checkpoints.
 
-use anyhow::Result;
+use anyhow::{ensure, Result};
 use std::path::Path;
 
 const SERVICES: &[&str] = &[
@@ -53,6 +55,10 @@ fn main() -> Result<()> {
                 .map(String::as_str)
                 .unwrap_or(common::keys::DEFAULT_BUNDLE);
             let bundle = fpp_svc::keys::bundle(dir)?;
+            ensure!(
+                bundle.log.as_ref().is_some_and(|l| !l.witnesses.is_empty()),
+                "the Transparency Log and a witness have not published their keys yet"
+            );
             if let Some(parent) = Path::new(out).parent() {
                 std::fs::create_dir_all(parent)?;
             }

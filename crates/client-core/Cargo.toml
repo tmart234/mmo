@@ -26,6 +26,7 @@ fpp-crypto     = { path = "../fpp-crypto" }
 fpp-merkle     = { path = "../fpp-merkle" }
 fpp-tokens     = { path = "../fpp-tokens" }
 fpp-session    = { path = "../fpp-session" }
+fpp-log        = { path = "../fpp-log" }
 rand           = { workspace = true }
 hex            = { workspace = true }
 

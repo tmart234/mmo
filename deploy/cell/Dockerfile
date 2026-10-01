@@ -1,4 +1,4 @@
-# One image for a cell's services (svc-log, svc-revocation, svc-evidence,
+# One image for a cell's services (svc-log, svc-witness, svc-revocation, svc-evidence,
 # svc-liveness, svc-verifier, svc-broker) and its tools (gen_keys, fpp-cell,
 # fpp-enforce, fpp-evidence).
 # docker-compose.yml runs each service as its own container. Build context:
@@ -12,6 +12,7 @@ RUN cargo build --release --locked \
 
 FROM debian:bookworm-slim
 COPY --from=build /src/target/release/svc-log \
+                  /src/target/release/svc-witness \
                   /src/target/release/svc-revocation \
                   /src/target/release/fpp-enforce \
                   /src/target/release/svc-evidence \
