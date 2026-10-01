@@ -251,6 +251,8 @@ pub enum Reason {
     ServerDraining = 12,
     /// The host has no free player slot.
     ServerFull = 13,
+    /// The AR's measured client build is not one this queue admits.
+    BuildUnlisted = 14,
 }
 
 #[cfg(test)]

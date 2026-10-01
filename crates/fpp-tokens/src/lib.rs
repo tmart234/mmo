@@ -90,6 +90,8 @@ pub enum TokenError {
     ArLink,
     /// Device tier below the queue minimum.
     Tier,
+    /// The AR's client build is not one the server admits.
+    Build,
     /// SAR sequence or `prev` does not continue the chain.
     Chain,
     /// A subject (token, device, account, build) is revoked.
@@ -100,6 +102,7 @@ impl TokenError {
     pub fn reason(&self, token: Token) -> Reason {
         match (self, token) {
             (TokenError::Tier, _) => Reason::TierInsufficient,
+            (TokenError::Build, _) => Reason::BuildUnlisted,
             (TokenError::Revoked, _) => Reason::Revoked,
             (TokenError::Binding, Token::Sat | Token::Ar) => Reason::PopInvalid,
             (_, Token::Ar) => Reason::ArInvalid,

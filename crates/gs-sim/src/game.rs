@@ -248,6 +248,7 @@ impl Match {
             gs_instance_id: self.instance_id(),
             matches: vec![self.cfg.match_id],
             min_tier: self.cfg.min_tier,
+            client_builds: Vec::new(),
         };
         let admitted = admit(
             sat,

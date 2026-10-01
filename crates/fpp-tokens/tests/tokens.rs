@@ -211,6 +211,7 @@ fn policy(f: &Fx, min_tier: DeviceTier) -> AdmissionPolicy {
         gs_instance_id: instance_id(&raw(&f.instance)),
         matches: vec![MATCH],
         min_tier,
+        client_builds: Vec::new(),
     }
 }
 
@@ -373,4 +374,31 @@ fn quic_pop_binds_connection_handshake_and_sat() {
     let v = fpp_crypto::verify::<AdmitPop>(&sign(&f.session, &base), &keys).unwrap();
     assert_eq!(v.payload, base);
     assert!(AdmitPop::from_cbor(&base.to_cbor()).is_ok());
+}
+
+#[test]
+fn admission_admits_only_listed_client_builds() {
+    let f = fx();
+    let a = ar(&f, DeviceTier::D2Hardware);
+    let s = sat(&f, &a);
+    let run = |builds: Vec<BuildId>| {
+        let mut p = policy(&f, DeviceTier::D0Unknown);
+        p.client_builds = builds;
+        admit(
+            &sign(&f.broker, &s),
+            &sign(&f.verifier, &a),
+            &pk(&f.session),
+            &f.keys,
+            &p,
+            &Revocations::default(),
+            NOW,
+        )
+        .err()
+        .map(|(t, e)| e.reason(t))
+    };
+    // (no list: any build, as before)
+    assert_eq!(run(Vec::new()), None);
+    assert_eq!(run(vec![BuildId([0xEE; 32]), a.client_build]), None);
+    // A build the queue does not list (a modified client, finding H07).
+    assert_eq!(run(vec![BuildId([0xEE; 32])]), Some(Reason::BuildUnlisted));
 }

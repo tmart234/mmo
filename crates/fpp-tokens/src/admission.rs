@@ -16,6 +16,9 @@ pub struct AdmissionPolicy {
     pub matches: Vec<MatchId>,
     /// Queue minimum, re-checked here as defense in depth (the Broker applied it first).
     pub min_tier: DeviceTier,
+    /// The title's release builds this queue admits, as the AR's measured
+    /// `client_build` names them (ATT-10). Empty: any build.
+    pub client_builds: Vec<BuildId>,
 }
 
 /// Revocation cache, fed by the Revocation Feed (04 §9).
@@ -67,8 +70,8 @@ pub struct Admitted {
     pub ar: AttestationResult,
 }
 
-/// §7.2 checks in order: SAT, then AR, then the session-key binding, then
-/// revocation. `keys` must hold the Broker SAT and Verifier AR keys (the
+/// §7.2 checks in order: SAT, then AR (tier, then client build), then the
+/// session-key binding, then revocation. `keys` must hold the Broker SAT and Verifier AR keys (the
 /// regional key bundle). On failure returns which token failed and why, for
 /// `Reject{code}` via [`TokenError::reason`].
 pub fn admit(
@@ -93,6 +96,9 @@ pub fn admit(
     }
     if ar.tier < policy.min_tier || sat.tier > ar.tier {
         return Err((Token::Ar, TokenError::Tier));
+    }
+    if !policy.client_builds.is_empty() && !policy.client_builds.contains(&ar.client_build) {
+        return Err((Token::Ar, TokenError::Build));
     }
     if sat.cnf != *session_key {
         return Err((Token::Sat, TokenError::Binding));

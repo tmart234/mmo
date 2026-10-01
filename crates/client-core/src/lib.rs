@@ -176,6 +176,20 @@ pub async fn request_admission_attested(
     session: SessionSigning,
     attestor: Option<&dyn Attestor>,
 ) -> Result<Credentials> {
+    request_admission_for_build(services, trust, queue, session, attestor, client_build()).await
+}
+
+/// [`request_admission_attested`] for a game's own build (a C game that
+/// gets its tokens from `fpp-ticket`): the `client_build` its AR carries
+/// where the platform does not measure one.
+pub async fn request_admission_for_build(
+    services: &Services,
+    trust: &ClientTrust,
+    queue: &str,
+    session: SessionSigning,
+    attestor: Option<&dyn Attestor>,
+    client_build: [u8; 32],
+) -> Result<Credentials> {
     let session_key = session.session_key();
     let session_pub = session_key.to_bytes();
     let keys = trust.keyset();
@@ -183,7 +197,6 @@ pub async fn request_admission_attested(
     // ---- Verifier: the session key and the device's evidence, for an AR.
     let mut v = request_challenge(&trust.ca_der, services.verifier, "verifier").await?;
     let platform = std::env::consts::OS.to_string();
-    let client_build = common::crypto::sha256(env!("CARGO_PKG_VERSION").as_bytes());
     let evidence = match attestor {
         Some(a) => a.evidence(&v.challenge, &session_pub)?,
         None => Vec::new(), // no platform evidence: tier D0
@@ -268,6 +281,13 @@ pub async fn request_admission_attested(
         gs_addr: gs_addr.parse().context("bad GS address from the Broker")?,
         gs_noise_static,
     })
+}
+
+/// The build this client claims to the Verifier (an AR's `client_build`
+/// where the platform does not measure it): a game server's client-build
+/// list must name it (`fpp_admission_add_client_build`).
+pub fn client_build() -> [u8; 32] {
+    common::crypto::sha256(env!("CARGO_PKG_VERSION").as_bytes())
 }
 
 pub fn addr_bytes(a: &SocketAddr) -> Vec<u8> {

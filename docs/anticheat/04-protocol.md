@@ -730,6 +730,7 @@ store) and expire after 60 s (ATT-02).
 | 11 | `POLICY_KICK` | Enforcement action |
 | 12 | `SERVER_DRAINING` | Graceful shutdown |
 | 13 | `SERVER_FULL` | No free player slot |
+| 14 | `BUILD_UNLISTED` | The AR's measured client build is not one the queue admits (ATT-10) |
 
 ## 12. Versioning and extensibility
 
