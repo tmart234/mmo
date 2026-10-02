@@ -32,6 +32,14 @@ path = "src/revocation_load.rs"
 name = "attestation_exit"
 path = "src/attestation_exit.rs"
 
+[[bin]]
+name = "verified_exit"
+path = "src/verified_exit.rs"
+
+[[bin]]
+name = "dev-cell"
+path = "src/dev_cell.rs"
+
 [dependencies]
 ctrlc = { workspace = true }
 anyhow = { workspace = true }

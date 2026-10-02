@@ -20,6 +20,15 @@ fpp-tokens = { path = "../fpp-tokens" }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
+# gs-link: a dedicated server's link to Server Liveness (QUIC); off by default
+common = { path = "../common", optional = true }
+quinn = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }
+
+[features]
+default = []
+gs-link = ["dep:common", "dep:quinn", "dep:tokio", "dep:anyhow"]
 
 [dev-dependencies]
 cbindgen = "0.29"

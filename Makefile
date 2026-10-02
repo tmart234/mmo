@@ -17,7 +17,7 @@ HEADLESS_PKGS := fpp-types fpp-wire fpp-crypto fpp-merkle fpp-tokens fpp-session
 PKG_FLAGS := $(foreach p,$(HEADLESS_PKGS),-p $(p))
 
 # -------- Phonies --------
-.PHONY: help ci check build-headless test-headless test-stage interop ffi-c-test ffi-c-test-i686 \
+.PHONY: help ci check build-headless test-headless test-stage interop ffi-c-test ffi-c-test-i686 ffi-c-verified \
         pi-cell pi-cell-smoke ffi-c-test-aarch64 sim-positive clean-build clean-lock-build \
         check-all build-all test-all
 
@@ -28,9 +28,10 @@ help:
 	@echo "  check              - fmt+clippy (headless crates only)"
 	@echo "  build-headless     - build headless crates (-p $(HEADLESS_PKGS))"
 	@echo "  test-headless      - cargo test for headless crates"
-	@echo "  test-stage         - test headless crates + run smoke (cell <-> GS <-> client) + revocation, split-view and attestation exit tests"
+	@echo "  test-stage         - test headless crates + run smoke (cell <-> GS <-> client) + revocation, split-view, attestation and verified-playlist exit tests"
 	@echo "  interop            - check FPP golden vectors with the independent Python verifier"
 	@echo "  ffi-c-test         - C SDK conformance (x86_64); ffi-c-test-i686 for the Halo ABI"
+	@echo "  ffi-c-verified     - build the C dedicated server of the H5 exit test (libfpp with gs-link)"
 	@echo "  pi-cell            - cross-build the cell's services (and gen_keys, fpp-cell) for a Raspberry Pi (aarch64)"
 	@echo "  pi-cell-smoke      - smoke test with the aarch64 services under qemu-aarch64-static"
 	@echo "  ffi-c-test-aarch64 - C SDK conformance for the Pi 5 host (aarch64, under qemu)"
@@ -78,6 +79,9 @@ test-stage: test-headless
 	cargo run -p tools --bin split_view
 	@echo "P3 exit tests (PC TPM clients on swtpm: tiers from measured boot, replayed quote, software TPM, guessed credential)..."
 	cargo run -p tools --bin attestation_exit
+	@echo "H5 exit test (a dedicated server in C on fpp_gs_link_*: players admitted by SAT and AR, a banned device kicked, players lapse when the server leaves Server Liveness)..."
+	$(MAKE) ffi-c-verified
+	cargo run -p tools --bin verified_exit
 
 # FPP v1 golden vectors, checked by the independent Python implementation.
 # (The Rust side is checked by crates/fpp-crypto/tests/golden.rs.)
@@ -100,6 +104,14 @@ ffi-c-test:
 	cc -std=c99 -Wall -Wextra -Werror -pedantic -Icrates/fpp-ffi/include \
 		crates/fpp-ffi/tests/c/p2p.c target/debug/libfpp.a $(FFI_LIBS) -o target/fpp-p2p
 	./target/fpp-p2p
+
+# A dedicated game server in C for verified playlists (stage H5): libfpp
+# with the gs-link feature (its link to Server Liveness), and the header's
+# FPP_GS_LINK part. Run by tools/src/verified_exit.rs against a dev cell.
+ffi-c-verified:
+	cargo build -p fpp-ffi --features gs-link
+	cc -std=c99 -Wall -Wextra -Werror -pedantic -DFPP_GS_LINK -Icrates/fpp-ffi/include \
+		crates/fpp-ffi/tests/c/verified_host.c target/debug/libfpp.a $(FFI_LIBS) -o target/fpp-verified-host
 
 ffi-c-test-i686:
 	cargo build -p fpp-ffi --target i686-unknown-linux-gnu

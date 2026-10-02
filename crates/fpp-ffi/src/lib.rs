@@ -28,7 +28,13 @@ use std::cell::Cell;
 use std::ffi::{c_char, c_int, c_void};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
+mod gs;
+#[cfg(feature = "gs-link")]
+mod gs_link;
 mod p2p;
+pub use gs::*;
+#[cfg(feature = "gs-link")]
+pub use gs_link::*;
 pub use p2p::*;
 
 /// Result of every SDK call. Verification failures map one-to-one onto the
@@ -65,6 +71,17 @@ pub enum FppStatus {
     TokenBinding = 22,
     /// Valid, but the device tier is below the minimum asked for.
     TokenTier = 23,
+    /// For another server or match (SAT `aud`/`match_id`; a SAR naming
+    /// another instance), or its slot is taken.
+    TokenAudience = 24,
+    /// A SAR that does not continue the chain (`seq`/`prev`).
+    TokenChain = 25,
+    /// The SAT does not name this AR (`ar_cti`).
+    TokenArLink = 26,
+    /// A subject (token, device, account, session key, build) is revoked.
+    TokenRevoked = 27,
+    /// The AR's client build is not one the server admits.
+    TokenBuild = 28,
     /// P2P sessions (`fpp_p2p_*`): why a datagram was dropped or a call
     /// refused. Drop the datagram and carry on; none of these is fatal.
     /// Not a packet of this protocol, or too large.
@@ -95,6 +112,9 @@ pub enum FppStatus {
     P2pCongested = 42,
     /// Host under load and the join's cookie is missing or wrong (dropped).
     P2pCookie = 43,
+    /// `fpp_gs_link_*`: Server Liveness unreachable, refused the join, or
+    /// the link is gone.
+    GsLink = 50,
     /// A bug in the SDK (a caught panic). Please report it.
     Internal = 99,
 }
@@ -255,6 +275,11 @@ pub extern "C" fn fpp_status_str(status: c_int) -> *const c_char {
         21 => b"token: not yet valid\0",
         22 => b"token: bound to another session key\0",
         23 => b"token: device tier below the minimum\0",
+        24 => b"token: for another server, match or slot\0",
+        25 => b"token: SAR chain broken\0",
+        26 => b"token: SAT names another AR\0",
+        27 => b"token: revoked\0",
+        28 => b"token: client build not admitted\0",
         30 => b"p2p: malformed or oversized packet\0",
         31 => b"p2p: unknown session\0",
         32 => b"p2p: replayed or too old\0",
@@ -269,6 +294,7 @@ pub extern "C" fn fpp_status_str(status: c_int) -> *const c_char {
         41 => b"p2p: unknown peer\0",
         42 => b"p2p: reliable channel congested\0",
         43 => b"p2p: join cookie invalid\0",
+        50 => b"gs link: Server Liveness unreachable or link closed\0",
         99 => b"internal SDK error\0",
         _ => b"unknown status\0",
     };
@@ -1504,12 +1530,7 @@ unsafe fn ar_verify(
     for key in raw.as_chunks::<32>().0 {
         keys.insert_ed25519(KeyRole::VerifierAr, verifying_key(*key)?);
     }
-    let result = fpp_tokens::verify_ar(ar, &keys, now_s).map_err(|e| match e {
-        fpp_tokens::TokenError::Verify(v) => FppStatus::from(v),
-        fpp_tokens::TokenError::Expired => FppStatus::TokenExpired,
-        fpp_tokens::TokenError::NotYetValid => FppStatus::TokenNotYetValid,
-        _ => FppStatus::Schema,
-    })?;
+    let result = fpp_tokens::verify_ar(ar, &keys, now_s).map_err(gs::token_status)?;
     if result.cnf != *session {
         return Err(FppStatus::TokenBinding);
     }

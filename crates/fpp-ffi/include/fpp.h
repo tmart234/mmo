@@ -35,6 +35,24 @@
 
 #define FPP_FEATURE_STRONGBOX (1 << 9)
 
+// `fpp_keys_add` roles: the regional key bundle's keys.
+#define FPP_KEY_VERIFIER 1
+
+#define FPP_KEY_BROKER 2
+
+#define FPP_KEY_LIVENESS 3
+
+#define FPP_KEY_ENFORCEMENT 4
+
+// `FppSarInfo.server_class` (04 §6.3).
+#define FPP_SERVER_COMMUNITY 0
+
+#define FPP_SERVER_PARTNER 1
+
+#define FPP_SERVER_FIRST_PARTY 2
+
+#define FPP_SERVER_FIRST_PARTY_CVM 3
+
 // Largest datagram the SDK produces or accepts (no IP fragmentation).
 #define FPP_P2P_MAX_PACKET 1452
 
@@ -85,6 +103,17 @@ typedef enum FppStatus {
   FPP_STATUS_TOKEN_BINDING = 22,
   // Valid, but the device tier is below the minimum asked for.
   FPP_STATUS_TOKEN_TIER = 23,
+  // For another server or match (SAT `aud`/`match_id`; a SAR naming
+  // another instance), or its slot is taken.
+  FPP_STATUS_TOKEN_AUDIENCE = 24,
+  // A SAR that does not continue the chain (`seq`/`prev`).
+  FPP_STATUS_TOKEN_CHAIN = 25,
+  // The SAT does not name this AR (`ar_cti`).
+  FPP_STATUS_TOKEN_AR_LINK = 26,
+  // A subject (token, device, account, session key, build) is revoked.
+  FPP_STATUS_TOKEN_REVOKED = 27,
+  // The AR's client build is not one the server admits.
+  FPP_STATUS_TOKEN_BUILD = 28,
   // P2P sessions (`fpp_p2p_*`): why a datagram was dropped or a call
   // refused. Drop the datagram and carry on; none of these is fatal.
   // Not a packet of this protocol, or too large.
@@ -115,9 +144,67 @@ typedef enum FppStatus {
   FPP_STATUS_P2P_CONGESTED = 42,
   // Host under load and the join's cookie is missing or wrong (dropped).
   FPP_STATUS_P2P_COOKIE = 43,
+  // `fpp_gs_link_*`: Server Liveness unreachable, refused the join, or
+  // the link is gone.
+  FPP_STATUS_GS_LINK = 50,
   // A bug in the SDK (a caught panic). Please report it.
   FPP_STATUS_INTERNAL = 99,
 } FppStatus;
+
+// What `fpp_admission_revocation` did with an event.
+typedef enum FppRevocationOutcome {
+  // Expired, or an action that neither refuses nor removes players.
+  FPP_REVOCATION_OUTCOME_IGNORED = 0,
+  // Refused from now on; players already admitted stay.
+  FPP_REVOCATION_OUTCOME_RECORDED = 1,
+  // Recorded, and any admitted players it names are queued for removal
+  // (`fpp_admission_poll_removed`).
+  FPP_REVOCATION_OUTCOME_REMOVING = 2,
+  // Not in force yet: applied by `fpp_admission_tick` when it is.
+  FPP_REVOCATION_OUTCOME_SCHEDULED = 3,
+  // It revokes this server instance: end the match.
+  FPP_REVOCATION_OUTCOME_INSTANCE_REVOKED = 4,
+} FppRevocationOutcome;
+
+// `FppControl.kind`: the §7.2 message types the fpp-session profile uses.
+typedef enum FppControlKind {
+  // data = SAT ‖ AR (`first_len`, `second_len`); the PoP is the handshake.
+  FPP_CONTROL_KIND_ADMIT = 3,
+  // `slot`, `start_tick`.
+  FPP_CONTROL_KIND_ADMITTED = 4,
+  // `code`.
+  FPP_CONTROL_KIND_REJECT = 5,
+  // data = the SAR.
+  FPP_CONTROL_KIND_SAR_UPDATE = 6,
+  // `code`.
+  FPP_CONTROL_KIND_KICK = 10,
+  FPP_CONTROL_KIND_BYE = 11,
+  // data = the signed Checkpoint.
+  FPP_CONTROL_KIND_CHECKPOINT_HEAD = 12,
+  // data = the signed InputCommit.
+  FPP_CONTROL_KIND_INPUT_COMMIT = 13,
+} FppControlKind;
+
+#if defined(FPP_GS_LINK)
+// `FppGsEvent.kind`.
+typedef enum FppGsEventKind {
+#if defined(FPP_GS_LINK)
+  // data = the next SAR, already checked: it continues the chain and
+  // certifies this server's keys. Send it to every player
+  // (`fpp_control_sar_update`).
+  FPP_GS_EVENT_KIND_SAR = 1,
+#endif
+#if defined(FPP_GS_LINK)
+  // data = a signed RevocationEvent (`fpp_admission_revocation`).
+  FPP_GS_EVENT_KIND_REVOCATION = 2,
+#endif
+#if defined(FPP_GS_LINK)
+  // The link is gone (`reason`): the server is no longer blessed. End
+  // the match; players drop on their own once its SARs stop.
+  FPP_GS_EVENT_KIND_CLOSED = 3,
+#endif
+} FppGsEventKind;
+#endif
 
 // What a poll returned (`FppP2pEvent.kind`).
 typedef enum FppP2pEventKind {
@@ -144,17 +231,31 @@ typedef enum FppP2pEventKind {
   FPP_P2P_EVENT_KIND_MESSAGE = 8,
 } FppP2pEventKind;
 
+// A server's admission state for one match.
+typedef struct FppAdmission FppAdmission;
+
 // Accumulates a host's commitment for one match epoch (04-protocol.md §8.1).
 typedef struct FppCheckpointBuilder FppCheckpointBuilder;
 
+#if defined(FPP_GS_LINK)
+// A server's link to Server Liveness.
+typedef struct FppGsLink FppGsLink;
+#endif
+
 // Accumulates one player's input frames for one epoch (04-protocol.md §7.4).
 typedef struct FppInputCommitBuilder FppInputCommitBuilder;
+
+// The keys tokens and revocation events are checked against.
+typedef struct FppKeys FppKeys;
 
 // The hosting player's endpoint.
 typedef struct FppP2pHost FppP2pHost;
 
 // A joining player's endpoint.
 typedef struct FppP2pJoiner FppP2pJoiner;
+
+// A server's SAR chain.
+typedef struct FppSarChain FppSarChain;
 
 // An Ed25519 signing key (a player's session key or a host's instance key),
 // held here or outside the SDK (`fpp_signer_external`).
@@ -216,6 +317,104 @@ typedef struct FppArInfo {
   // NUL-terminated, e.g. "windows", "android", "ios".
   uint8_t platform[33];
 } FppArInfo;
+
+// The current SAR of a chain.
+typedef struct FppSarInfo {
+  // `gs_instance_id`: the SAT's `aud` must name it.
+  uint8_t sub[32];
+  // The instance key: the server's Checkpoints verify under it
+  // (`fpp_verify_checkpoint`).
+  uint8_t cnf[32];
+  // 1 if the SAR binds an `fpp_p2p_*` endpoint: its static X25519 key,
+  // which must be the key the player dialled.
+  uint8_t has_noise_static;
+  uint8_t noise_static[32];
+  // The server's build, as Server Liveness measured it.
+  uint8_t build_id[32];
+  uint8_t server_class;
+  uint64_t iat;
+  uint64_t exp;
+  uint64_t seq;
+  // NUL-terminated.
+  uint8_t region[33];
+} FppSarInfo;
+
+// A joiner the server admitted, or (`reason` set) why it did not.
+typedef struct FppAdmitted {
+  // `fpp_types::Reason` code to send in `Reject` and close the session
+  // with; 0 when admitted.
+  uint16_t reason;
+  // The SAT's slot (the Broker placed the player there).
+  uint16_t slot;
+  // Device tier of the AR, 0..3.
+  uint8_t tier;
+  // Device ID (stable per device: what a ban names, finding H08).
+  uint8_t did[32];
+  // The SAT's account (`sub`).
+  uint8_t account[32];
+  // The AR's measured client build (finding H07).
+  uint8_t client_build[32];
+  uint8_t sat_cti[16];
+  uint64_t sat_exp;
+  // NUL-terminated.
+  uint8_t platform[33];
+  // NUL-terminated.
+  uint8_t queue[65];
+} FppAdmitted;
+
+// A decoded control message. Byte fields go to the caller's data buffer.
+typedef struct FppControl {
+  enum FppControlKind kind;
+  uint16_t code;
+  uint16_t slot;
+  uint32_t start_tick;
+  size_t first_len;
+  size_t second_len;
+} FppControl;
+
+#if defined(FPP_GS_LINK)
+// What the server joins with.
+typedef struct FppGsLinkConfig {
+  // Server Liveness, "ip:port".
+  const char *liveness;
+  // The CA (DER file) Server Liveness's TLS certificate must chain to.
+  const char *ca_cert;
+  // The regional key bundle (JSON file): SARs and revocation events are
+  // checked under it.
+  const char *bundle;
+  // A label for this server.
+  const char *gs_id;
+  // The address players dial, "ip:port" (the Broker hands it out).
+  const char *game_addr;
+  // 32-byte seed of the server's long-term Ed25519 key: Server Liveness
+  // knows the server by it.
+  const uint8_t *gs_key_seed;
+  // 32-byte Ed25519 key that signs this run's Checkpoints (an
+  // `FppSigner`'s public key); every SAR certifies it.
+  const uint8_t *instance_public_key;
+  // 32-byte static X25519 key of the server's `fpp_p2p_host`
+  // (`fpp_p2p_public_key`); every SAR binds it, and players dial it.
+  const uint8_t *noise_public_key;
+  // 32-byte SHA-256 of the server's executable, or NULL to hash the
+  // running one. With `tpm2`, Server Liveness uses the kernel's
+  // measurement instead.
+  const uint8_t *sw_hash;
+  // 1: prove the server's boot and build with a TPM 2.0 through
+  // tpm2-tools (as `gs-sim --tpm2`).
+  uint8_t tpm2;
+  // Give up joining after this long (0: 10 s).
+  uint32_t timeout_ms;
+} FppGsLinkConfig;
+#endif
+
+#if defined(FPP_GS_LINK)
+typedef struct FppGsEvent {
+  enum FppGsEventKind kind;
+  // `fpp_types::Reason` code (Closed).
+  uint16_t reason;
+  size_t data_len;
+} FppGsEvent;
+#endif
 
 // One event. Variable-size fields go into the caller's data buffer; the
 // `*_len` fields say how to split it.
@@ -621,6 +820,295 @@ enum FppStatus fpp_ar_verify_key(const uint8_t *ar,
                                  uint64_t now_s,
                                  uint8_t minimum_tier,
                                  struct FppArInfo *info);
+
+// An empty key set. Free it with `fpp_keys_free`.
+//
+// # Safety
+// `out` valid for a pointer write.
+enum FppStatus fpp_keys_new(struct FppKeys **out);
+
+// Add a 32-byte Ed25519 public key in `role` (`FPP_KEY_*`). A role may hold
+// several keys (rotation).
+//
+// # Safety
+// `keys` a live handle; `public_key` valid for 32 bytes.
+enum FppStatus fpp_keys_add(struct FppKeys *keys, uint32_t role, const uint8_t *public_key);
+
+// # Safety
+// `keys` NULL or a live handle, not used afterwards.
+void fpp_keys_free(struct FppKeys *keys);
+
+// Start a chain from a server's first SAR, checked under `keys`' Server
+// Liveness keys at `now_s` (Unix seconds). The caller then checks that it
+// is for the server it meant (`fpp_sar_chain_info`: `noise_static` is the
+// key it dialled, `sub` its SAT's audience).
+//
+// # Safety
+// `keys` a live handle; `sar` valid for `len` bytes; `out` valid for a
+// pointer write.
+enum FppStatus fpp_sar_chain_start(const struct FppKeys *keys,
+                                   const uint8_t *sar,
+                                   size_t len,
+                                   uint64_t now_s,
+                                   struct FppSarChain **out);
+
+// Extend the chain with the server's next SAR. Any error means the
+// server lost its blessing: end the session (`SAR_LAPSED`, 7). The chain
+// is unchanged on error.
+//
+// # Safety
+// `chain` a live handle; `sar` valid for `len` bytes.
+enum FppStatus fpp_sar_chain_update(struct FppSarChain *chain,
+                                    const uint8_t *sar,
+                                    size_t len,
+                                    uint64_t now_s);
+
+// `FPP_STATUS_OK` while the current SAR is valid at `now_s`, else
+// `FPP_STATUS_TOKEN_EXPIRED`. (Also count time since the last SAR on your
+// own clock: no update for three issue intervals is a lapse, 04 §6.3.)
+//
+// # Safety
+// `chain` a live handle.
+enum FppStatus fpp_sar_chain_live(const struct FppSarChain *chain, uint64_t now_s);
+
+// The chain's current SAR.
+//
+// # Safety
+// `chain` a live handle; `info` valid for a write.
+enum FppStatus fpp_sar_chain_info(const struct FppSarChain *chain, struct FppSarInfo *info);
+
+// # Safety
+// `chain` NULL or a live handle, not used afterwards.
+void fpp_sar_chain_free(struct FppSarChain *chain);
+
+// Admission for match `match_id` on the server whose instance key is
+// `instance_public_key` (the SAT's `aud` must name it), against `keys`'
+// Broker and Verifier keys (copied), refusing ARs below `minimum_tier`.
+//
+// # Safety
+// `keys` a live handle; `instance_public_key` valid for 32 bytes;
+// `match_id` valid for 16 bytes; `out` valid for a pointer write.
+enum FppStatus fpp_admission_new(const struct FppKeys *keys,
+                                 const uint8_t *instance_public_key,
+                                 const uint8_t *match_id,
+                                 uint8_t minimum_tier,
+                                 struct FppAdmission **out);
+
+// Admit only ARs whose measured client build is one of those added
+// (finding H07: a modified client cannot claim a release build where the
+// platform measures it). None added: any build.
+//
+// # Safety
+// `admission` a live handle; `build_id` valid for 32 bytes.
+enum FppStatus fpp_admission_add_client_build(struct FppAdmission *admission,
+                                              const uint8_t *build_id);
+
+// Refuse a device by its Device ID (a title's own ban list; finding H08:
+// the ID comes from the AR, which the Verifier derives from hardware where
+// the platform has it). An admitted player on that device is queued for
+// removal.
+//
+// # Safety
+// `admission` a live handle; `did` valid for 32 bytes.
+enum FppStatus fpp_admission_ban_device(struct FppAdmission *admission, const uint8_t *did);
+
+// §7.2 admission of a joiner that proved `session_key` in its handshake
+// (`fpp_p2p_host_peer_session_key`), presenting `sat` and `ar` in `Admit`,
+// at `now_s`. On success the player holds the SAT's slot until
+// `fpp_admission_remove`, and the SAT cannot be used again in this match.
+// `*out` is always filled: `reason` says what to send in `Reject` when the
+// status is not OK (a taken slot is `SAT_INVALID`).
+//
+// # Safety
+// `admission` a live handle; `sat`, `ar` and `session_key` valid for their
+// lengths; `out` valid for a write.
+enum FppStatus fpp_admission_admit(struct FppAdmission *admission,
+                                   const uint8_t *sat,
+                                   size_t sat_len,
+                                   const uint8_t *ar,
+                                   size_t ar_len,
+                                   const uint8_t *session_key,
+                                   size_t session_key_len,
+                                   uint64_t now_s,
+                                   struct FppAdmitted *out);
+
+// The player in `slot` left: the slot is free (its SAT stays used).
+//
+// # Safety
+// `admission` a live handle.
+enum FppStatus fpp_admission_remove(struct FppAdmission *admission, uint16_t slot);
+
+// A signed RevocationEvent from the Revocation Feed (Server Liveness
+// relays them to its game servers: `fpp_gs_link_poll`), checked under
+// `keys`' Enforcement keys and applied at `now_s`. `*outcome` (if not
+// NULL) says what to do next.
+//
+// # Safety
+// `admission` a live handle; `event` valid for `len` bytes; `outcome` NULL
+// or valid for a write.
+enum FppStatus fpp_admission_revocation(struct FppAdmission *admission,
+                                        const uint8_t *event,
+                                        size_t len,
+                                        uint64_t now_s,
+                                        enum FppRevocationOutcome *outcome);
+
+// Apply scheduled revocation events now in force. Call about once a
+// second. Returns `FPP_STATUS_TOKEN_REVOKED` if one revoked this server
+// instance (end the match); players removed are queued as with
+// `fpp_admission_revocation`.
+//
+// # Safety
+// `admission` a live handle.
+enum FppStatus fpp_admission_tick(struct FppAdmission *admission, uint64_t now_s);
+
+// Next admitted player a revocation (or a device ban) removed: its slot
+// and the reason code to kick it with. `FPP_STATUS_EMPTY` when none.
+//
+// # Safety
+// `admission` a live handle; `slot` and `reason` valid for writes.
+enum FppStatus fpp_admission_poll_removed(struct FppAdmission *admission,
+                                          uint16_t *slot,
+                                          uint16_t *reason);
+
+// # Safety
+// `admission` NULL or a live handle, not used afterwards.
+void fpp_admission_free(struct FppAdmission *admission);
+
+// Decode one control message from the reliable channel. Byte fields are
+// copied to `(data, cap)` back to back (`first_len`, then `second_len`);
+// `FPP_STATUS_BUFFER_TOO_SMALL` if they do not fit (`*out` holds the
+// lengths). A message type the fpp-session profile does not use is
+// `FPP_STATUS_SCHEMA`.
+//
+// # Safety
+// `message` valid for `len` bytes; `out` valid for a write; `data` NULL or
+// valid for `cap` bytes.
+enum FppStatus fpp_control_decode(const uint8_t *message,
+                                  size_t len,
+                                  struct FppControl *out,
+                                  uint8_t *data,
+                                  size_t cap);
+
+// `SarUpdate{sar}`: the server sends it first to every joiner, and every
+// new SAR to every player.
+//
+// # Safety
+// `sar` valid for `len` bytes; output per the SDK's convention.
+enum FppStatus fpp_control_sar_update(const uint8_t *sar,
+                                      size_t len,
+                                      uint8_t *out,
+                                      size_t cap,
+                                      size_t *out_len);
+
+// `Admit{sat, ar}` (empty PoP: the fpp-session handshake proved the key).
+//
+// # Safety
+// `sat`, `ar` valid for their lengths; output per the SDK's convention.
+enum FppStatus fpp_control_admit(const uint8_t *sat,
+                                 size_t sat_len,
+                                 const uint8_t *ar,
+                                 size_t ar_len,
+                                 uint8_t *out,
+                                 size_t cap,
+                                 size_t *out_len);
+
+// `Admitted{slot, start_tick}`.
+//
+// # Safety
+// Output per the SDK's convention.
+enum FppStatus fpp_control_admitted(uint16_t slot,
+                                    uint32_t start_tick,
+                                    uint8_t *out,
+                                    size_t cap,
+                                    size_t *out_len);
+
+// `Reject{code}` (`kick` 0) or `Kick{code}` (`kick` 1).
+//
+// # Safety
+// Output per the SDK's convention.
+enum FppStatus fpp_control_refuse(uint16_t code,
+                                  uint8_t kick,
+                                  uint8_t *out,
+                                  size_t cap,
+                                  size_t *out_len);
+
+// `CheckpointHead{checkpoint}`: the Checkpoint the server just signed,
+// for every player.
+//
+// # Safety
+// `checkpoint` valid for `len` bytes; output per the SDK's convention.
+enum FppStatus fpp_control_checkpoint_head(const uint8_t *checkpoint,
+                                           size_t len,
+                                           uint8_t *out,
+                                           size_t cap,
+                                           size_t *out_len);
+
+// Name of a `fpp_types::Reason` code (never NULL).
+const char *fpp_reason_str(uint16_t code);
+
+#if defined(FPP_GS_LINK)
+// Load a regional key bundle (`keys/fpp_key_bundle.json`, as `fpp-cell
+// bundle` gathers it) into a key set for the rest of the SDK.
+//
+// # Safety
+// `path` a NUL-terminated string; `out` valid for a pointer write.
+enum FppStatus fpp_keys_load_bundle(const char *path, struct FppKeys **out);
+#endif
+
+#if defined(FPP_GS_LINK)
+// Join Server Liveness and start the link. Blocks until joined (or
+// `timeout_ms`). `FPP_STATUS_GS_LINK` if it cannot reach or join Server
+// Liveness (it logs why to stderr).
+//
+// # Safety
+// `config` valid, its strings NUL-terminated and its keys valid for 32
+// bytes; `out` valid for a pointer write.
+enum FppStatus fpp_gs_link_connect(const struct FppGsLinkConfig *config, struct FppGsLink **out);
+#endif
+
+#if defined(FPP_GS_LINK)
+// The match Server Liveness gave this server: SATs name it, and the
+// server's Checkpoints must (`fpp_checkpoint_begin`).
+//
+// # Safety
+// `link` a live handle; `out` valid for 16 bytes.
+enum FppStatus fpp_gs_link_match_id(const struct FppGsLink *link, uint8_t *out);
+#endif
+
+#if defined(FPP_GS_LINK)
+// Next event, or `FPP_STATUS_EMPTY`. Its bytes go to `(data, cap)`; if
+// they do not fit the event stays queued and `FPP_STATUS_BUFFER_TOO_SMALL`
+// is returned with `event->data_len` set.
+//
+// # Safety
+// `link` a live handle; `event` valid for a write; `data` NULL or valid
+// for `cap` bytes.
+enum FppStatus fpp_gs_link_poll(struct FppGsLink *link,
+                                struct FppGsEvent *event,
+                                uint8_t *data,
+                                size_t cap);
+#endif
+
+#if defined(FPP_GS_LINK)
+// Submit a signed Checkpoint (one per epoch, from epoch 0, each `prev`
+// the last one's digest). Server Liveness revokes a server whose chain
+// breaks or that goes quiet for 30 s, so a match sends one even in its
+// lobby.
+//
+// # Safety
+// `link` a live handle; `checkpoint` valid for `len` bytes.
+enum FppStatus fpp_gs_link_submit_checkpoint(struct FppGsLink *link,
+                                             const uint8_t *checkpoint,
+                                             size_t len);
+#endif
+
+#if defined(FPP_GS_LINK)
+// Close the link (leave Server Liveness) and free it.
+//
+// # Safety
+// `link` NULL or a live handle, not used afterwards.
+void fpp_gs_link_free(struct FppGsLink *link);
+#endif
 
 // Generate a static X25519 key pair (the host's identity for its invites).
 // `private_out` and `public_out`: 32 bytes each. Keep the private key secret;

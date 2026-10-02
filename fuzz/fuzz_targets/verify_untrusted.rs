@@ -5,7 +5,7 @@ use ed25519_dalek::SigningKey;
 use fpp_crypto::{Ed25519Signer, KeyRole, KeySet};
 use fpp_tokens::admission::{admit, AdmissionPolicy, Revocations};
 use fpp_tokens::{verify_ar, verify_sat, SarChain};
-use fpp_types::{DeviceTier, GsInstanceId, MatchId};
+use fpp_types::{BuildId, DeviceTier, GsInstanceId, MatchId};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -66,6 +66,7 @@ fuzz_target!(|data: &[u8]| {
                 gs_instance_id: GsInstanceId([0; 32]),
                 matches: vec![MatchId([0; 16])],
                 min_tier: DeviceTier::D0Unknown,
+                client_builds: vec![BuildId([0; 32])],
             };
             let _ = admit(
                 &body[..mid],

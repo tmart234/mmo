@@ -2950,7 +2950,9 @@ dependencies = [
 name = "fpp-ffi"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "cbindgen",
+ "common",
  "ed25519-dalek",
  "fpp-crypto",
  "fpp-merkle",
@@ -2959,8 +2961,10 @@ dependencies = [
  "fpp-types",
  "fpp-wire",
  "p256",
+ "quinn",
  "rand 0.8.8",
  "sha2",
+ "tokio",
 ]
 
 [[package]]

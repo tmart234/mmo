@@ -17,5 +17,8 @@ no_includes = true
 rename_variants = "ScreamingSnakeCase"
 prefix_with_name = true
 
+[defines]
+"feature = gs-link" = "FPP_GS_LINK"
+
 [export]
 include = ["FppStatus", "FppInputCommitInfo", "FppCheckpointInfo"]

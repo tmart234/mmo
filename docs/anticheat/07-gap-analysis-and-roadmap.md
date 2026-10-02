@@ -245,7 +245,9 @@ lifetime). The smoke test's client checks every head of its match. Open:
 one witness (EVD-02 asks for two, one outside the publisher); reports are
 judged only while Server Liveness still holds the match (a later proof goes
 to Enforcement by hand); a head never logged proves nothing by itself; the
-C SDK does not check yet (the Halo client gets this with H5).
+C SDK checks a server's SAR chain and its heads' signatures
+(`fpp_sar_chain_*`, `fpp_verify_checkpoint`; the Halo client does, H5) but
+not yet their inclusion in the log.
 **P2 status:** all five parts and their exit tests are done, in one regional
 cell of separate processes and keys (`tools::cell`, `deploy/cell` in CI,
 `deploy/pi`). What P2 left open is listed under each part above; the cross-cutting gaps are multi-region deployment, service metrics, and TPM
