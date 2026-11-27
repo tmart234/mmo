@@ -19,6 +19,7 @@ pub mod broker;
 pub mod evidence;
 pub mod keys;
 pub mod liveness;
+pub mod policy;
 pub mod revocation;
 pub mod tlog;
 pub mod verifier;
@@ -38,8 +39,9 @@ use fpp::log::{Checkpoint, Log, Note, Witness};
 use fpp::session::StaticKeypair;
 use fpp::transport::async_io::AsyncNoiseStream;
 use fpp::transport::DEFAULT_DEADLINE;
-use keys::{CellKeys, LOG_ORIGIN, WITNESS_NAME};
+use keys::CellKeys;
 use liveness::{LivenessConfig, LivenessRole};
+use policy::AuthorityPolicy;
 use rand::{rngs::OsRng, RngCore};
 use revocation::RevocationFeed;
 use std::net::SocketAddr;
@@ -81,8 +83,7 @@ impl Drop for RunningAuthority {
 }
 
 impl Authority {
-    /// Open a complete regional authority cell in `dir`, write `bundle_path`,
-    /// and optionally spawn the internal Witness cosigner.
+    /// Open a complete regional authority cell in `dir` with default `AuthorityPolicy`.
     pub fn open_all(
         dir: &Path,
         bundle_path: Option<&Path>,
@@ -90,19 +91,51 @@ impl Authority {
         attestation: ClientAttestation,
         witness_interval: Option<Duration>,
     ) -> Result<RunningAuthority> {
+        Self::open_with_policy(
+            dir,
+            bundle_path,
+            AuthorityPolicy::default(),
+            liveness_cfg,
+            attestation,
+            witness_interval,
+        )
+    }
+
+    /// Open a complete regional authority cell in `dir` for a specific title/region
+    /// `policy`, write `bundle_path`, and optionally spawn the internal Witness cosigner.
+    pub fn open_with_policy(
+        dir: &Path,
+        bundle_path: Option<&Path>,
+        policy: AuthorityPolicy,
+        mut liveness_cfg: LivenessConfig,
+        attestation: ClientAttestation,
+        witness_interval: Option<Duration>,
+    ) -> Result<RunningAuthority> {
+        policy.validate()?;
+        liveness_cfg.issuer = policy.liveness_iss();
+        liveness_cfg.region = policy.region.clone();
+        liveness_cfg.max_slots = policy.max_slots;
+        liveness_cfg.sar_interval_s = policy.sar_interval_s;
+        liveness_cfg.sar_ttl_s = policy.sar_ttl_s;
+        if liveness_cfg.gs_program_path == policy::DEFAULT_GS_PROGRAM_PATH {
+            liveness_cfg.gs_program_path = policy.gs_program_path.clone();
+        }
+
         let cell_keys = CellKeys::open(dir)?;
-        let bundle = cell_keys.bundle();
+        let bundle = cell_keys.bundle_for(&policy);
         if let Some(p) = bundle_path {
             bundle
                 .save(p)
                 .map_err(|e| anyhow!("save bundle {}: {e}", p.display()))?;
         }
 
+        let log_origin = policy.log_origin();
+        let witness_name = policy.witness_name();
         let log_key = keys::load_log_hybrid(dir)?;
-        let raw_log = Log::open(dir.join("log/data"), LOG_ORIGIN, log_key, 60)
+        let raw_log = Log::open(dir.join("log/data"), &log_origin, log_key, 60)
             .map_err(|e| anyhow!("open Transparency Log: {e}"))?;
         let witnesses = vec![(
-            WITNESS_NAME.to_string(),
+            witness_name.clone(),
             cell_keys.witness.verifying_key().to_bytes(),
         )];
         let log = Arc::new(LogEngine::open(raw_log, witnesses)?);
@@ -110,9 +143,9 @@ impl Authority {
         let witness_task = match witness_interval {
             Some(interval) => {
                 let w = Witness::open(
-                    WITNESS_NAME,
+                    &witness_name,
                     cell_keys.witness.clone(),
-                    LOG_ORIGIN,
+                    &log_origin,
                     cell_keys.log.ed25519_public().to_bytes(),
                     cell_keys.log.ml_dsa_public().to_vec(),
                     dir.join("witness/state"),
@@ -139,14 +172,17 @@ impl Authority {
         );
         let verifier = Arc::new(VerifierRole {
             key: fpp::crypto::Ed25519Signer::new(keys::load_ed25519(dir, "verifier")?),
+            did_key: cell_keys.did_key,
+            policy: policy.clone(),
             attestation,
             deadline: liveness_deadline,
         });
-        let broker = BrokerRole::new(
+        let broker = BrokerRole::new_with_policy(
             fpp::crypto::Ed25519Signer::new(keys::load_ed25519(dir, "broker")?),
             cell_keys.verifier.verifying_key(),
             Placer::Local(liveness.clone()),
             Some(revocation.clone()),
+            policy,
         );
 
         let authority = Arc::new(Authority {

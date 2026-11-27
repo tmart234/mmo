@@ -2,7 +2,10 @@
 //!
 //! Subcommands (zero-dep CLI parser, no clap/proc-macros):
 //!   fppd init     [--dir cell] [--bundle keys/fpp_key_bundle.json]
+//!                 [--policy FILE] [--domain DOMAIN]
 //!   fppd serve    [--dir cell] [--bundle keys/fpp_key_bundle.json] [--bind 127.0.0.1:4444]
+//!                 [--policy FILE] [--domain DOMAIN] [--region REGION] [--policy-ver N]
+//!                 [--max-slots N] [--queue NAME:TIER]... [--sar-interval-s N] [--sar-ttl-s N]
 //!                 [--tpm-ek-roots PEM] [--build-registry FILE] [--gs-program PATH]
 //!                 [--require-secure-boot] [--client-builds FILE] [--no-witness]
 //!                 [--witness-interval-s 1]
@@ -31,8 +34,9 @@ use fpp::tokens::{verify_ar, verify_sat};
 use fpp::types::Reason;
 use fpp::wire::{Action, Scope, SubjectKind};
 use fpp_attest::tpm::Registry;
-use fppd::keys::{self, CellKeys, LOG_ORIGIN, WITNESS_NAME};
+use fppd::keys::{self, CellKeys};
 use fppd::liveness::LivenessConfig;
+use fppd::policy::AuthorityPolicy;
 use fppd::revocation::Order;
 use fppd::verifier::{ClientAttestation, ClientBuilds};
 use fppd::{
@@ -120,19 +124,33 @@ async fn dispatch(mut args: Args) -> Result<()> {
 fn cmd_init(mut args: Args) -> Result<()> {
     let mut dir = PathBuf::from("cell");
     let mut bundle = PathBuf::from(DEFAULT_BUNDLE);
+    let mut policy = AuthorityPolicy::default();
+    let mut domain_override: Option<String> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--dir" => dir = PathBuf::from(args.value("--dir")?),
             "--bundle" => bundle = PathBuf::from(args.value("--bundle")?),
+            "--policy" => {
+                let p = PathBuf::from(args.value("--policy")?);
+                let text =
+                    std::fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
+                policy = AuthorityPolicy::parse(&text)?;
+            }
+            "--domain" => domain_override = Some(args.value("--domain")?),
             other => bail!("init: unknown flag {other}"),
         }
     }
+    if let Some(d) = domain_override {
+        policy.domain = d;
+    }
+    policy.validate()?;
     let keys = CellKeys::open(&dir)?;
-    keys.bundle()
+    keys.bundle_for(&policy)
         .save(&bundle)
         .map_err(|e| anyhow!("save bundle: {e}"))?;
     println!(
-        "[fppd] initialized isolated role keys in {} and wrote {}",
+        "[fppd] initialized isolated role keys for {} in {} and wrote {}",
+        policy.domain,
         dir.display(),
         bundle.display()
     );
@@ -143,10 +161,19 @@ async fn cmd_serve(mut args: Args) -> Result<()> {
     let mut dir = PathBuf::from("cell");
     let mut bundle = PathBuf::from(DEFAULT_BUNDLE);
     let mut bind: SocketAddr = "127.0.0.1:4444".parse()?;
+    let mut policy = AuthorityPolicy::default();
+    let mut policy_file: Option<PathBuf> = None;
+    let mut domain_override: Option<String> = None;
+    let mut region_override: Option<String> = None;
+    let mut policy_ver_override: Option<u64> = None;
+    let mut max_slots_override: Option<u16> = None;
+    let mut sar_interval_override: Option<u64> = None;
+    let mut sar_ttl_override: Option<u64> = None;
+    let mut extra_queues: Vec<(String, fpp::types::DeviceTier)> = Vec::new();
     let mut ek_roots: Option<PathBuf> = None;
     let mut build_registry: Option<PathBuf> = None;
     let mut client_builds: Option<PathBuf> = None;
-    let mut gs_program = liveness_default_program();
+    let mut gs_program_override: Option<String> = None;
     let mut require_secure_boot = false;
     let mut no_witness = false;
     let mut witness_interval_s = 1u64;
@@ -156,6 +183,18 @@ async fn cmd_serve(mut args: Args) -> Result<()> {
             "--dir" => dir = PathBuf::from(args.value("--dir")?),
             "--bundle" => bundle = PathBuf::from(args.value("--bundle")?),
             "--bind" => bind = args.value("--bind")?.parse()?,
+            "--policy" => policy_file = Some(PathBuf::from(args.value("--policy")?)),
+            "--domain" => domain_override = Some(args.value("--domain")?),
+            "--region" => region_override = Some(args.value("--region")?),
+            "--policy-ver" => policy_ver_override = Some(args.value("--policy-ver")?.parse()?),
+            "--max-slots" => max_slots_override = Some(args.value("--max-slots")?.parse()?),
+            "--sar-interval-s" => {
+                sar_interval_override = Some(args.value("--sar-interval-s")?.parse()?)
+            }
+            "--sar-ttl-s" => sar_ttl_override = Some(args.value("--sar-ttl-s")?.parse()?),
+            "--queue" => {
+                extra_queues.push(AuthorityPolicy::parse_queue_spec(&args.value("--queue")?)?)
+            }
             "--tpm-ek-roots" => ek_roots = Some(PathBuf::from(args.value("--tpm-ek-roots")?)),
             "--build-registry" => {
                 build_registry = Some(PathBuf::from(args.value("--build-registry")?))
@@ -163,7 +202,7 @@ async fn cmd_serve(mut args: Args) -> Result<()> {
             "--client-builds" => {
                 client_builds = Some(PathBuf::from(args.value("--client-builds")?))
             }
-            "--gs-program" => gs_program = args.value("--gs-program")?,
+            "--gs-program" => gs_program_override = Some(args.value("--gs-program")?),
             "--require-secure-boot" => require_secure_boot = true,
             "--no-witness" => no_witness = true,
             "--witness-interval-s" => {
@@ -173,8 +212,36 @@ async fn cmd_serve(mut args: Args) -> Result<()> {
         }
     }
 
+    if let Some(p) = &policy_file {
+        let text = std::fs::read_to_string(p).with_context(|| format!("read {}", p.display()))?;
+        policy = AuthorityPolicy::parse(&text)?;
+    }
+    if let Some(d) = domain_override {
+        policy.domain = d;
+    }
+    if let Some(r) = region_override {
+        policy.region = r;
+    }
+    if let Some(v) = policy_ver_override {
+        policy.policy_ver = v;
+    }
+    if let Some(n) = max_slots_override {
+        policy.max_slots = n;
+    }
+    if let Some(s) = sar_interval_override {
+        policy.sar_interval_s = s.max(1);
+    }
+    if let Some(s) = sar_ttl_override {
+        policy.sar_ttl_s = s.max(2);
+    }
+    if let Some(g) = gs_program_override {
+        policy.gs_program_path = g;
+    }
+    for (name, tier) in extra_queues {
+        policy.queues.insert(name, tier);
+    }
+
     let mut liveness_cfg = LivenessConfig {
-        gs_program_path: gs_program,
         require_secure_boot,
         ..LivenessConfig::default()
     };
@@ -202,10 +269,13 @@ async fn cmd_serve(mut args: Args) -> Result<()> {
         attestation.client_builds = ClientBuilds::parse(&text)?;
     }
 
+    let domain = policy.domain.clone();
+    let region = policy.region.clone();
     let witness_interval = (!no_witness).then(|| Duration::from_secs(witness_interval_s.max(1)));
-    let running = Authority::open_all(
+    let running = Authority::open_with_policy(
         &dir,
         Some(&bundle),
+        policy,
         liveness_cfg,
         attestation,
         witness_interval,
@@ -215,7 +285,7 @@ async fn cmd_serve(mut args: Args) -> Result<()> {
         .with_context(|| format!("bind {bind}"))?;
     let actual = listener.local_addr()?;
     println!(
-        "[fppd] ready on {actual} (bundle: {}, transport: {}..)",
+        "[fppd] ready on {actual} (domain: {domain}, region: {region}, bundle: {}, transport: {}..)",
         bundle.display(),
         hex::encode(&running.bundle.transport_pub[..6])
     );
@@ -229,10 +299,6 @@ async fn cmd_serve(mut args: Args) -> Result<()> {
     }
     drop(running);
     Ok(())
-}
-
-fn liveness_default_program() -> String {
-    fppd::liveness::DEFAULT_GS_PROGRAM_PATH.to_string()
 }
 
 async fn cmd_role(mut args: Args) -> Result<()> {
@@ -258,16 +324,26 @@ async fn cmd_role(mut args: Args) -> Result<()> {
                 .ok_or_else(|| anyhow!("bundle has no Transparency Log keys"))?;
             let admin = keys::load_noise(&dir, "admin")?;
             let sk = keys::load_ed25519(&dir, "witness")?;
+            let my_pub = sk.verifying_key().to_bytes();
+            let witness_name = log_keys
+                .witnesses
+                .iter()
+                .find(|(_, k)| *k == my_pub)
+                .map(|(n, _)| n.clone())
+                .unwrap_or_else(|| format!("{}/witness", log_keys.origin.trim_end_matches("/log")));
             let mut witness = Witness::open(
-                WITNESS_NAME,
+                &witness_name,
                 sk,
-                LOG_ORIGIN,
+                &log_keys.origin,
                 log_keys.ed25519,
                 log_keys.ml_dsa,
                 dir.join("witness/state"),
             )
             .map_err(|e| anyhow!("{e}"))?;
-            println!("[witness] following {log_addr}");
+            println!(
+                "[witness] {witness_name} following {log_addr} ({})",
+                log_keys.origin
+            );
             let mut last_logged = u64::MAX;
             loop {
                 tokio::select! {

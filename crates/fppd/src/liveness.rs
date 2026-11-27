@@ -32,14 +32,15 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-pub const LIVENESS_ISS: &str = "liveness.dev";
-pub const REGION: &str = "dev";
-pub const SAR_INTERVAL: Duration = Duration::from_secs(2);
-pub const SAR_TTL_S: u64 = 10;
-pub const DEFAULT_GS_PROGRAM_PATH: &str = "/usr/local/bin/gs-sim";
+pub const DEFAULT_GS_PROGRAM_PATH: &str = crate::policy::DEFAULT_GS_PROGRAM_PATH;
 
 #[derive(Clone, Debug)]
 pub struct LivenessConfig {
+    pub issuer: String,
+    pub region: String,
+    pub max_slots: u16,
+    pub sar_interval_s: u64,
+    pub sar_ttl_s: u64,
     pub admission_timeout_ms: u64,
     pub join_max_skew_ms: u64,
     pub checkpoint_timeout_ms: u64,
@@ -51,13 +52,19 @@ pub struct LivenessConfig {
 
 impl Default for LivenessConfig {
     fn default() -> Self {
+        let p = crate::policy::AuthorityPolicy::default();
         Self {
+            issuer: p.liveness_iss(),
+            region: p.region,
+            max_slots: p.max_slots,
+            sar_interval_s: p.sar_interval_s,
+            sar_ttl_s: p.sar_ttl_s,
             admission_timeout_ms: 10_000,
             join_max_skew_ms: 120_000,
             checkpoint_timeout_ms: 30_000,
             tpm_ek_roots: Vec::new(),
             build_registry: HashMap::new(),
-            gs_program_path: DEFAULT_GS_PROGRAM_PATH.into(),
+            gs_program_path: p.gs_program_path,
             require_secure_boot: false,
         }
     }
@@ -123,10 +130,14 @@ impl LivenessRole {
         Duration::from_millis(self.config.admission_timeout_ms)
     }
 
-    /// Reserve a slot on a live, blessed game server (used directly by Broker or via Place RPC).
+    /// Reserve a slot on the least-loaded live, blessed game server / shard
+    /// below `config.max_slots`.
     pub fn place(&self) -> Option<Placement> {
         let mut sessions = self.sessions.write().expect("sessions lock");
-        let (&match_id, s) = sessions.iter_mut().find(|(_, s)| !s.revoked)?;
+        let (&match_id, s) = sessions
+            .iter_mut()
+            .filter(|(_, s)| !s.revoked && s.next_slot < self.config.max_slots)
+            .min_by_key(|(_, s)| s.next_slot)?;
         let slot = s.next_slot;
         s.next_slot = s.next_slot.checked_add(1)?;
         Some(Placement {
@@ -157,7 +168,7 @@ impl LivenessRole {
     }
 
     fn apply_revocation(&self, event: &RevocationEvent, cose: Vec<u8>) {
-        if !event.scope.covers(Some(REGION), None) {
+        if !event.scope.covers(Some(&self.config.region), None) {
             return;
         }
         if event.subject_kind == SubjectKind::GsInstance {
@@ -197,15 +208,15 @@ impl LivenessRole {
     ) -> Vec<u8> {
         let iat = now_s();
         let sar = ServerAttestationResult {
-            iss: LIVENESS_ISS.into(),
+            iss: self.config.issuer.clone(),
             sub: instance_id(instance_pub),
             iat,
-            exp: iat + SAR_TTL_S,
+            exp: iat + self.config.sar_ttl_s,
             cnf: *instance_pub,
             tls_spki_sha256: None,
             server_class: ServerClass::FirstParty,
             build_id: BuildId(*sw_hash),
-            region: REGION.into(),
+            region: self.config.region.clone(),
             seq,
             prev,
             vrf_pub: None,
@@ -349,7 +360,8 @@ impl LivenessRole {
         // Replay existing revocations in force immediately.
         if let Some(feed) = &self.feed {
             for (ev, cose) in feed.all_events().await {
-                if ev.scope.covers(Some(REGION), None) && ev.subject_kind != SubjectKind::GsInstance
+                if ev.scope.covers(Some(&self.config.region), None)
+                    && ev.subject_kind != SubjectKind::GsInstance
                 {
                     let _ = tx.send(ToGameServer::Revocation(cose));
                 }
@@ -491,7 +503,7 @@ async fn sar_loop_task(
             break;
         }
         seq += 1;
-        tokio::time::sleep(SAR_INTERVAL).await;
+        tokio::time::sleep(Duration::from_secs(role.config.sar_interval_s.max(1))).await;
     }
 }
 
