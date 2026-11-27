@@ -1,100 +1,56 @@
-# mmo
+# Fair-Play Protocol (FPP v1)
 
-## High-level Idea
-Client <-> GS <-> trust plane, speaking the Fair-Play Protocol (FPP v1).
+**A fairness-maximalist, cryptographically enforced authority & trust protocol for video games.**
 
-- **Trust plane** – a regional *cell* of separate services, each its own
-  process with its own key, so one failing or compromised takes neither the
-  others' keys nor their availability (docs/anticheat/03 §3):
-  - **Server Liveness** (`svc-liveness`) admits game servers on their TPM
-    2.0 evidence, keeps each one "blessed" with a short-lived, hash-chained
-    **Server Attestation Result (SAR)**, verifies one signed **Checkpoint**
-    per epoch from each, and revokes by simply stopping SARs.
-  - **Verifier** (`svc-verifier`) appraises a client's platform evidence
-    and signs an **Attestation Result (AR)** with its device trust tier.
-  - **Broker** (`svc-broker`) takes an AR, applies the queue's tier floor,
-    has Server Liveness reserve a slot on a live GS (over the cell's mutual
-    TLS), and signs a **Session Admission Token (SAT)** for that match.
-  - **Revocation Feed** (`svc-revocation`) carries Enforcement's signed
-    revocation events (`fpp-enforce`) to the Broker and Server Liveness,
-    which relays them to game servers; every event is in the Transparency
-    Log first.
-  - **Evidence Store** (`svc-evidence`) keeps the Checkpoints Server
-    Liveness verified, content addressed, for auditors (`fpp-evidence`).
-  - **Transparency Log** and its **witness** (`svc-log`, `svc-witness`):
-    revocation events, enforcement records and every Checkpoint Server
-    Liveness verified; players check theirs against it.
-- **GS** – runs the match. Clients join over **fpp-session** (Noise over UDP,
-  ADR-002): the GS shows its current SAR, checks `Admit{SAT, AR}`, applies
-  clients' *intent* (never positions), and signs a Checkpoint per epoch.
-- **Client** – refuses to play unless the GS's SAR chain certifies the exact
-  key it connected to, and stops the moment that chain lapses. It commits to
-  its inputs every epoch with a signed **InputCommit**, and checks the
-  Checkpoints the GS showed it against the Transparency Log: a different
-  one there is a split view, which it reports and Server Liveness revokes.
-
-Flow:
-1. **GS join** (QUIC, TLS 1.3 with X25519MLKEM768, to Server Liveness):
-   challenge → `JoinRequest` signed by the GS long-term key, binding its
-   instance key, game-port key and address → `JoinAccept`. With a TPM 2.0
-   (`gs-sim --tpm2`) it also carries a quote over the challenge, the boot
-   and IMA logs and the EK certificate, and Server Liveness runs credential
-   activation and checks the build the kernel measured (`TPM_GUIDE.md`).
-2. **Liveness**: Server Liveness → GS a new SAR every 2 s (`exp = iat + 10
-   s`); GS → Server Liveness a signed Checkpoint every epoch. No Checkpoint,
-   or a bad one, revokes the GS: SARs stop.
-3. **Client admission**: Verifier challenge → session-key proof and
-   evidence → AR (tier D0 until platform evidence is appraised, P3); then
-   Broker challenge → the AR, used by its session key → SAT for a slot,
-   refused where the queue's tier floor is higher (e.g. `verified`).
-4. **Join the GS** (fpp-session): Noise IK to the GS key the Broker named →
-   `SarUpdate` → client checks it → `Admit{SAT, AR}` → `Admitted{slot}`.
-5. **Play**: InputFrames (unreliable, redundant) per tick; InputCommit per
-   epoch and SarUpdate / CheckpointHead messages on the reliable channel.
-6. **Revocation**: Enforcement's event reaches the GS through the feed and
-   Server Liveness, and the GS removes the players it names (p99 well under
-   5 s, `make ci`). A revoked GS gets no more SARs: it kicks everyone, and
-   if it ignores that too its clients drop within 3 issue intervals, on
-   their own.
-
-> **Design and spec:** [`docs/anticheat/`](docs/anticheat/README.md): threat
-> model, requirements, architecture, protocol spec (FPP v1), ADRs and roadmap.
+Every authority claim, device attestation, match admission, input commit, checkpoint, and enforcement revocation is encoded in **owned strict deterministic CBOR / COSE_Sign1** (`crates/fpp`), carried over **owned `Noise_IK_25519_ChaChaPoly_SHA256` transport** (UDP game sessions and framed TCP control links pinned directly to static X25519 keys — zero X.509 PKI ceremony, zero `bincode`/`serde` on the wire), and anchored in a **hybrid Ed25519 + ML-DSA-65 C2SP Transparency Log** with independent witness cosigning.
 
 ---
 
-### Quick Start
+## Owned 5-Crate Architecture
+
+| Crate | Purpose |
+|---|---|
+| [`crates/fpp`](crates/fpp) | Complete `#![forbid(unsafe_code)]` FPP v1 protocol crate: deterministic CBOR/COSE, Ed25519/ES256/ML-DSA-65 + SHA-256/HMAC/ChaCha20-Poly1305 primitives, RFC 9162 Merkle trees, AR/SAT/SAR tokens, Noise IK UDP game sessions (`fpp::session`), Noise IK framed TCP control transport (`fpp::transport`), unified `GsLink` client, C2SP Transparency Log + Witness (`log` feature), evidence auditor, and TPM 2.0 collector. |
+| [`crates/fpp-attest`](crates/fpp-attest) | Feature-gated hardware attestation appraisal (`default = ["tpm"]`, optional `mobile`): TPM 2.0 quotes/PCRs/WBCL/IMA/credential activation + Android KeyMint/Play Integrity + Apple App Attest. Core protocol stays 100% vendor-independent. |
+| [`crates/fpp-ffi`](crates/fpp-ffi) | Pure-Rust C/C++ SDK (`libfpp.a` + `include/fpp.h`) including `gs-link` with zero `tokio`/`quinn`/`rustls`/`aws-lc` — cross-compiles cleanly to 32-bit `i686` (Halo: CE ABI) and `aarch64` (Raspberry Pi). Exports `fpp_sha256`, `fpp_hmac_sha256`, `fpp_aead_seal`, and `fpp_aead_open` so game titles never hand-roll crypto. |
+| [`crates/fppd`](crates/fppd) | Unified authority daemon & operator CLI (`fppd init`, `fppd serve`, `fppd role witness`, `fppd enforce`, `fppd evidence`, `fppd audit`, `fppd ticket`). Consolidates all trust-plane roles into one binary while preserving strictly isolated per-role signing keys (`KeyRole` allowlists) and supporting standalone independent witnesses. |
+| [`crates/fpp-sim`](crates/fpp-sim) | Headless reference client, reference game server (sharing `fpp::gs_link::GsLink`), and all 5 end-to-end adversarial exit test suites (`smoke`, `revocation_load`, `split_view`, `attestation_exit`, `verified_exit`). |
+
+---
+
+## Cryptographic Enforcement Flow
+
+1. **GS Join & Blessing** (`Noise_IK` TCP pinned to `bundle.transport_pub` + CBOR): Server Liveness challenges the game server, verifies its long-term key + TPM 2.0 EK/AK/PCR/IMA evidence & credential activation, and streams hash-chained **Server Attestation Results (SARs)** every 2 s (`exp = iat + 10 s`). Missing or invalid epoch **Checkpoints** stop SARs immediately.
+2. **Client Attestation & Admission**: Verifier appraises hardware evidence (TPM 2.0 / Android / Apple) bound to the client's session key (Ed25519 or hardware-resident ES256) and signs an **Attestation Result (AR)**. Broker checks the AR, enforces queue tier floors (`open`, `verified` D2, `hardened` D3) and active revocations, reserves a slot on a live GS, and signs a **Session Admission Token (SAT)**.
+3. **Game Session (`fpp::session`)**: Noise IK over UDP to the GS static key named by the Broker. Client verifies the server's SAR chain binds that exact static key and match audience before presenting `Admit{SAT, AR}`. Every epoch, the client signs an `InputCommit` and checks server `CheckpointHead`s against the Transparency Log (Ed25519 + ML-DSA-65 + witness cosignature + Merkle inclusion proof).
+4. **Revocation & Split-View Protection**: Enforcement revocations are logged in the Transparency Log first, relayed to Broker & live game servers (p99 kick < 1 s), and if a rogue GS ignores its revocation or equivocates on a Checkpoint, clients drop it on their own within one SAR lifetime (10 s).
+
+> **Design and spec:** [`docs/anticheat/`](docs/anticheat/README.md)
+
+---
+
+## Quick Start
 
 ```bash
-# dev keys: a dev CA and public TLS certificates (keys/), and a cell with
-# each service's identity (cell/); services make their signing keys on first start
-cargo run -p tools --bin gen_keys
+# Run unified regional authority daemon (writes keys/fpp_key_bundle.json)
+cargo run -p fppd -- serve
 
-# a cell in containers (Server Liveness, Verifier, Broker): deploy/cell/README.md
-docker compose -f deploy/cell/docker-compose.yml up --build
+# Or run authority + independent witness in containers (2 services)
+docker compose -f deploy/cell/docker-compose.yml up -d --build
 
-# run full CI-lite (fmt, clippy, tests, smoke)
-make ci
+# Run full CI (fmt, clippy, unit/integration tests, all 5 adversarial exit suites,
+# Python golden-vector interop, Go sumdb interop, C SDK conformance)
+FPP_REQUIRE_SWTPM=1 FPP_REQUIRE_GO=1 make ci
 
-# dependency policy (advisories, licenses, sources), as in CI
+# Dependency policy (zero ignored advisories)
 cargo deny check
 
-# C SDK for C/C++ games (include/fpp.h + libfpp.a): conformance, 64-bit and Halo's 32-bit ABI
+# C SDK conformance (64-bit x86_64 and 32-bit i686 Halo ABI)
 make ffi-c-test
 make ffi-c-test-i686
 
-# Raspberry Pi: the cell on a Pi Zero 2 W, SDK for the Pi 5 host (deploy/pi/README.md)
+# Raspberry Pi (aarch64) single-binary authority + emulation smoke
 make pi-cell pi-cell-smoke ffi-c-test-aarch64
-
-# fuzz the wire decoders and verifiers (nightly + cargo-fuzz)
-cargo +nightly fuzz run wire_decode -- -max_total_time=60
-cargo +nightly fuzz run verify_untrusted -- -max_total_time=60
 ```
 
-Every QUIC link to a service verifies its certificate against
-`keys/dev_ca.der` (and its name, `liveness.dev`, `verifier.dev`,
-`broker.dev`) and negotiates X25519MLKEM768; services call each other over
-mutual TLS with the cell's own CA. Everyone trusts the role keys in
-`keys/fpp_key_bundle.json` (Verifier, Broker, Server Liveness), which
-`tools::cell` or `fpp-cell bundle cell` gathers from what each service
-publishes in `cell/public/`. Clients drop a GS as soon as its SAR
-chain breaks or goes stale. Nothing in `keys/` or `cell/` is committed.
+Nothing in `keys/` or `cell/` is committed to git. Every client and game server trusts only the public role keys and pinned Noise X25519 `transport_pub` in `keys/fpp_key_bundle.json`.

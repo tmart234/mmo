@@ -4,13 +4,13 @@
 
 use ed25519_dalek::SigningKey;
 use fpp::*;
-use fpp_crypto::{sign, Ed25519Signer};
-use fpp_tokens::{
+use fpp_core::crypto::{sign, Ed25519Signer};
+use fpp_core::tokens::{
     instance_id, sar_link, AttestationResult, Features, ServerAttestationResult,
     SessionAdmissionToken,
 };
-use fpp_types::{BuildId, DeviceTier, Did, Digest, MatchId, Reason, ServerClass};
-use fpp_wire::{Action, RevocationEvent, Scope, SubjectKind};
+use fpp_core::types::{BuildId, DeviceTier, Did, Digest, MatchId, Reason, ServerClass};
+use fpp_core::wire::{Action, RevocationEvent, Scope, SubjectKind};
 use std::ptr;
 
 const NOW: u64 = 1_790_000_000;
@@ -93,7 +93,7 @@ fn ar(session: &Ed25519Signer, cti: u8, did: u8) -> AttestationResult {
         iat: NOW,
         exp: NOW + 1800,
         cti: [cti; 16],
-        cnf: fpp_types::SessionKey::Ed25519(public(session)),
+        cnf: fpp_core::types::SessionKey::Ed25519(public(session)),
         nonce: [2; 32],
         did: Did([did; 32]),
         tier: DeviceTier::D2Hardware,

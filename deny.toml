@@ -1,5 +1,5 @@
 # cargo-deny policy (CI job `dependency-policy`, blocking). Run locally with
-# `cargo deny check`. Every ignore needs a reason and an exit plan.
+# `cargo deny check`. Zero advisory ignores after eliminating bincode and client-bevy.
 
 [graph]
 all-features = false
@@ -7,14 +7,8 @@ all-features = false
 [advisories]
 version = 2
 yanked = "deny"
-# Flag unmaintained crates we depend on directly; transitive ones (mostly the
-# Bevy reference client's font/GUI stack) are tracked upstream.
 unmaintained = "workspace"
-ignore = [
-    { id = "RUSTSEC-2025-0141", reason = "bincode 1.x is unmaintained; wire encoding moves to deterministic CBOR/COSE in fpp-wire (roadmap P1, docs/anticheat/04-protocol.md §2)" },
-    { id = "RUSTSEC-2026-0194", reason = "quick-xml via wayland-scanner: build-time codegen over trusted Wayland protocol XML in the Bevy reference client only; never parses runtime input. Clears with the next Bevy upgrade." },
-    { id = "RUSTSEC-2026-0195", reason = "same as RUSTSEC-2026-0194" },
-]
+ignore = []
 
 [licenses]
 version = 2
@@ -35,7 +29,6 @@ allow = [
 ]
 
 [bans]
-# The Bevy reference client pulls many duplicate versions; not worth failing on.
 multiple-versions = "allow"
 wildcards = "deny"
 # Workspace crates depend on each other by path.

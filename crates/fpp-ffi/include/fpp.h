@@ -35,6 +35,9 @@
 
 #define FPP_FEATURE_STRONGBOX (1 << 9)
 
+// Bytes [`fpp_aead_seal`] adds to a plaintext: 12-byte random nonce + 16-byte Poly1305 tag.
+#define FPP_AEAD_OVERHEAD 28
+
 // `fpp_keys_add` roles: the regional key bundle's keys.
 #define FPP_KEY_VERIFIER 1
 
@@ -189,9 +192,7 @@ typedef enum FppControlKind {
 // `FppGsEvent.kind`.
 typedef enum FppGsEventKind {
 #if defined(FPP_GS_LINK)
-  // data = the next SAR, already checked: it continues the chain and
-  // certifies this server's keys. Send it to every player
-  // (`fpp_control_sar_update`).
+  // data = the next SAR, already checked.
   FPP_GS_EVENT_KIND_SAR = 1,
 #endif
 #if defined(FPP_GS_LINK)
@@ -199,8 +200,7 @@ typedef enum FppGsEventKind {
   FPP_GS_EVENT_KIND_REVOCATION = 2,
 #endif
 #if defined(FPP_GS_LINK)
-  // The link is gone (`reason`): the server is no longer blessed. End
-  // the match; players drop on their own once its SARs stop.
+  // The link is gone (`reason`): the server is no longer blessed.
   FPP_GS_EVENT_KIND_CLOSED = 3,
 #endif
 } FppGsEventKind;
@@ -341,7 +341,7 @@ typedef struct FppSarInfo {
 
 // A joiner the server admitted, or (`reason` set) why it did not.
 typedef struct FppAdmitted {
-  // `fpp_types::Reason` code to send in `Reject` and close the session
+  // `fpp_core::types::Reason` code to send in `Reject` and close the session
   // with; 0 when admitted.
   uint16_t reason;
   // The SAT's slot (the Broker placed the player there).
@@ -377,30 +377,28 @@ typedef struct FppControl {
 typedef struct FppGsLinkConfig {
   // Server Liveness, "ip:port".
   const char *liveness;
-  // The CA (DER file) Server Liveness's TLS certificate must chain to.
+  // Legacy optional CA path (retained for C ABI compatibility; Noise IK
+  // pins `transport_pub` directly from `bundle`).
   const char *ca_cert;
-  // The regional key bundle (JSON file): SARs and revocation events are
-  // checked under it.
+  // The regional key bundle (JSON or CBOR file): carries Server Liveness's
+  // signing key, Enforcement's key, and the pinned Noise `transport_pub`.
   const char *bundle;
   // A label for this server.
   const char *gs_id;
   // The address players dial, "ip:port" (the Broker hands it out).
   const char *game_addr;
-  // 32-byte seed of the server's long-term Ed25519 key: Server Liveness
-  // knows the server by it.
+  // 32-byte seed of the server's long-term Ed25519 key.
   const uint8_t *gs_key_seed;
-  // 32-byte Ed25519 key that signs this run's Checkpoints (an
-  // `FppSigner`'s public key); every SAR certifies it.
+  // 32-byte Ed25519 key that signs this run's Checkpoints.
   const uint8_t *instance_public_key;
-  // 32-byte static X25519 key of the server's `fpp_p2p_host`
-  // (`fpp_p2p_public_key`); every SAR binds it, and players dial it.
+  // 32-byte static X25519 key of the server's `fpp_p2p_host`.
   const uint8_t *noise_public_key;
   // 32-byte SHA-256 of the server's executable, or NULL to hash the
   // running one. With `tpm2`, Server Liveness uses the kernel's
   // measurement instead.
   const uint8_t *sw_hash;
   // 1: prove the server's boot and build with a TPM 2.0 through
-  // tpm2-tools (as `gs-sim --tpm2`).
+  // tpm2-tools.
   uint8_t tpm2;
   // Give up joining after this long (0: 10 s).
   uint32_t timeout_ms;
@@ -410,7 +408,7 @@ typedef struct FppGsLinkConfig {
 #if defined(FPP_GS_LINK)
 typedef struct FppGsEvent {
   enum FppGsEventKind kind;
-  // `fpp_types::Reason` code (Closed).
+  // `fpp_core::types::Reason` code (Closed).
   uint16_t reason;
   size_t data_len;
 } FppGsEvent;
@@ -421,7 +419,7 @@ typedef struct FppGsEvent {
 typedef struct FppP2pEvent {
   enum FppP2pEventKind kind;
   uint32_t peer;
-  // `fpp_types::Reason` code (PeerLeft, Closed).
+  // `fpp_core::types::Reason` code (PeerLeft, Closed).
   uint16_t reason;
   uint8_t has_key;
   uint8_t key[32];
@@ -821,6 +819,44 @@ enum FppStatus fpp_ar_verify_key(const uint8_t *ar,
                                  uint8_t minimum_tier,
                                  struct FppArInfo *info);
 
+// HMAC-SHA256 (RFC 2104) of `data` under `key`.
+//
+// # Safety
+// `key` valid for `key_len` bytes (when `key_len > 0`); `data` valid for
+// `len` bytes (when `len > 0`); `out` valid for 32 bytes.
+enum FppStatus fpp_hmac_sha256(const uint8_t *key,
+                               size_t key_len,
+                               const uint8_t *data,
+                               size_t len,
+                               uint8_t *out);
+
+// Seal `plaintext` (`len` bytes) with RFC 8439 ChaCha20-Poly1305 (empty AAD)
+// under a 32-byte `key` and a fresh random 12-byte nonce.
+// Output format: `nonce (12 B) || ciphertext (len B) || tag (16 B)`.
+//
+// # Safety
+// `key` valid for 32 bytes; `plaintext` valid for `len` bytes (when `len > 0`);
+// `out` valid for `out_cap` bytes; `out_len` valid for a write.
+enum FppStatus fpp_aead_seal(const uint8_t *key,
+                             const uint8_t *plaintext,
+                             size_t len,
+                             uint8_t *out,
+                             size_t out_cap,
+                             size_t *out_len);
+
+// Open a message sealed by [`fpp_aead_seal`], verifying the Poly1305 tag in
+// constant time. Returns `FPP_STATUS_SIGNATURE` if truncated or unauthentic.
+//
+// # Safety
+// `key` valid for 32 bytes; `sealed` valid for `len` bytes; `out` valid for
+// `out_cap` bytes; `out_len` valid for a write.
+enum FppStatus fpp_aead_open(const uint8_t *key,
+                             const uint8_t *sealed,
+                             size_t len,
+                             uint8_t *out,
+                             size_t out_cap,
+                             size_t *out_len);
+
 // An empty key set. Free it with `fpp_keys_free`.
 //
 // # Safety
@@ -1043,12 +1079,12 @@ enum FppStatus fpp_control_checkpoint_head(const uint8_t *checkpoint,
                                            size_t cap,
                                            size_t *out_len);
 
-// Name of a `fpp_types::Reason` code (never NULL).
+// Name of a `fpp_core::types::Reason` code (never NULL).
 const char *fpp_reason_str(uint16_t code);
 
 #if defined(FPP_GS_LINK)
-// Load a regional key bundle (`keys/fpp_key_bundle.json`, as `fpp-cell
-// bundle` gathers it) into a key set for the rest of the SDK.
+// Load a regional key bundle (`keys/fpp_key_bundle.json`) into a key set for
+// the rest of the SDK.
 //
 // # Safety
 // `path` a NUL-terminated string; `out` valid for a pointer write.
@@ -1058,7 +1094,7 @@ enum FppStatus fpp_keys_load_bundle(const char *path, struct FppKeys **out);
 #if defined(FPP_GS_LINK)
 // Join Server Liveness and start the link. Blocks until joined (or
 // `timeout_ms`). `FPP_STATUS_GS_LINK` if it cannot reach or join Server
-// Liveness (it logs why to stderr).
+// Liveness.
 //
 // # Safety
 // `config` valid, its strings NUL-terminated and its keys valid for 32
@@ -1067,8 +1103,7 @@ enum FppStatus fpp_gs_link_connect(const struct FppGsLinkConfig *config, struct 
 #endif
 
 #if defined(FPP_GS_LINK)
-// The match Server Liveness gave this server: SATs name it, and the
-// server's Checkpoints must (`fpp_checkpoint_begin`).
+// The match Server Liveness gave this server.
 //
 // # Safety
 // `link` a live handle; `out` valid for 16 bytes.
@@ -1076,9 +1111,7 @@ enum FppStatus fpp_gs_link_match_id(const struct FppGsLink *link, uint8_t *out);
 #endif
 
 #if defined(FPP_GS_LINK)
-// Next event, or `FPP_STATUS_EMPTY`. Its bytes go to `(data, cap)`; if
-// they do not fit the event stays queued and `FPP_STATUS_BUFFER_TOO_SMALL`
-// is returned with `event->data_len` set.
+// Next event, or `FPP_STATUS_EMPTY`.
 //
 // # Safety
 // `link` a live handle; `event` valid for a write; `data` NULL or valid
@@ -1090,10 +1123,7 @@ enum FppStatus fpp_gs_link_poll(struct FppGsLink *link,
 #endif
 
 #if defined(FPP_GS_LINK)
-// Submit a signed Checkpoint (one per epoch, from epoch 0, each `prev`
-// the last one's digest). Server Liveness revokes a server whose chain
-// breaks or that goes quiet for 30 s, so a match sends one even in its
-// lobby.
+// Submit a signed Checkpoint for the current epoch.
 //
 // # Safety
 // `link` a live handle; `checkpoint` valid for `len` bytes.
@@ -1103,7 +1133,7 @@ enum FppStatus fpp_gs_link_submit_checkpoint(struct FppGsLink *link,
 #endif
 
 #if defined(FPP_GS_LINK)
-// Close the link (leave Server Liveness) and free it.
+// Close the link and free it.
 //
 // # Safety
 // `link` NULL or a live handle, not used afterwards.
@@ -1186,7 +1216,7 @@ enum FppStatus fpp_p2p_host_tick(struct FppP2pHost *host, uint64_t now_ms);
 // `host` a live handle.
 enum FppStatus fpp_p2p_host_keepalive(struct FppP2pHost *host, uint32_t peer);
 
-// Tell `peer` why (an `fpp_types::Reason` code, e.g. 5 = tier insufficient)
+// Tell `peer` why (an `fpp_core::types::Reason` code, e.g. 5 = tier insufficient)
 // and forget it.
 //
 // # Safety
@@ -1311,7 +1341,7 @@ enum FppStatus fpp_p2p_joiner_keepalive(struct FppP2pJoiner *joiner);
 // `joiner` a live handle.
 enum FppStatus fpp_p2p_joiner_retry(struct FppP2pJoiner *joiner);
 
-// Tell the host we leave (`reason`: an `fpp_types::Reason` code), then stop.
+// Tell the host we leave (`reason`: an `fpp_core::types::Reason` code), then stop.
 //
 // # Safety
 // `joiner` a live handle.

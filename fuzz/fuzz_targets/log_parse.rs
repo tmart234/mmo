@@ -1,9 +1,10 @@
-//! Transparency Log inputs from the network or storage (notes, checkpoints,
-//! entry bundles, hybrid COSE_Sign receipts, Checkpoint leaves): never panic.
+//! Transparency Log inputs from the network or storage: never panic.
 #![no_main]
 
-use fpp_crypto::{KeyRole, KeySet};
-use fpp_log::{b64, log::decode_bundle, Checkpoint, Note};
+use fpp::b64;
+use fpp::crypto::{hybrid, KeyRole, KeySet};
+use fpp::log::{leaf, log::decode_bundle, Checkpoint, Note};
+use fpp::wire::{cose::SignMulti, LogReceipt};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -26,10 +27,10 @@ fuzz_target!(|data: &[u8]| {
             let _ = decode_bundle(body);
         }
         2 => {
-            let _ = fpp_wire::cose::SignMulti::decode(body);
+            let _ = SignMulti::decode(body);
         }
         3 => {
-            let _ = fpp_log::leaf::parse_checkpoint(body);
+            let _ = leaf::parse_checkpoint(body);
         }
         _ => {
             let mut keys = KeySet::default();
@@ -38,7 +39,7 @@ fuzz_target!(|data: &[u8]| {
                 ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key(),
                 vec![0; 1952],
             );
-            let _ = fpp_crypto::hybrid::verify_hybrid::<fpp_wire::LogReceipt>(body, &keys);
+            let _ = hybrid::verify_hybrid::<LogReceipt>(body, &keys);
         }
     }
 });

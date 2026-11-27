@@ -3,9 +3,9 @@
 
 use ed25519_dalek::SigningKey;
 use fpp::*;
-use fpp_crypto::{sign, Ed25519Signer};
-use fpp_tokens::{AttestationResult, Features};
-use fpp_types::{BuildId, DeviceTier, Did};
+use fpp_core::crypto::{sign, Ed25519Signer};
+use fpp_core::tokens::{AttestationResult, Features};
+use fpp_core::types::{BuildId, DeviceTier, Did};
 use std::ptr;
 
 const NOW: u64 = 1_790_000_000;
@@ -24,7 +24,7 @@ fn ar(session: [u8; 32], tier: DeviceTier, iat: u64) -> AttestationResult {
         iat,
         exp: iat + 1800,
         cti: [1; 16],
-        cnf: fpp_types::SessionKey::Ed25519(session),
+        cnf: fpp_core::types::SessionKey::Ed25519(session),
         nonce: [2; 32],
         did: Did([3; 32]),
         tier,

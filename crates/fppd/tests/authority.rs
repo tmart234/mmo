@@ -1,0 +1,496 @@
+//! Consolidated authority tests (replaces svc-broker/tests/cell.rs,
+//! svc-evidence/tests/store.rs, svc-revocation/tests/feed.rs,
+//! svc-log/tests/services.rs, svc-liveness admission & TPM2 tests):
+//!
+//! - Role key isolation: an AR signed by Broker or Liveness key is refused.
+//! - Unauthorized RPC callers (wrong Noise static key) are refused on Place,
+//!   RevocationPublish, EvidencePut/Get/List, LogAdd/Cosign.
+//! - Evidence Store content-addressing detects on-disk tampering on every read.
+//! - Revocation Feed verifies Enforcement signature and logs to Transparency Log first.
+//! - External Witness cosigns over Noise_IK TCP and refuses rollback/split views.
+//! - Idle peer dropped at admission deadline (F08).
+//! - Real TPM 2.0 GS admission against `swtpm`: EK chain, IMA Build Registry,
+//!   credential activation, and rejection of modified binary / wrong activation secret.
+
+use ed25519_dalek::SigningKey;
+use fpp::control::{
+    evidence_request_sign_bytes, match_request_sign_bytes, EvidenceAnswer, EvidenceRequest,
+    EvidenceStoreRequest, EvidenceStoreResponse, LogRequest, LogResponse, MatchAnswer,
+    MatchRequest, PlaceResponse, Purpose, RevocationRequest, RevocationResponse,
+};
+use fpp::crypto::{now_s, sha256, Ed25519Signer, SessionSigner, Signer};
+use fpp::gs_link::{GsLink, GsLinkConfig, GsLinkEvent};
+use fpp::log::Witness;
+use fpp::session::StaticKeypair;
+use fpp::tokens::{AttestationResult, Features};
+use fpp::tpm2_collect::{swtpm, Tpm2Options};
+use fpp::types::{BuildId, DeviceTier, Did, Reason};
+use fpp::wire::{Action, Scope, SubjectKind};
+use fpp_attest::tpm::ima::ima_ng_record;
+use fppd::evidence::EvidenceStore;
+use fppd::keys::{LOG_ORIGIN, WITNESS_NAME};
+use fppd::liveness::{verify_checkpoint, LivenessConfig, DEFAULT_GS_PROGRAM_PATH};
+use fppd::revocation::Order;
+use fppd::verifier::ClientAttestation;
+use fppd::{external_witness_round, open_control, rpc_evidence_get, rpc_evidence_list, Authority};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+use tokio::net::TcpListener;
+
+fn temp_dir(name: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!(
+        "fppd-test-{name}-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&d);
+    d
+}
+
+#[tokio::test]
+async fn role_key_isolation_and_unauthorized_admin_rejected() {
+    let dir = temp_dir("isolation");
+    let running = Authority::open_all(
+        &dir,
+        None,
+        LivenessConfig::default(),
+        ClientAttestation::default(),
+        Some(Duration::from_millis(200)),
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let auth = running.authority.clone();
+    let srv = tokio::spawn(async move { auth.serve(listener).await });
+    let srv_pub = running.bundle.transport_pub;
+
+    // 1) An AR signed by the Broker's or Liveness's key (wrong role!) must be refused by Broker.
+    let session = Ed25519Signer::new(SigningKey::from_bytes(&[11; 32]));
+    let fake_ar = AttestationResult {
+        iss: "ver.dev".into(),
+        iat: now_s(),
+        exp: now_s() + 600,
+        cti: [1; 16],
+        cnf: session.session_key(),
+        nonce: [0; 32],
+        did: Did([2; 32]),
+        tier: DeviceTier::D2Hardware,
+        features: Features::default(),
+        client_build: BuildId([0; 32]),
+        platform: "linux".into(),
+        policy_ver: 1,
+        warnings: vec![],
+    };
+    let signed_by_liveness = fpp::crypto::sign(&running.keys.liveness, &fake_ar);
+    let (mut s, chal) = open_control(addr, &srv_pub, None, Purpose::Match)
+        .await
+        .unwrap();
+    let mmsg = match_request_sign_bytes(&chal, &signed_by_liveness, "verified");
+    let pop: [u8; 64] = session.sign(&mmsg).try_into().unwrap();
+    s.send(&MatchRequest {
+        ar: signed_by_liveness,
+        queue: "verified".into(),
+        pop_sig: pop,
+    })
+    .await
+    .unwrap();
+    let ans: MatchAnswer = s.recv().await.unwrap();
+    assert_eq!(
+        ans,
+        MatchAnswer::Refused {
+            code: Reason::ArInvalid as u16
+        }
+    );
+
+    // 2) An AR legitimately signed by Verifier, but presented by ANOTHER session key, is refused.
+    let (mut vs, vchal) = open_control(addr, &srv_pub, None, Purpose::Evidence)
+        .await
+        .unwrap();
+    let spub = session.session_key().to_bytes();
+    let emsg = evidence_request_sign_bytes(&vchal, &spub, "linux", &[0; 32], &[]);
+    let epop: [u8; 64] = session.sign(&emsg).try_into().unwrap();
+    vs.send(&EvidenceRequest {
+        session_pub: spub,
+        pop_sig: epop,
+        platform: "linux".into(),
+        client_build: [0; 32],
+        evidence: Vec::new(),
+    })
+    .await
+    .unwrap();
+    let EvidenceAnswer::Ar(real_ar) = vs.recv().await.unwrap() else {
+        panic!("expected AR");
+    };
+    let thief = Ed25519Signer::new(SigningKey::from_bytes(&[99; 32]));
+    let (mut bs, bchal) = open_control(addr, &srv_pub, None, Purpose::Match)
+        .await
+        .unwrap();
+    let bmsg = match_request_sign_bytes(&bchal, &real_ar, "open");
+    let bpop: [u8; 64] = thief.sign(&bmsg).try_into().unwrap();
+    bs.send(&MatchRequest {
+        ar: real_ar,
+        queue: "open".into(),
+        pop_sig: bpop,
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        bs.recv::<MatchAnswer>().await.unwrap(),
+        MatchAnswer::Refused {
+            code: Reason::PopInvalid as u16
+        }
+    );
+
+    // 3) Unauthorized caller (random Noise static key) is refused on Place, Revocation, Evidence, Log.
+    let rando = StaticKeypair::generate();
+    let (mut ps, _) = open_control(addr, &srv_pub, Some(&rando), Purpose::Place)
+        .await
+        .unwrap();
+    assert!(matches!(
+        ps.recv::<PlaceResponse>().await.unwrap(),
+        PlaceResponse::Refused(_)
+    ));
+
+    let (mut rs, _) = open_control(addr, &srv_pub, Some(&rando), Purpose::RevocationPublish)
+        .await
+        .unwrap();
+    rs.send(&RevocationRequest::Publish(vec![1, 2, 3]))
+        .await
+        .unwrap();
+    assert!(matches!(
+        rs.recv::<RevocationResponse>().await.unwrap(),
+        RevocationResponse::Refused(_)
+    ));
+
+    let (mut es, _) = open_control(addr, &srv_pub, Some(&rando), Purpose::EvidenceList)
+        .await
+        .unwrap();
+    es.send(&EvidenceStoreRequest::List([0; 16])).await.unwrap();
+    assert!(matches!(
+        es.recv::<EvidenceStoreResponse>().await.unwrap(),
+        EvidenceStoreResponse::Refused(_)
+    ));
+
+    let (mut ls, _) = open_control(addr, &srv_pub, Some(&rando), Purpose::LogAdd)
+        .await
+        .unwrap();
+    ls.send(&LogRequest::Add(vec![b"x".to_vec()]))
+        .await
+        .unwrap();
+    assert!(matches!(
+        ls.recv::<LogResponse>().await.unwrap(),
+        LogResponse::Refused(_)
+    ));
+
+    srv.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn evidence_store_detects_disk_corruption() {
+    let dir = temp_dir("evidence");
+    let store = EvidenceStore::open(dir.clone()).unwrap();
+    let obj = b"signed checkpoint payload bytes".to_vec();
+    let match_id = [7u8; 16];
+    let d = store.put(match_id, &obj).await.unwrap();
+    assert_eq!(d, sha256(&obj));
+    assert_eq!(store.list(&match_id).unwrap(), vec![d]);
+    assert_eq!(store.get(&d).unwrap().unwrap(), obj);
+
+    // Corrupt on disk: get() must refuse rather than serve tampered bytes.
+    let h = hex::encode(d);
+    let path = dir.join("objects").join(&h[..2]).join(h);
+    std::fs::write(&path, b"corrupted").unwrap();
+    assert!(store.get(&d).is_err());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn external_witness_and_revocation_logged_and_persisted() {
+    let dir = temp_dir("witness");
+    // Start authority WITHOUT internal witness so we exercise external witness over Noise_IK TCP!
+    let running = Authority::open_all(
+        &dir,
+        None,
+        LivenessConfig::default(),
+        ClientAttestation::default(),
+        None,
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let auth = running.authority.clone();
+    let srv = tokio::spawn(async move { auth.serve(listener).await });
+
+    // Enforcement publishes a revocation -> logged into Transparency Log before acceptance.
+    let feed = running.authority.revocation.as_ref().unwrap();
+    let (_, _, seq) = feed
+        .enforce(
+            &running.keys.enforcement,
+            Order {
+                subject_kind: SubjectKind::Device,
+                subject_id: vec![0x55; 32],
+                action: Action::Ban,
+                scope: Scope::default(),
+                reason: Reason::Revoked as u16,
+                duration_s: None,
+                note: "test ban".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(seq, 0);
+
+    // External witness cosigns over Noise_IK TCP.
+    let mut witness = Witness::open(
+        WITNESS_NAME,
+        running.keys.witness.clone(),
+        LOG_ORIGIN,
+        running.keys.log.ed25519_public().to_bytes(),
+        running.keys.log.ml_dsa_public().to_vec(),
+        dir.join("ext-witness/state"),
+    )
+    .unwrap();
+    let cosigned = external_witness_round(
+        addr,
+        &running.bundle.transport_pub,
+        &running.keys.admin,
+        &mut witness,
+    )
+    .await
+    .unwrap();
+    assert_eq!(cosigned, Some(2)); // 1 enforcement record + 1 revocation event
+
+    // Authorized auditor can read evidence store via RPC.
+    let store = running.authority.evidence.as_ref().unwrap();
+    let mid = [0x33; 16];
+    let d = store.put(mid, b"cp0").await.unwrap();
+    let listed = rpc_evidence_list(
+        addr,
+        &running.bundle.transport_pub,
+        &running.keys.admin,
+        mid,
+    )
+    .await
+    .unwrap();
+    assert_eq!(listed, vec![d]);
+    let got = rpc_evidence_get(addr, &running.bundle.transport_pub, &running.keys.admin, d)
+        .await
+        .unwrap();
+    assert_eq!(got.as_deref(), Some(b"cp0".as_slice()));
+
+    srv.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// F08: an idle peer that connects via TCP but never sends Noise msg1 or
+/// ChallengeRequest is dropped at `admission_timeout_ms`.
+#[tokio::test]
+async fn idle_peer_is_dropped_at_admission_deadline() {
+    let dir = temp_dir("deadline");
+    let cfg = LivenessConfig {
+        admission_timeout_ms: 200,
+        ..LivenessConfig::default()
+    };
+    let running = Authority::open_all(&dir, None, cfg, ClientAttestation::default(), None).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let _idle = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (sock, _) = listener.accept().await.unwrap();
+    let started = Instant::now();
+    let err = running
+        .authority
+        .clone()
+        .handle_connection(sock)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("timed out"),
+        "expected timeout error, got: {err:#}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(3));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn checkpoint_chain_enforced() {
+    let k = Ed25519Signer::new(SigningKey::from_bytes(&[6; 32]));
+    let pk = k.verifying_key().to_bytes();
+    let m = [4; 16];
+    let mk = |epoch: u32, prev: fpp::types::Digest| {
+        fpp::crypto::sign(
+            &k,
+            &fpp::wire::Checkpoint {
+                match_id: fpp::types::MatchId(m),
+                gs_instance_id: fpp::tokens::instance_id(&pk),
+                build_id: BuildId([0; 32]),
+                policy_ver: 1,
+                epoch,
+                ticks: (epoch * 30, epoch * 30 + 29),
+                prev,
+                inputs_root: fpp::types::Digest::default(),
+                inputs_n: 0,
+                events_root: fpp::types::Digest::default(),
+                events_n: 0,
+                state_root: fpp::types::Digest::default(),
+                rng_root: fpp::types::Digest::default(),
+                rng_n: 0,
+                roster_root: fpp::types::Digest::default(),
+                roster_n: 0,
+            },
+        )
+    };
+    let c0 = mk(0, fpp::types::Digest::default());
+    let (e0, d0) = verify_checkpoint(&c0, &pk, &m, None).unwrap();
+    assert_eq!(e0, 0);
+    let c1 = mk(1, d0);
+    verify_checkpoint(&c1, &pk, &m, Some((0, d0))).unwrap();
+    assert!(verify_checkpoint(&c0, &pk, &m, Some((0, d0))).is_err());
+    assert!(verify_checkpoint(&mk(2, d0), &pk, &m, Some((0, d0))).is_err());
+}
+
+/// Real TPM 2.0 game-server join against `swtpm`: EK chain, IMA Build Registry,
+/// credential activation, SAR streaming, and rejection of a modified GS binary!
+#[tokio::test]
+async fn gs_tpm2_admission_and_modified_binary_refused() {
+    if !swtpm::available() {
+        assert!(
+            std::env::var_os("FPP_REQUIRE_SWTPM").is_none(),
+            "FPP_REQUIRE_SWTPM is set and swtpm/tpm2-tools missing"
+        );
+        return;
+    }
+    let dir = temp_dir("tpm2-gs");
+    let tpm = swtpm::Swtpm::start(dir.join("swtpm")).unwrap();
+    let roots =
+        fpp_attest::x509::pem_certificates(&std::fs::read_to_string(tpm.root_pem()).unwrap())
+            .unwrap();
+    let inter = fpp_attest::x509::pem_certificates(
+        &std::fs::read_to_string(tpm.intermediate_pem()).unwrap(),
+    )
+    .unwrap();
+
+    // Measure a genuine GS binary into PCR 10 via IMA log.
+    let good_hash = sha256(b"genuine-gs-binary-v1");
+    let (ima_rec, template_hash) = ima_ng_record(&good_hash, DEFAULT_GS_PROGRAM_PATH);
+    tpm.extend(10, &template_hash).unwrap();
+    let ima_path = dir.join("ima.log");
+    std::fs::write(&ima_path, &ima_rec).unwrap();
+
+    let mut cfg = LivenessConfig {
+        tpm_ek_roots: roots,
+        ..LivenessConfig::default()
+    };
+    cfg.build_registry
+        .insert(good_hash, "gs-sim-release-1".into());
+
+    let running = Authority::open_all(
+        &dir.join("cell"),
+        None,
+        cfg,
+        ClientAttestation::default(),
+        None,
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let auth = running.authority.clone();
+    let srv = tokio::spawn(async move { auth.serve(listener).await });
+
+    // 1) Genuine GS with matching IMA build joins and receives its SAR!
+    let bundle_ok = running.bundle.clone();
+    let tcti = tpm.tcti();
+    let inter_ok = inter.clone();
+    let ima_ok = ima_path.clone();
+    let work_ok = dir.join("work-ok");
+    let link = tokio::task::spawn_blocking(move || {
+        GsLink::connect(GsLinkConfig {
+            liveness: addr,
+            bundle: bundle_ok,
+            gs_id: "gs-tpm-ok".into(),
+            game_addr: "127.0.0.1:50090".into(),
+            gs_key: SigningKey::from_bytes(&[1; 32]),
+            instance_pub: SigningKey::from_bytes(&[2; 32]).verifying_key().to_bytes(),
+            noise_pub: StaticKeypair::generate().public,
+            sw_hash: good_hash,
+            tpm2: Some(Tpm2Options {
+                tcti: Some(tcti),
+                workdir: work_ok,
+                pcrs: vec![10],
+                ek_intermediates: inter_ok,
+                boot_log: None,
+                ima_log: Some(ima_ok),
+            }),
+            timeout: Duration::from_secs(10),
+        })
+    })
+    .await
+    .unwrap()
+    .expect("genuine TPM GS must be admitted");
+
+    // Wait briefly for first SAR to arrive on the link.
+    let mut got_sar = false;
+    for _ in 0..40 {
+        if matches!(link.poll_event(), Some(GsLinkEvent::Sar(_))) {
+            got_sar = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(got_sar, "admitted TPM GS must receive verified SAR");
+    drop(link);
+
+    // 2) A GS with no TPM evidence must be refused when Build Registry is active!
+    let bundle_no_tpm = running.bundle.clone();
+    let no_tpm = tokio::task::spawn_blocking(move || {
+        GsLink::connect(GsLinkConfig {
+            liveness: addr,
+            bundle: bundle_no_tpm,
+            gs_id: "gs-no-tpm".into(),
+            game_addr: "127.0.0.1:50091".into(),
+            gs_key: SigningKey::from_bytes(&[3; 32]),
+            instance_pub: SigningKey::from_bytes(&[4; 32]).verifying_key().to_bytes(),
+            noise_pub: StaticKeypair::generate().public,
+            sw_hash: good_hash,
+            tpm2: None,
+            timeout: Duration::from_secs(5),
+        })
+    })
+    .await
+    .unwrap();
+    assert!(no_tpm.is_err(), "unattested GS must be refused");
+
+    // 3) A GS that lies about its sw_hash (different from kernel IMA measurement) is refused!
+    let bundle_lie = running.bundle.clone();
+    let tcti2 = tpm.tcti();
+    let work_lie = dir.join("work-lie");
+    let lie = tokio::task::spawn_blocking(move || {
+        GsLink::connect(GsLinkConfig {
+            liveness: addr,
+            bundle: bundle_lie,
+            gs_id: "gs-lie".into(),
+            game_addr: "127.0.0.1:50092".into(),
+            gs_key: SigningKey::from_bytes(&[5; 32]),
+            instance_pub: SigningKey::from_bytes(&[6; 32]).verifying_key().to_bytes(),
+            noise_pub: StaticKeypair::generate().public,
+            sw_hash: [0xee; 32],
+            tpm2: Some(Tpm2Options {
+                tcti: Some(tcti2),
+                workdir: work_lie,
+                pcrs: vec![10],
+                ek_intermediates: inter,
+                boot_log: None,
+                ima_log: Some(ima_path),
+            }),
+            timeout: Duration::from_secs(10),
+        })
+    })
+    .await
+    .unwrap();
+    assert!(lie.is_err(), "GS lying about sw_hash must be refused");
+
+    srv.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}

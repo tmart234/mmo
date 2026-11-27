@@ -1,0 +1,36 @@
+[package]
+name = "fpp"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Fair-Play Protocol v1: owned deterministic CBOR/COSE, crypto roles, Merkle trees, tokens, Noise sessions and control transport, Transparency Log, and evidence auditor"
+
+[dependencies]
+ed25519-dalek = { workspace = true }
+p256 = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+chacha20poly1305 = { workspace = true }
+curve25519-dalek = { workspace = true }
+snow = { workspace = true }
+subtle = { workspace = true }
+rand = { workspace = true }
+
+# Optional: FPP-S1H hybrid Ed25519 + ML-DSA-65 (long-lived roots & Transparency Log).
+# Kept off for the C SDK (fpp-ffi) so cross-builds need zero C crypto deps.
+aws-lc-rs = { workspace = true, optional = true }
+# Optional: async Noise TCP transport for fppd and async clients.
+tokio = { workspace = true, optional = true }
+
+[features]
+default = []
+s1h = ["dep:aws-lc-rs"]
+log = ["s1h"]
+async-net = ["dep:tokio"]
+
+[dev-dependencies]
+hex = { workspace = true }
+proptest = "1"
+serde_json = { workspace = true }
+tokio = { workspace = true }

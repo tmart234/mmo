@@ -14,9 +14,9 @@
 //! host's device bans and client-build list.
 
 use ed25519_dalek::SigningKey;
-use fpp_crypto::{sign, Ed25519Signer};
-use fpp_tokens::{AttestationResult, Features};
-use fpp_types::{BuildId, DeviceTier, Did};
+use fpp_core::crypto::{sign, Ed25519Signer};
+use fpp_core::tokens::{AttestationResult, Features};
+use fpp_core::types::{BuildId, DeviceTier, Did};
 use std::process::exit;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -65,7 +65,7 @@ fn main() {
                 iat,
                 exp: iat + 1800,
                 cti: rand::random(),
-                cnf: fpp_types::SessionKey::Ed25519(session),
+                cnf: fpp_core::types::SessionKey::Ed25519(session),
                 nonce: [0; 32],
                 did: Did(std::env::var("MINT_AR_DID").map_or_else(|_| rand::random(), |d| hex32(&d))),
                 tier,

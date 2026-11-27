@@ -15,11 +15,11 @@ jobs:
 
       # Key files by name (raw seeds, DER keys, anything in keys/), and any
       # tracked file holding a PEM private key. Public certificates, such as
-      # the vendored attestation roots in crates/attest-*/roots/, are allowed.
+      # the vendored attestation roots in crates/fpp-attest/roots/, are allowed.
       - name: No private key material in git
         run: |
-          if git ls-files | grep -E '\.pk8$|\.key\.der$|(^|/)keys/[^/]+$' | grep -v '/\.gitignore$'; then
-            echo "::error::private key material is tracked by git (generate it with gen_keys instead)"
+          if git ls-files | grep -E '\.pk8$|\.key\.der$|\.seed$|(^|/)keys/[^/]+$' | grep -v '/\.gitignore$'; then
+            echo "::error::private key material is tracked by git (generate it with fppd init instead)"
             exit 1
           fi
           if git grep -lI -e '-----BEGIN [A-Z ]*PRIVATE KEY-----' -- . ':!.github/workflows/ci.yml'; then
@@ -42,62 +42,60 @@ jobs:
           restore-keys: |
             cargo-${{ runner.os }}-
 
-      # A real TPM 2.0 for attest-tpm's tests (tests/swtpm.rs): swtpm, the
-      # reference implementation, with tpm2-tools
+      # Real TPM 2.0 (swtpm + tpm2-tools) for fpp-attest, fppd, and attestation_exit.
       - name: swtpm and tpm2-tools
         run: sudo apt-get update -q && sudo apt-get install -y -q swtpm swtpm-tools tpm2-tools
 
-      # The Transparency Log is checked against Go's golang.org/x/mod/sumdb
-      # (interop/go/tlog, run by fpp-log's tests)
+      # Independent Go sumdb check (interop/go/tlog, run by fpp::log tests).
       - uses: actions/setup-go@v5
         with:
           go-version: "1.22"
           cache: false
 
-      - name: Run CI-lite (fmt, clippy, build, test, smoke)
+      - name: Run full CI (fmt, clippy, build, test, 5 exit suites, interop, C SDK)
         run: make ci
         env:
-          STRICT_SMOKE: "1"
           FPP_REQUIRE_SWTPM: "1"
           FPP_REQUIRE_GO: "1"
 
-      # The Halo: CE port (first reference title) is 32-bit x86: keep the C SDK
-      # building and conforming for that ABI.
+      # The Halo: CE port (first reference title) is 32-bit x86: keep the pure-Rust
+      # C SDK (including gs-link) building and conforming for that ABI.
       - name: C SDK conformance on i686 (Halo ABI)
         run: |
           sudo apt-get update -q && sudo apt-get install -y -q gcc-multilib
           rustup target add i686-unknown-linux-gnu
           make ffi-c-test-i686
 
-  # One regional cell in containers (deploy/cell): the image builds, the
-  # services start with their own keys, the key bundle is gathered, and an
-  # Enforcement action goes through the feed into the Transparency Log.
+  # One regional authority cell in containers (deploy/cell): unified fppd authority
+  # + independent witness container, plus an Enforcement action logged and cosigned.
   cell-containers:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Build and start the cell
         run: docker compose -f deploy/cell/docker-compose.yml up -d --build
-      - name: Key bundle gathered, services running
+      - name: Authority and independent witness running; enforcement logged and cosigned
         run: |
           compose="docker compose -f deploy/cell/docker-compose.yml"
           for i in $(seq 30); do
-            $compose ps -a bundle --format '{{.State}} {{.ExitCode}}' | grep -q '^exited 0$' && break
-            sleep 2
+            $compose logs authority | grep -q '\[fppd\] ready' && break
+            sleep 1
           done
-          $compose ps -a bundle --format '{{.State}} {{.ExitCode}}' | grep -q '^exited 0$'
-          test "$($compose ps --status running --services | sort | tr '\n' ' ')" = "broker evidence liveness log revocation verifier witness "
+          test "$($compose ps --status running --services | sort | tr '\n' ' ')" = "authority witness "
           $compose run --rm enforce kick "session:$(printf '07%.0s' $(seq 32))" --note "CI"
-          $compose logs revocation | grep -q "log index"
+          $compose logs authority | grep -q "log index"
+          for i in $(seq 15); do
+            $compose logs witness | grep -q "cosigned size" && break
+            sleep 1
+          done
           $compose logs witness | grep -q "cosigned size"
           $compose logs
       - name: Stop the cell
         if: always()
         run: docker compose -f deploy/cell/docker-compose.yml down -v
 
-  # Advisories (RustSec, same database as cargo-audit), licenses, bans and
-  # sources, per deny.toml. Blocking.
+  # Advisories (RustSec), licenses, bans and sources, per deny.toml (zero ignores).
   dependency-policy:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -115,8 +113,6 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
-      # The prebuilt cargo-fuzz is a musl binary and would default to building
-      # for musl, where AddressSanitizer is unavailable; target gnu explicitly.
       - name: Seed the FPP corpus with the golden vectors
         run: |
           python3 - <<'PY'

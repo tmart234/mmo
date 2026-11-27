@@ -1,18 +1,7 @@
-name: GS release
+name: Release
 
-# The game server builds a Verifier admits (finding F06): built here, from
-# main, never on an operator's machine, with signed SLSA build provenance
-# (GitHub artifact attestations, Sigstore), and published as a release with
-# its Build Registry line.
-#
-# An operator deploys the release's gs-sim binary as is, to
-# /opt/fpp/gs-sim (the VS's --gs-program), and checks its provenance first:
-#
-#   gh attestation verify gs-sim-x86_64-linux --repo tmart234/mmo
-#
-# The VS's --build-registry is the registry lines of the releases it accepts
-# (build-registry.txt of each): the kernel measures the binary before it
-# runs (IMA), and the VS admits a GS only if that hash is one of them.
+# Reproducible CI build with SLSA provenance (GitHub artifact attestations,
+# Sigstore) and Build Registry line for `fppd`.
 on:
   push:
     branches: [main]
@@ -24,7 +13,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: gs-release
+  group: fpp-release
   cancel-in-progress: false
 
 permissions:
@@ -44,41 +33,39 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Build
+      - name: Build fppd
         run: |
-          cargo build --release --locked -p gs-sim
+          cargo build --release --locked -p fppd --bin fppd
           mkdir dist
-          cp target/release/gs-sim dist/gs-sim-x86_64-linux
+          cp target/release/fppd dist/fppd-x86_64-linux
 
       - name: Build Registry line
         id: registry
         run: |
           short="${GITHUB_SHA:0:12}"
-          hash="$(sha256sum dist/gs-sim-x86_64-linux | cut -d' ' -f1)"
-          echo "$hash  gs-sim x86_64-linux $short (run $GITHUB_RUN_NUMBER)" > dist/build-registry.txt
+          hash="$(sha256sum dist/fppd-x86_64-linux | cut -d' ' -f1)"
+          echo "$hash  fppd x86_64-linux $short (run $GITHUB_RUN_NUMBER)" > dist/build-registry.txt
           cat dist/build-registry.txt
           echo "short=$short" >> "$GITHUB_OUTPUT"
 
-      # SLSA build provenance: which repository, commit, workflow and run
-      # made this binary, signed with the workflow's identity
       - uses: actions/attest-build-provenance@v2
         with:
-          subject-path: dist/gs-sim-x86_64-linux
+          subject-path: dist/fppd-x86_64-linux
 
       - name: Release
         env:
           SHORT: ${{ steps.registry.outputs.short }}
         run: |
           {
-            echo "gs-sim built by CI from $GITHUB_SHA ([run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID))."
+            echo "fppd built by CI from $GITHUB_SHA ([run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID))."
             echo
-            echo "Check its provenance before deploying: \`gh attestation verify gs-sim-x86_64-linux --repo $GITHUB_REPOSITORY\`"
+            echo "Check its provenance before deploying: \`gh attestation verify fppd-x86_64-linux --repo $GITHUB_REPOSITORY\`"
             echo
-            echo "Build Registry line (for the VS's --build-registry):"
+            echo "Build Registry line:"
             echo
             echo '```'
             cat dist/build-registry.txt
             echo '```'
           } > notes.md
-          gh release create "gs-$SHORT" dist/gs-sim-x86_64-linux dist/build-registry.txt \
-            --target "$GITHUB_SHA" --title "gs-sim $SHORT" --notes-file notes.md --latest=false
+          gh release create "fpp-$SHORT" dist/fppd-x86_64-linux dist/build-registry.txt \
+            --target "$GITHUB_SHA" --title "fppd $SHORT" --notes-file notes.md --latest=false

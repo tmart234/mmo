@@ -4,31 +4,21 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Fair-Play Protocol v1 SDK for C/C++ games: stable C ABI over fpp-wire, fpp-crypto, fpp-merkle and fpp-session"
+description = "Fair-Play Protocol v1 SDK for C/C++ games: stable C ABI over owned pure-Rust fpp (zero tokio, zero quinn/rustls, zero bincode)"
 
 [lib]
 name = "fpp"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
-fpp-types = { path = "../fpp-types" }
-fpp-wire = { path = "../fpp-wire" }
-fpp-crypto = { path = "../fpp-crypto" }
-fpp-merkle = { path = "../fpp-merkle" }
-fpp-session = { path = "../fpp-session" }
-fpp-tokens = { path = "../fpp-tokens" }
+fpp_core = { package = "fpp", path = "../fpp" }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
-sha2 = { workspace = true }
-# gs-link: a dedicated server's link to Server Liveness (QUIC); off by default
-common = { path = "../common", optional = true }
-quinn = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
-anyhow = { workspace = true, optional = true }
 
 [features]
 default = []
-gs-link = ["dep:common", "dep:quinn", "dep:tokio", "dep:anyhow"]
+# gs-link: a dedicated server's Noise_IK TCP link to Server Liveness (pure std, zero tokio/quinn).
+gs-link = []
 
 [dev-dependencies]
 cbindgen = "0.29"

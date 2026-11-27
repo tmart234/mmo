@@ -1,10 +1,9 @@
-//! Player-hosted session endpoints (fpp-session) on untrusted datagrams:
-//! a host, and a joiner already connected to it, both fed arbitrary bytes.
+//! Player-hosted session endpoints (`fpp::session`) on untrusted datagrams.
 #![no_main]
 
 use ed25519_dalek::SigningKey;
-use fpp_crypto::Ed25519Signer;
-use fpp_session::{Host, HostConfig, JoinConfig, Joiner, StaticKeypair};
+use fpp::crypto::Ed25519Signer;
+use fpp::session::{Host, HostConfig, JoinConfig, Joiner, StaticKeypair};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -26,7 +25,6 @@ fuzz_target!(|data: &[u8]| {
     let confirm = joiner.poll_transmit().expect("confirm");
     host.recv([1], &confirm.packet).expect("confirm accepted");
 
-    // Split the input into datagrams; the first byte of each picks a sender.
     for chunk in data.split(|&b| b == 0xff) {
         let (from, datagram) = chunk.split_first().map_or((2, chunk), |(f, d)| (f % 4, d));
         let _ = host.recv([from], datagram);

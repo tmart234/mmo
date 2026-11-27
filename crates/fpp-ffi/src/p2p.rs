@@ -10,10 +10,10 @@
 //! byte-for-byte and returned exactly as given.
 
 use super::{emit, fixed, free, guard, handle, handle_mut, input, FppSigner, FppStatus, Res};
-use fpp_session::{
+use fpp_core::session::{
     Error, Host, HostConfig, HostEvent, JoinConfig, Joiner, JoinerEvent, StaticKeypair, Transmit,
 };
-use fpp_types::SessionKey;
+use fpp_core::types::SessionKey;
 
 /// Largest datagram the SDK produces or accepts (no IP fragmentation).
 pub const FPP_P2P_MAX_PACKET: usize = 1452;
@@ -28,12 +28,12 @@ pub const FPP_P2P_MAX_ATTESTATION: usize = 512;
 /// Largest title-defined hello, either direction.
 pub const FPP_P2P_MAX_HELLO: usize = 256;
 
-const _: () = assert!(FPP_P2P_MAX_PACKET == fpp_session::MAX_PACKET);
-const _: () = assert!(FPP_P2P_MAX_PAYLOAD == fpp_session::MAX_PAYLOAD);
-const _: () = assert!(FPP_P2P_MAX_MESSAGE == fpp_session::MAX_MESSAGE);
-const _: () = assert!(FPP_P2P_MAX_ADDRESS == fpp_session::MAX_ADDRESS);
-const _: () = assert!(FPP_P2P_MAX_ATTESTATION == fpp_session::MAX_ATTESTATION);
-const _: () = assert!(FPP_P2P_MAX_HELLO == fpp_session::MAX_HELLO);
+const _: () = assert!(FPP_P2P_MAX_PACKET == fpp_core::session::MAX_PACKET);
+const _: () = assert!(FPP_P2P_MAX_PAYLOAD == fpp_core::session::MAX_PAYLOAD);
+const _: () = assert!(FPP_P2P_MAX_MESSAGE == fpp_core::session::MAX_MESSAGE);
+const _: () = assert!(FPP_P2P_MAX_ADDRESS == fpp_core::session::MAX_ADDRESS);
+const _: () = assert!(FPP_P2P_MAX_ATTESTATION == fpp_core::session::MAX_ATTESTATION);
+const _: () = assert!(FPP_P2P_MAX_HELLO == fpp_core::session::MAX_HELLO);
 
 impl From<Error> for FppStatus {
     fn from(e: Error) -> Self {
@@ -91,7 +91,7 @@ pub enum FppP2pEventKind {
 pub struct FppP2pEvent {
     pub kind: FppP2pEventKind,
     pub peer: u32,
-    /// `fpp_types::Reason` code (PeerLeft, Closed).
+    /// `fpp_core::types::Reason` code (PeerLeft, Closed).
     pub reason: u16,
     pub has_key: u8,
     pub key: [u8; 32],
@@ -134,7 +134,7 @@ fn host_event(e: &HostEvent) -> (FppP2pEvent, Vec<u8>) {
             ev.has_key = 1;
             ev.key = match session_key {
                 SessionKey::Ed25519(k) => *k,
-                p256 => fpp_crypto::session_key_id(p256),
+                p256 => fpp_core::crypto::session_key_id(p256),
             };
             ev.attestation_len = attestation.len();
             ev.admit_pop_len = admit_pop.len();
@@ -455,7 +455,7 @@ pub unsafe extern "C" fn fpp_p2p_host_keepalive(host: *mut FppP2pHost, peer: u32
     guard(|| Ok(unsafe { handle_mut(host) }?.inner.keepalive(peer)?))
 }
 
-/// Tell `peer` why (an `fpp_types::Reason` code, e.g. 5 = tier insufficient)
+/// Tell `peer` why (an `fpp_core::types::Reason` code, e.g. 5 = tier insufficient)
 /// and forget it.
 ///
 /// # Safety
@@ -704,7 +704,7 @@ pub unsafe extern "C" fn fpp_p2p_joiner_retry(joiner: *mut FppP2pJoiner) -> FppS
     guard(|| Ok(unsafe { handle_mut(joiner) }?.inner.retry()?))
 }
 
-/// Tell the host we leave (`reason`: an `fpp_types::Reason` code), then stop.
+/// Tell the host we leave (`reason`: an `fpp_core::types::Reason` code), then stop.
 ///
 /// # Safety
 /// `joiner` a live handle.
