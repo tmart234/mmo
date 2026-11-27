@@ -5,11 +5,12 @@
 //!
 //! Uses ONLY its isolated Verifier signing key (`KeyRole::VerifierAr`).
 
+use crate::policy::AuthorityPolicy;
 use anyhow::{anyhow, Result};
 use fpp::control::{
     evidence_request_sign_bytes, CredentialChallenge, EvidenceAnswer, EvidenceRequest,
 };
-use fpp::crypto::{self, now_s, tagged_hash, Ed25519Signer};
+use fpp::crypto::{self, hmac_sha256, now_s, Ed25519Signer};
 use fpp::tokens::{AttestationResult, Features};
 use fpp::types::{BuildId, DeviceTier, Did, Reason, SessionKey};
 use fpp_attest::tpm::verify::{appraise_pc_client, Activation};
@@ -342,6 +343,9 @@ pub struct PendingAr {
 
 pub struct VerifierRole {
     pub key: Ed25519Signer,
+    /// Per-publisher HMAC key for unlinkable hardware Device IDs (ID-02).
+    pub did_key: [u8; 32],
+    pub policy: AuthorityPolicy,
     pub attestation: ClientAttestation,
     pub deadline: Duration,
 }
@@ -473,16 +477,26 @@ impl VerifierRole {
         appraised: Appraised,
     ) -> EvidenceAnswer {
         let did = match &appraised.identity {
-            Some(id) => Did(tagged_hash("mmo/dev-did-hw", id)),
-            None => Did(tagged_hash("mmo/dev-did", &req.session_pub)),
+            Some(id) => {
+                let mut msg = Vec::with_capacity(13 + id.len());
+                msg.extend_from_slice(b"fpp/1/did-hw\0");
+                msg.extend_from_slice(id);
+                Did(hmac_sha256(&self.did_key, &msg))
+            }
+            None => {
+                let mut msg = Vec::with_capacity(14 + req.session_pub.len());
+                msg.extend_from_slice(b"fpp/1/did-eph\0");
+                msg.extend_from_slice(&req.session_pub);
+                Did(hmac_sha256(&self.did_key, &msg))
+            }
         };
         let mut cti = [0u8; 16];
         OsRng.fill_bytes(&mut cti);
         let now = now_s();
         let ar = AttestationResult {
-            iss: VERIFIER_ISS.into(),
+            iss: self.policy.verifier_iss(),
             iat: now,
-            exp: now + AR_LIFETIME_S,
+            exp: now + self.policy.ar_ttl_s,
             cti,
             cnf: session_key,
             nonce: *challenge,
@@ -493,7 +507,7 @@ impl VerifierRole {
             platform: appraised
                 .platform
                 .map_or_else(|| req.platform.clone(), str::to_string),
-            policy_ver: POLICY_VER,
+            policy_ver: self.policy.policy_ver,
             warnings: appraised.warnings,
         };
         println!(

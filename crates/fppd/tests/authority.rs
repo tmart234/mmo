@@ -494,3 +494,264 @@ async fn gs_tpm2_admission_and_modified_binary_refused() {
     srv.abort();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn custom_game_policy_multi_shard_and_unlinkable_dids() {
+    use fpp::control::{
+        evidence_request_sign_bytes, match_request_sign_bytes, EvidenceAnswer, EvidenceRequest,
+        MatchAnswer, MatchRequest, MAX_CONTROL_FRAME,
+    };
+    use fpp::crypto::SessionSigner;
+    use fpp::tokens::{verify_ar, verify_sat, SarChain};
+    use fppd::open_control;
+    use fppd::policy::AuthorityPolicy;
+
+    let dir_a = temp_dir("policy-alpha");
+    let dir_b = temp_dir("policy-beta");
+
+    let policy_a = AuthorityPolicy::parse(
+        r#"
+        domain = alpha-mmo.example
+        region = us-east
+        policy_ver = 4
+        max_slots = 1
+        queues.clear = true
+        queue.world-shard = D0
+        queue.raid-mythic = D2
+        "#,
+    )
+    .unwrap();
+    let policy_b = AuthorityPolicy::parse(
+        r#"
+        domain = beta-fps.example
+        region = eu-west
+        policy_ver = 9
+        max_slots = 64
+        queues.clear = true
+        queue.casual = D0
+        queue.ranked-5v5 = D2
+        "#,
+    )
+    .unwrap();
+
+    let run_a = Authority::open_with_policy(
+        &dir_a,
+        None,
+        policy_a,
+        LivenessConfig::default(),
+        ClientAttestation::default(),
+        Some(Duration::from_secs(1)),
+    )
+    .unwrap();
+    let run_b = Authority::open_with_policy(
+        &dir_b,
+        None,
+        policy_b,
+        LivenessConfig::default(),
+        ClientAttestation::default(),
+        Some(Duration::from_secs(1)),
+    )
+    .unwrap();
+
+    assert_eq!(
+        run_a.bundle.log.as_ref().unwrap().origin,
+        "alpha-mmo.example/log"
+    );
+    assert_eq!(
+        run_b.bundle.log.as_ref().unwrap().origin,
+        "beta-fps.example/log"
+    );
+
+    let la = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = la.local_addr().unwrap();
+    let auth_a = run_a.authority.clone();
+    let srv_a = tokio::spawn(async move { auth_a.serve(la).await });
+
+    let lb = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = lb.local_addr().unwrap();
+    let auth_b = run_b.authority.clone();
+    let srv_b = tokio::spawn(async move { auth_b.serve(lb).await });
+
+    // Join TWO shards on alpha-mmo (max_slots = 1 each) so placement spills to shard 2.
+    let join_shard = |addr: std::net::SocketAddr,
+                      bundle: fpp::bundle::KeyBundle,
+                      id: &str,
+                      game_addr: &str,
+                      seed: u8| {
+        let id = id.to_string();
+        let game_addr = game_addr.to_string();
+        tokio::task::spawn_blocking(move || {
+            GsLink::connect(GsLinkConfig {
+                liveness: addr,
+                bundle,
+                gs_id: id,
+                game_addr,
+                gs_key: SigningKey::from_bytes(&[seed; 32]),
+                instance_pub: SigningKey::from_bytes(&[seed + 1; 32])
+                    .verifying_key()
+                    .to_bytes(),
+                noise_pub: StaticKeypair::generate().public,
+                sw_hash: [seed; 32],
+                tpm2: None,
+                timeout: Duration::from_secs(5),
+            })
+        })
+    };
+    let shard1 = join_shard(
+        addr_a,
+        run_a.bundle.clone(),
+        "shard-1",
+        "127.0.0.1:51001",
+        10,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let shard2 = join_shard(
+        addr_a,
+        run_a.bundle.clone(),
+        "shard-2",
+        "127.0.0.1:51002",
+        20,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let _beta_gs = join_shard(
+        addr_b,
+        run_b.bundle.clone(),
+        "beta-1",
+        "127.0.0.1:52001",
+        30,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    // Verify SAR from alpha-mmo carries custom issuer & region `us-east`.
+    let sar = loop {
+        if let Some(fpp::gs_link::GsLinkEvent::Sar(s)) = shard1.poll_event() {
+            break s;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let chain = SarChain::start(&sar, &run_a.bundle.keyset(), now_s()).unwrap();
+    assert_eq!(chain.current().iss, "liveness.alpha-mmo.example");
+    assert_eq!(chain.current().region, "us-east");
+
+    // Helper: request AR + SAT for a session key against an authority & queue.
+    let admit = |addr: std::net::SocketAddr,
+                 bundle: fpp::bundle::KeyBundle,
+                 signer: Ed25519Signer,
+                 queue: &'static str| async move {
+        let sk_pub = signer.session_key().to_bytes();
+        let (mut vs, vchal) = open_control(addr, &bundle.transport_pub, None, Purpose::Evidence)
+            .await
+            .unwrap();
+        let msg = evidence_request_sign_bytes(&vchal, &sk_pub, "linux", &[1; 32], &[]);
+        let pop: [u8; 64] = signer.sign(&msg).try_into().unwrap();
+        vs.send(&EvidenceRequest {
+            session_pub: sk_pub,
+            pop_sig: pop,
+            platform: "linux".into(),
+            client_build: [1; 32],
+            evidence: vec![],
+        })
+        .await
+        .unwrap();
+        let EvidenceAnswer::Ar(ar_bytes) = vs.recv_max(MAX_CONTROL_FRAME).await.unwrap() else {
+            panic!("expected AR");
+        };
+        let ar = verify_ar(&ar_bytes, &bundle.keyset(), now_s()).unwrap();
+
+        let (mut bs, bchal) = open_control(addr, &bundle.transport_pub, None, Purpose::Match)
+            .await
+            .unwrap();
+        let mmsg = match_request_sign_bytes(&bchal, &ar_bytes, queue);
+        let mpop: [u8; 64] = signer.sign(&mmsg).try_into().unwrap();
+        bs.send(&MatchRequest {
+            ar: ar_bytes,
+            queue: queue.into(),
+            pop_sig: mpop,
+        })
+        .await
+        .unwrap();
+        let ans: MatchAnswer = bs.recv_max(MAX_CONTROL_FRAME).await.unwrap();
+        (ar, ans)
+    };
+
+    // Same client key across both publishers:
+    let client_a1 = Ed25519Signer::new(SigningKey::from_bytes(&[0x77; 32]));
+    let client_a2 = Ed25519Signer::new(SigningKey::from_bytes(&[0x77; 32]));
+    let client_b = Ed25519Signer::new(SigningKey::from_bytes(&[0x77; 32]));
+    let client_other = Ed25519Signer::new(SigningKey::from_bytes(&[0x88; 32]));
+
+    // Default `open` queue is disabled on alpha-mmo (`queues.clear = true`), and `raid-mythic` requires D2.
+    let (_, open_ans) = admit(addr_a, run_a.bundle.clone(), client_a1, "open").await;
+    assert!(matches!(
+        open_ans,
+        MatchAnswer::Refused { code } if code == Reason::TierInsufficient as u16
+    ));
+    let (ar_a1, raid_ans) = admit(
+        addr_a,
+        run_a.bundle.clone(),
+        Ed25519Signer::new(SigningKey::from_bytes(&[0x77; 32])),
+        "raid-mythic",
+    )
+    .await;
+    assert_eq!(ar_a1.iss, "verifier.alpha-mmo.example");
+    assert_eq!(ar_a1.policy_ver, 4);
+    assert!(matches!(
+        raid_ans,
+        MatchAnswer::Refused { code } if code == Reason::TierInsufficient as u16
+    ));
+
+    // Custom `world-shard` queue admits two players and balances across shard-1 and shard-2 (max_slots=1 each!).
+    let (ar_a2, ans1) = admit(addr_a, run_a.bundle.clone(), client_a2, "world-shard").await;
+    let (_, ans2) = admit(addr_a, run_a.bundle.clone(), client_other, "world-shard").await;
+    let (_, ans3) = admit(
+        addr_a,
+        run_a.bundle.clone(),
+        Ed25519Signer::new(SigningKey::from_bytes(&[0x99; 32])),
+        "world-shard",
+    )
+    .await;
+    let (sat1, addr1) = match ans1 {
+        MatchAnswer::Granted { sat, gs_addr, .. } => (sat, gs_addr),
+        other => panic!("expected Granted, got {other:?}"),
+    };
+    let (_, addr2) = match ans2 {
+        MatchAnswer::Granted { sat, gs_addr, .. } => (sat, gs_addr),
+        other => panic!("expected Granted, got {other:?}"),
+    };
+    assert_ne!(addr1, addr2, "players must balance across both shards");
+    assert!(
+        matches!(ans3, MatchAnswer::Refused { code } if code == Reason::ServerDraining as u16),
+        "third player must be refused once both 1-slot shards are full"
+    );
+    let sat1_claims = verify_sat(&sat1, &run_a.bundle.keyset(), now_s()).unwrap();
+    assert_eq!(sat1_claims.iss, "broker.alpha-mmo.example");
+    assert_eq!(sat1_claims.queue, "world-shard");
+    assert_eq!(sat1_claims.policy_ver, 4);
+
+    // Same key on beta-fps gets a completely unlinkable Device ID (ID-02), while stable within alpha-mmo.
+    let (ar_b, ans_b) = admit(addr_b, run_b.bundle.clone(), client_b, "casual").await;
+    assert_eq!(ar_b.iss, "verifier.beta-fps.example");
+    assert_eq!(ar_b.policy_ver, 9);
+    assert!(matches!(ans_b, MatchAnswer::Granted { .. }));
+    assert_eq!(
+        ar_a1.did, ar_a2.did,
+        "DID must be stable within one publisher"
+    );
+    assert_ne!(
+        ar_a1.did, ar_b.did,
+        "DID must be unlinkable across publishers (ID-02)"
+    );
+
+    drop(shard1);
+    drop(shard2);
+    srv_a.abort();
+    srv_b.abort();
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}

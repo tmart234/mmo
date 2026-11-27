@@ -208,6 +208,8 @@ async fn run() -> Result<()> {
         liveness: None,
         verifier: Some(Arc::new(VerifierRole {
             key: Ed25519Signer::new(ver_sk.clone()),
+            did_key: [0x22; 32],
+            policy: fppd::policy::AuthorityPolicy::default(),
             attestation: ClientAttestation::default(),
             deadline: Duration::from_secs(5),
         })),

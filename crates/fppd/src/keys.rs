@@ -6,11 +6,13 @@
 //! - `admin.seed`      — X25519 Noise IK static key for authorized operators/roles
 //! - `liveness.seed`   — Ed25519 Server Liveness key (`fpp/1/sar`)
 //! - `verifier.seed`   — Ed25519 Verifier key (`fpp/1/attestation-result`)
+//! - `verifier/did.seed` — 32-byte publisher HMAC key for unlinkable Device IDs (ID-02)
 //! - `broker.seed`     — Ed25519 Broker key (`fpp/1/sat`)
 //! - `enforcement.seed`— Ed25519 Enforcement key (`fpp/1/revocation`)
 //! - `log.seed` + `log.mldsa` — Hybrid Ed25519 + ML-DSA-65 Log key (`FPP-S1H`)
 //! - `witness.seed`    — Ed25519 Transparency Log witness key
 
+use crate::policy::AuthorityPolicy;
 use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::SigningKey;
 use fpp::bundle::{KeyBundle, LogKeys};
@@ -67,6 +69,9 @@ pub struct CellKeys {
     pub admin: StaticKeypair,
     pub liveness: Ed25519Signer,
     pub verifier: Ed25519Signer,
+    /// Per-publisher 32-byte HMAC secret for hardware Device IDs (ID-02):
+    /// stable for bans within this game/publisher, unlinkable across publishers.
+    pub did_key: [u8; 32],
     pub broker: Ed25519Signer,
     pub enforcement: Ed25519Signer,
     pub log: HybridSigner,
@@ -81,6 +86,7 @@ impl CellKeys {
             admin: load_noise(dir, "admin")?,
             liveness: Ed25519Signer::new(load_ed25519(dir, "liveness")?),
             verifier: Ed25519Signer::new(load_ed25519(dir, "verifier")?),
+            did_key: load_or_create_seed(dir, "verifier", "did")?,
             broker: Ed25519Signer::new(load_ed25519(dir, "broker")?),
             enforcement: Ed25519Signer::new(load_ed25519(dir, "enforcement")?),
             log: load_log_hybrid(dir)?,
@@ -88,8 +94,13 @@ impl CellKeys {
         })
     }
 
-    /// Public regional key bundle trusted by relying parties (clients & game servers).
+    /// Public regional key bundle using the default `fpp.dev` domain.
     pub fn bundle(&self) -> KeyBundle {
+        self.bundle_for(&AuthorityPolicy::default())
+    }
+
+    /// Public regional key bundle for a specific game/publisher `policy`.
+    pub fn bundle_for(&self, policy: &AuthorityPolicy) -> KeyBundle {
         KeyBundle {
             transport_pub: self.transport.public,
             role_transport: BTreeMap::new(),
@@ -98,10 +109,13 @@ impl CellKeys {
             server_liveness: self.liveness.verifying_key(),
             enforcement: self.enforcement.verifying_key(),
             log: Some(LogKeys {
-                origin: LOG_ORIGIN.into(),
+                origin: policy.log_origin(),
                 ed25519: self.log.ed25519_public().to_bytes(),
                 ml_dsa: self.log.ml_dsa_public().to_vec(),
-                witnesses: vec![(WITNESS_NAME.into(), self.witness.verifying_key().to_bytes())],
+                witnesses: vec![(
+                    policy.witness_name(),
+                    self.witness.verifying_key().to_bytes(),
+                )],
             }),
         }
     }

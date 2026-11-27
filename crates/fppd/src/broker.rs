@@ -1,13 +1,14 @@
 //! The Broker role (04 §5.2): verifies a client's Attestation Result (signed
 //! ONLY by the Verifier's key, bound to the session key proving possession of
-//! this challenge), enforces the queue's device tier floor and Enforcement
-//! revocations, reserves a slot on a live game server (directly in all-in-one
-//! mode, or over Noise_IK TCP in per-role mode), and signs a Session Admission
-//! Token (SAT).
+//! this challenge), enforces the title policy's queue device-tier floor and
+//! Enforcement revocations, reserves a slot on a live game server/shard
+//! (directly in all-in-one mode, or over Noise_IK TCP in per-role mode), and
+//! signs a Session Admission Token (SAT).
 //!
 //! Uses ONLY its isolated Broker signing key (`KeyRole::BrokerSat`).
 
 use crate::liveness::LivenessRole;
+use crate::policy::{AuthorityPolicy, DEFAULT_DOMAIN};
 use crate::revocation::RevocationFeed;
 use ed25519_dalek::VerifyingKey;
 use fpp::control::{
@@ -25,24 +26,22 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-pub const BROKER_ISS: &str = "broker.dev";
-pub const REGION: &str = "dev";
-pub const POLICY_VER: u64 = 1;
-pub const SAT_LIFETIME_S: u64 = 3600;
 pub const LIVENESS_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Default queue lookup (for callers without a custom `AuthorityPolicy`).
 pub fn queue_min_tier(queue: &str) -> Option<DeviceTier> {
-    match queue {
-        "open" => Some(DeviceTier::D0Unknown),
-        "verified" => Some(DeviceTier::D2Hardware),
-        "hardened" => Some(DeviceTier::D3Hardened),
-        _ => None,
-    }
+    AuthorityPolicy::default().queue_min_tier(queue)
 }
 
-/// Dev account pseudonym derived from the session key.
+/// Account pseudonym derived from the session key under the default domain.
 pub fn account_of(session_key: &SessionKey) -> [u8; 32] {
-    tagged_hash("mmo/dev-acct", &session_key.to_bytes())
+    account_of_in_domain(DEFAULT_DOMAIN, session_key)
+}
+
+/// Title-scoped account pseudonym derived from the session key.
+pub fn account_of_in_domain(domain: &str, session_key: &SessionKey) -> [u8; 32] {
+    let tag = format!("fpp/1/acct/{domain}");
+    tagged_hash(&tag, &session_key.to_bytes())
 }
 
 pub enum Placer {
@@ -59,7 +58,7 @@ pub enum Placer {
 impl Placer {
     pub async fn place(&self) -> Option<Placement> {
         match self {
-            Placer::Local(liveness) => liveness.place(),
+            Placer::Local(live) => live.place(),
             Placer::Remote {
                 addr,
                 server_pub,
@@ -75,7 +74,7 @@ impl Placer {
                 })
                 .await
                 .ok()?;
-                let _challenge: AttestChallenge = s.recv().await.ok()?;
+                let _: AttestChallenge = s.recv().await.ok()?;
                 match s.recv::<PlaceResponse>().await.ok()? {
                     PlaceResponse::Placed(p) => Some(p),
                     _ => None,
@@ -87,6 +86,7 @@ impl Placer {
 
 pub struct BrokerRole {
     pub key: Ed25519Signer,
+    pub policy: AuthorityPolicy,
     verifier_keys: KeySet,
     placer: Placer,
     denials: Mutex<Vec<RevocationEvent>>,
@@ -105,10 +105,21 @@ impl BrokerRole {
         placer: Placer,
         feed: Option<Arc<RevocationFeed>>,
     ) -> Arc<Self> {
+        Self::new_with_policy(key, verifier_pub, placer, feed, AuthorityPolicy::default())
+    }
+
+    pub fn new_with_policy(
+        key: Ed25519Signer,
+        verifier_pub: VerifyingKey,
+        placer: Placer,
+        feed: Option<Arc<RevocationFeed>>,
+        policy: AuthorityPolicy,
+    ) -> Arc<Self> {
         let mut verifier_keys = KeySet::default();
         verifier_keys.insert_ed25519(KeyRole::VerifierAr, verifier_pub);
         let broker = Arc::new(Self {
             key,
+            policy,
             verifier_keys,
             placer,
             denials: Mutex::new(Vec::new()),
@@ -139,12 +150,12 @@ impl BrokerRole {
     }
 
     fn denied(&self, ar: &fpp::tokens::AttestationResult, queue: &str, now: u64) -> bool {
-        let account = account_of(&ar.cnf);
+        let account = account_of_in_domain(&self.policy.domain, &ar.cnf);
         let mut denials = self.denials.lock().expect("denials");
         denials.retain(|e| e.expires_at.is_none_or(|x| x > now));
         denials.iter().any(|e| {
             e.effective_at <= now + SKEW_S
-                && e.scope.covers(Some(REGION), Some(queue))
+                && e.scope.covers(Some(&self.policy.region), Some(queue))
                 && match e.subject_kind {
                     SubjectKind::Account => e.subject_id == account,
                     SubjectKind::Device => e.subject_id == ar.did.0,
@@ -156,7 +167,7 @@ impl BrokerRole {
     }
 
     pub async fn answer(&self, challenge: &[u8; 32], req: &MatchRequest) -> MatchAnswer {
-        let Some(min_tier) = queue_min_tier(&req.queue) else {
+        let Some(min_tier) = self.policy.queue_min_tier(&req.queue) else {
             return refuse(Reason::TierInsufficient);
         };
         let now = now_s();
@@ -179,11 +190,11 @@ impl BrokerRole {
         let mut cti = [0u8; 16];
         OsRng.fill_bytes(&mut cti);
         let sat = SessionAdmissionToken {
-            iss: BROKER_ISS.into(),
-            sub: account_of(&ar.cnf),
+            iss: self.policy.broker_iss(),
+            sub: account_of_in_domain(&self.policy.domain, &ar.cnf),
             aud: instance_id(&place.instance_pub),
             iat: now,
-            exp: now + SAT_LIFETIME_S,
+            exp: now + self.policy.sat_ttl_s,
             cti,
             cnf: ar.cnf,
             did: ar.did,
@@ -191,7 +202,7 @@ impl BrokerRole {
             match_id: MatchId(place.match_id),
             slot: place.slot,
             queue: req.queue.clone(),
-            policy_ver: POLICY_VER,
+            policy_ver: self.policy.policy_ver,
             ar_cti: ar.cti,
         };
         let signed = crypto::sign(&self.key, &sat);
