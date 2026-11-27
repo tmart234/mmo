@@ -239,3 +239,244 @@ pub unsafe extern "C" fn fpp_gs_link_submit_checkpoint(
 pub unsafe extern "C" fn fpp_gs_link_free(link: *mut FppGsLink) {
     unsafe { free(link) }
 }
+
+// ============================================================================
+// Client control-plane admission & Transparency Log split-view audit (EVD-02/03)
+// ============================================================================
+
+/// Maximum token size stored inside [`FppAdmittedTicket`].
+pub const FPP_MAX_TICKET_TOKEN: usize = 4096;
+
+/// Parameters for direct client admission against `fppd` (`fpp_client_admit`).
+#[repr(C)]
+pub struct FppClientAdmitConfig {
+    /// Regional authority (`fppd`) address, `"ip:port"`.
+    pub authority: *const c_char,
+    /// Path to `fpp_key_bundle.json` (carries Verifier/Broker/Liveness keys and
+    /// pinned Noise transport keys).
+    pub bundle: *const c_char,
+    /// Queue/playlist/shard name (NULL or empty defaults to `"open"`).
+    pub queue: *const c_char,
+    /// 32-byte SHA-256 client build digest, or NULL to hash the running binary.
+    pub client_build: *const u8,
+    /// Optional 32-byte Ed25519 session seed, or NULL to generate a fresh key.
+    pub session_seed: *const u8,
+    /// Total admission timeout in milliseconds (`0` defaults to 15,000 ms).
+    pub timeout_ms: u32,
+}
+
+/// Verified admission ticket returned by [`fpp_client_admit`].
+#[repr(C)]
+pub struct FppAdmittedTicket {
+    pub session_seed: [u8; 32],
+    pub gs_noise_static: [u8; 32],
+    pub liveness_key: [u8; 32],
+    pub match_id: [u8; 16],
+    pub did: [u8; 32],
+    /// NUL-terminated `"ip:port"` of the assigned game server / shard.
+    pub gs_addr: [c_char; 64],
+    pub ar: [u8; 4096],
+    pub ar_len: usize,
+    pub sat: [u8; 4096],
+    pub sat_len: usize,
+    pub slot: u16,
+    /// Assigned device tier (`0..3`).
+    pub tier: u8,
+    /// If refused by Verifier or Broker, the FPP `Reason` code (`0` on success).
+    pub reason: u16,
+}
+
+/// Outcome of auditing a game server's Checkpoint against the Transparency Log.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FppTlogStatus {
+    /// Not yet indexed in the log; retry after the next witness round.
+    Pending = 0,
+    /// Proven included under a witness-cosigned Transparency Log checkpoint.
+    Included = 1,
+    /// Proven split view: the log holds a different Checkpoint digest for this
+    /// `(match_id, epoch)`. Report it via [`fpp_tlog_report_equivocation`].
+    SplitView = 2,
+}
+
+/// Request an Attestation Result from Verifier and a Session Admission Token
+/// from Broker directly over `Noise_IK` TCP, filling `out` with verified ticket
+/// material ready for `fpp_p2p_joiner_new` and `fpp_control_admit`.
+///
+/// # Safety
+/// `config` valid with NUL-terminated strings; `out` valid for writing an
+/// [`FppAdmittedTicket`].
+#[no_mangle]
+pub unsafe extern "C" fn fpp_client_admit(
+    config: *const FppClientAdmitConfig,
+    out: *mut FppAdmittedTicket,
+) -> FppStatus {
+    guard(|| {
+        let c = unsafe { handle(config) }?;
+        let out_ref = unsafe { out.as_mut() }.ok_or(FppStatus::NullPointer)?;
+        out_ref.reason = 0;
+
+        let authority: SocketAddr = unsafe { text(c.authority) }?
+            .parse()
+            .map_err(|_| FppStatus::InvalidArgument)?;
+        let bundle =
+            KeyBundle::load(unsafe { text(c.bundle) }?).map_err(|e| link_error("key bundle", e))?;
+        let queue = if c.queue.is_null() {
+            "open".to_string()
+        } else {
+            let q = unsafe { text(c.queue) }?;
+            if q.is_empty() {
+                "open".to_string()
+            } else {
+                q.to_string()
+            }
+        };
+        let client_build = if c.client_build.is_null() {
+            let exe = std::env::current_exe().map_err(|_| FppStatus::GsLink)?;
+            fpp_core::crypto::file_sha256(&exe).map_err(|_| FppStatus::GsLink)?
+        } else {
+            unsafe { fixed(c.client_build) }?
+        };
+        let session_seed = if c.session_seed.is_null() {
+            None
+        } else {
+            Some(unsafe { fixed(c.session_seed) }?)
+        };
+        let timeout = Duration::from_millis(match c.timeout_ms {
+            0 => 15_000,
+            t => t.into(),
+        });
+
+        let ticket = fpp_core::client::admit(&fpp_core::client::AdmitConfig {
+            authority,
+            bundle,
+            queue,
+            client_build,
+            session_seed,
+            timeout,
+        })
+        .map_err(|e| {
+            if let Some(code) = e.reason {
+                out_ref.reason = code;
+            }
+            link_error("client admit", e)
+        })?;
+
+        if ticket.ar.len() > FPP_MAX_TICKET_TOKEN
+            || ticket.sat.len() > FPP_MAX_TICKET_TOKEN
+            || ticket.gs_addr.len() >= out_ref.gs_addr.len()
+        {
+            return Err(FppStatus::BufferTooSmall);
+        }
+
+        out_ref.session_seed = ticket.session_seed;
+        out_ref.gs_noise_static = ticket.gs_noise_static;
+        out_ref.liveness_key = ticket.liveness_key;
+        out_ref.match_id = ticket.match_id;
+        out_ref.did = ticket.did;
+        out_ref.gs_addr.fill(0);
+        for (i, b) in ticket.gs_addr.as_bytes().iter().enumerate() {
+            out_ref.gs_addr[i] = *b as c_char;
+        }
+        out_ref.ar[..ticket.ar.len()].copy_from_slice(&ticket.ar);
+        out_ref.ar_len = ticket.ar.len();
+        out_ref.sat[..ticket.sat.len()].copy_from_slice(&ticket.sat);
+        out_ref.sat_len = ticket.sat.len();
+        out_ref.slot = ticket.slot;
+        out_ref.tier = ticket.tier as u8;
+        out_ref.reason = 0;
+        Ok(())
+    })
+}
+
+/// Audit a game server's Checkpoint `(match_id, epoch, digest)` against the
+/// Transparency Log at `log_addr`, verifying the C2SP log signature, witness
+/// cosignature, and RFC 9162 Merkle inclusion proof (EVD-02 / EVD-03).
+///
+/// # Safety
+/// `log_addr` and `bundle` are NUL-terminated; `match_id` valid for 16 bytes;
+/// `digest` valid for 32 bytes; `out_status` non-NULL; `out_logged_digest`
+/// NULL or valid for 32 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn fpp_tlog_check_checkpoint(
+    log_addr: *const c_char,
+    bundle: *const c_char,
+    match_id: *const u8,
+    epoch: u32,
+    digest: *const u8,
+    timeout_ms: u32,
+    out_status: *mut FppTlogStatus,
+    out_logged_digest: *mut u8,
+) -> FppStatus {
+    guard(|| {
+        let addr: SocketAddr = unsafe { text(log_addr) }?
+            .parse()
+            .map_err(|_| FppStatus::InvalidArgument)?;
+        let bundle =
+            KeyBundle::load(unsafe { text(bundle) }?).map_err(|e| link_error("key bundle", e))?;
+        let match_id: [u8; 16] = unsafe { fixed(match_id) }?;
+        let digest: [u8; 32] = unsafe { fixed(digest) }?;
+        let status_out = unsafe { out_status.as_mut() }.ok_or(FppStatus::NullPointer)?;
+        let timeout = Duration::from_millis(match timeout_ms {
+            0 => 5_000,
+            t => t.into(),
+        });
+
+        let audit =
+            fpp_core::client::check_checkpoint(addr, &bundle, &match_id, epoch, &digest, timeout)
+                .map_err(|e| link_error("tlog check", e))?;
+        match audit {
+            fpp_core::client::CheckpointAudit::Pending => {
+                *status_out = FppTlogStatus::Pending;
+            }
+            fpp_core::client::CheckpointAudit::Included { .. } => {
+                *status_out = FppTlogStatus::Included;
+            }
+            fpp_core::client::CheckpointAudit::SplitView { logged } => {
+                *status_out = FppTlogStatus::SplitView;
+                if !out_logged_digest.is_null() {
+                    unsafe { super::write_fixed(out_logged_digest, &logged) }?;
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Report a conflicting signed Checkpoint to Server Liveness (`liveness_addr`)
+/// so the equivocating game server is revoked immediately. Sets `*out_revoked`
+/// to `1` if Server Liveness confirmed revocation, `0` otherwise.
+///
+/// # Safety
+/// `liveness_addr` and `bundle` are NUL-terminated; `signed_checkpoint` valid
+/// for `signed_checkpoint_len` bytes; `out_revoked` NULL or valid for 1 byte.
+#[no_mangle]
+pub unsafe extern "C" fn fpp_tlog_report_equivocation(
+    liveness_addr: *const c_char,
+    bundle: *const c_char,
+    signed_checkpoint: *const u8,
+    signed_checkpoint_len: usize,
+    timeout_ms: u32,
+    out_revoked: *mut u8,
+) -> FppStatus {
+    guard(|| {
+        let addr: SocketAddr = unsafe { text(liveness_addr) }?
+            .parse()
+            .map_err(|_| FppStatus::InvalidArgument)?;
+        let bundle =
+            KeyBundle::load(unsafe { text(bundle) }?).map_err(|e| link_error("key bundle", e))?;
+        let checkpoint = unsafe { input(signed_checkpoint, signed_checkpoint_len) }?;
+        let timeout = Duration::from_millis(match timeout_ms {
+            0 => 5_000,
+            t => t.into(),
+        });
+
+        let ans = fpp_core::client::report_equivocation(addr, &bundle, checkpoint, timeout)
+            .map_err(|e| link_error("tlog report", e))?;
+        if !out_revoked.is_null() {
+            let revoked = matches!(ans, fpp_core::control::ReportAnswer::Revoked);
+            unsafe { *out_revoked = u8::from(revoked) };
+        }
+        Ok(())
+    })
+}

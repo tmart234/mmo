@@ -755,3 +755,177 @@ async fn custom_game_policy_multi_shard_and_unlinkable_dids() {
     let _ = std::fs::remove_dir_all(&dir_a);
     let _ = std::fs::remove_dir_all(&dir_b);
 }
+
+#[tokio::test]
+async fn client_admit_and_tlog_split_view_revocation() {
+    use fpp::client::{self, AdmitConfig, CheckpointAudit};
+    use fpp::control::ReportAnswer;
+    use fpp::crypto::{object_digest, sign};
+    use fpp::types::{Digest, MatchId};
+    use fpp::wire::Checkpoint;
+
+    let dir = temp_dir("client-tlog-split-view");
+    let running = Authority::open_all(
+        &dir,
+        None,
+        LivenessConfig::default(),
+        ClientAttestation::default(),
+        Some(Duration::from_millis(200)),
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let auth = running.authority.clone();
+    let server = tokio::spawn(async move { auth.serve(listener).await });
+
+    let instance_signer = Ed25519Signer::new(SigningKey::from_bytes(&[0x44; 32]));
+    let instance_pub = instance_signer.verifying_key().to_bytes();
+    let gs_noise = StaticKeypair::generate().public;
+    let bundle_gs = running.bundle.clone();
+    let link = tokio::task::spawn_blocking(move || {
+        GsLink::connect(GsLinkConfig {
+            liveness: addr,
+            bundle: bundle_gs,
+            gs_id: "tlog-gs".into(),
+            game_addr: "127.0.0.1:53000".into(),
+            gs_key: SigningKey::from_bytes(&[0x43; 32]),
+            instance_pub,
+            noise_pub: gs_noise,
+            sw_hash: [0x45; 32],
+            tpm2: None,
+            timeout: Duration::from_secs(5),
+        })
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let match_id = link.match_id();
+
+    // 1) Pure-std direct client admission (fpp::client::admit -> Verifier + Broker).
+    let bundle_c = running.bundle.clone();
+    let ticket = tokio::task::spawn_blocking(move || {
+        client::admit(&AdmitConfig {
+            authority: addr,
+            bundle: bundle_c,
+            queue: "open".into(),
+            client_build: [0x9a; 32],
+            session_seed: None,
+            timeout: Duration::from_secs(5),
+        })
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(ticket.gs_addr, "127.0.0.1:53000");
+    assert_eq!(ticket.gs_noise_static, gs_noise);
+    assert_eq!(ticket.match_id, match_id);
+    assert_eq!(ticket.slot, 0);
+
+    // 2) Submit honest epoch 0 Checkpoint and verify Transparency Log inclusion (C2SP + witness + Merkle).
+    let make_cp = |epoch: u32, prev: Option<Digest>, state_byte: u8| -> (Vec<u8>, [u8; 32]) {
+        let cp = Checkpoint {
+            match_id: MatchId(match_id),
+            gs_instance_id: fpp::tokens::instance_id(&instance_pub),
+            build_id: BuildId([0x45; 32]),
+            policy_ver: 1,
+            epoch,
+            ticks: (epoch * 30, epoch * 30 + 29),
+            prev: prev.unwrap_or_default(),
+            inputs_root: Digest::default(),
+            inputs_n: 0,
+            events_root: Digest::default(),
+            events_n: 0,
+            state_root: Digest([state_byte; 32]),
+            rng_root: Digest::default(),
+            rng_n: 0,
+            roster_root: Digest::default(),
+            roster_n: 0,
+        };
+        let bytes = sign(&instance_signer, &cp);
+        let digest = object_digest(&bytes).0;
+        (bytes, digest)
+    };
+
+    let (cp0, d0) = make_cp(0, None, 0x11);
+    link.submit_checkpoint(cp0).unwrap();
+
+    let mut included = false;
+    for _ in 0..30 {
+        let bundle_q = running.bundle.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            client::check_checkpoint(addr, &bundle_q, &match_id, 0, &d0, Duration::from_secs(5))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        if matches!(res, CheckpointAudit::Included { .. }) {
+            included = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    assert!(included, "honest epoch 0 Checkpoint must be proven logged");
+
+    // 3) Equivocate on epoch 1: submit cp1_log to Server Liveness, show cp1_fake to client.
+    let (cp1_log, d1_log) = make_cp(1, Some(Digest(d0)), 0x22);
+    let (cp1_fake, d1_fake) = make_cp(1, Some(Digest(d0)), 0x99);
+    assert_ne!(d1_log, d1_fake);
+    link.submit_checkpoint(cp1_log).unwrap();
+
+    let mut split = false;
+    for _ in 0..30 {
+        let bundle_q = running.bundle.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            client::check_checkpoint(
+                addr,
+                &bundle_q,
+                &match_id,
+                1,
+                &d1_fake,
+                Duration::from_secs(5),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        if let CheckpointAudit::SplitView { logged } = res {
+            assert_eq!(logged, d1_log);
+            split = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    assert!(
+        split,
+        "rogue epoch 1 Checkpoint must be detected as SplitView"
+    );
+
+    // 4) Report the conflicting signed Checkpoint -> Server Liveness revokes the rogue GS!
+    let bundle_r = running.bundle.clone();
+    let ans = tokio::task::spawn_blocking(move || {
+        client::report_equivocation(addr, &bundle_r, &cp1_fake, Duration::from_secs(5))
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(ans, ReportAnswer::Revoked);
+
+    // Confirm GsLink receives Closed (revoked) promptly.
+    let mut closed = false;
+    for _ in 0..30 {
+        while let Some(ev) = link.poll_event() {
+            if matches!(ev, fpp::gs_link::GsLinkEvent::Closed(_)) {
+                closed = true;
+            }
+        }
+        if closed {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(closed, "equivocating GS must be revoked and closed");
+
+    drop(link);
+    server.abort();
+    let _ = std::fs::remove_dir_all(&dir);
+}

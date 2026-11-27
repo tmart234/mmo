@@ -113,6 +113,7 @@ impl Note {
     }
 
     /// The log's ML-DSA-65 signature (FPP-S1H) by `name`/`public`.
+    #[cfg(feature = "s1h")]
     pub fn verify_ml_dsa(&self, name: &str, public: &[u8]) -> Result<(), LogError> {
         let hash = key_hash(name, ALG_FPP_ML_DSA_65, public);
         for (n, sig) in &self.signatures {
@@ -132,6 +133,7 @@ impl Note {
     }
 
     /// Both halves of a hybrid (FPP-S1H) signature.
+    #[cfg(feature = "s1h")]
     pub fn verify_hybrid(&self, name: &str, ed: &[u8; 32], ml: &[u8]) -> Result<(), LogError> {
         self.verify(name, ed)?;
         self.verify_ml_dsa(name, ml)
@@ -172,6 +174,7 @@ pub fn sign(text: &str, name: &str, key: &SigningKey) -> Result<String, LogError
 }
 
 /// Sign `text` with a hybrid key: the Ed25519 line, then the ML-DSA-65 one.
+#[cfg(feature = "s1h")]
 pub fn sign_hybrid(
     text: &str,
     name: &str,

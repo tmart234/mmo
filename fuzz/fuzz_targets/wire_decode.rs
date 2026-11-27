@@ -3,7 +3,7 @@
 #![no_main]
 
 use fpp::control::{
-    AttestChallenge, ChallengeRequest, CheckpointSubmit, ControlMsg, CredentialChallenge,
+    AttestChallenge, CborMsg, ChallengeRequest, CheckpointSubmit, CredentialChallenge,
     CredentialResponse, EquivocationReport, EvidenceAnswer, EvidenceRequest, EvidenceStoreRequest,
     EvidenceStoreResponse, GossipAnswer, GossipRequest, JoinAccept, JoinRequest, LogRequest,
     LogResponse, MatchAnswer, MatchRequest, PlaceResponse, ReportAnswer, RevocationRequest,
@@ -12,9 +12,9 @@ use fpp::control::{
 use fpp_sim::game_wire::{ClientCmd, WorldSnapshot};
 use libfuzzer_sys::fuzz_target;
 
-fn decode<T: ControlMsg>(body: &[u8]) {
-    if let Ok(msg) = T::decode_cbor(body) {
-        let re = msg.encode_cbor();
+fn decode<T: CborMsg>(body: &[u8]) {
+    if let Ok(msg) = T::decode(body) {
+        let re = msg.encode();
         assert_eq!(re, body);
     }
 }

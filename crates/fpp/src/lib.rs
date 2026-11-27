@@ -22,10 +22,10 @@
 pub mod audit;
 pub mod b64;
 pub mod bundle;
+pub mod client;
 pub mod control;
 pub mod crypto;
 pub mod gs_link;
-#[cfg(feature = "log")]
 pub mod log;
 pub mod merkle;
 pub mod session;
