@@ -56,6 +56,11 @@
 
 #define FPP_SERVER_FIRST_PARTY_CVM 3
 
+#if defined(FPP_GS_LINK)
+// Maximum token size stored inside [`FppAdmittedTicket`].
+#define FPP_MAX_TICKET_TOKEN 4096
+#endif
+
 // Largest datagram the SDK produces or accepts (no IP fragmentation).
 #define FPP_P2P_MAX_PACKET 1452
 
@@ -204,6 +209,25 @@ typedef enum FppGsEventKind {
   FPP_GS_EVENT_KIND_CLOSED = 3,
 #endif
 } FppGsEventKind;
+#endif
+
+#if defined(FPP_GS_LINK)
+// Outcome of auditing a game server's Checkpoint against the Transparency Log.
+typedef enum FppTlogStatus {
+#if defined(FPP_GS_LINK)
+  // Not yet indexed in the log; retry after the next witness round.
+  FPP_TLOG_STATUS_PENDING = 0,
+#endif
+#if defined(FPP_GS_LINK)
+  // Proven included under a witness-cosigned Transparency Log checkpoint.
+  FPP_TLOG_STATUS_INCLUDED = 1,
+#endif
+#if defined(FPP_GS_LINK)
+  // Proven split view: the log holds a different Checkpoint digest for this
+  // `(match_id, epoch)`. Report it via [`fpp_tlog_report_equivocation`].
+  FPP_TLOG_STATUS_SPLIT_VIEW = 2,
+#endif
+} FppTlogStatus;
 #endif
 
 // What a poll returned (`FppP2pEvent.kind`).
@@ -412,6 +436,47 @@ typedef struct FppGsEvent {
   uint16_t reason;
   size_t data_len;
 } FppGsEvent;
+#endif
+
+#if defined(FPP_GS_LINK)
+// Parameters for direct client admission against `fppd` (`fpp_client_admit`).
+typedef struct FppClientAdmitConfig {
+  // Regional authority (`fppd`) address, `"ip:port"`.
+  const char *authority;
+  // Path to `fpp_key_bundle.json` (carries Verifier/Broker/Liveness keys and
+  // pinned Noise transport keys).
+  const char *bundle;
+  // Queue/playlist/shard name (NULL or empty defaults to `"open"`).
+  const char *queue;
+  // 32-byte SHA-256 client build digest, or NULL to hash the running binary.
+  const uint8_t *client_build;
+  // Optional 32-byte Ed25519 session seed, or NULL to generate a fresh key.
+  const uint8_t *session_seed;
+  // Total admission timeout in milliseconds (`0` defaults to 15,000 ms).
+  uint32_t timeout_ms;
+} FppClientAdmitConfig;
+#endif
+
+#if defined(FPP_GS_LINK)
+// Verified admission ticket returned by [`fpp_client_admit`].
+typedef struct FppAdmittedTicket {
+  uint8_t session_seed[32];
+  uint8_t gs_noise_static[32];
+  uint8_t liveness_key[32];
+  uint8_t match_id[16];
+  uint8_t did[32];
+  // NUL-terminated `"ip:port"` of the assigned game server / shard.
+  char gs_addr[64];
+  uint8_t ar[4096];
+  size_t ar_len;
+  uint8_t sat[4096];
+  size_t sat_len;
+  uint16_t slot;
+  // Assigned device tier (`0..3`).
+  uint8_t tier;
+  // If refused by Verifier or Broker, the FPP `Reason` code (`0` on success).
+  uint16_t reason;
+} FppAdmittedTicket;
 #endif
 
 // One event. Variable-size fields go into the caller's data buffer; the
@@ -1138,6 +1203,53 @@ enum FppStatus fpp_gs_link_submit_checkpoint(struct FppGsLink *link,
 // # Safety
 // `link` NULL or a live handle, not used afterwards.
 void fpp_gs_link_free(struct FppGsLink *link);
+#endif
+
+#if defined(FPP_GS_LINK)
+// Request an Attestation Result from Verifier and a Session Admission Token
+// from Broker directly over `Noise_IK` TCP, filling `out` with verified ticket
+// material ready for `fpp_p2p_joiner_new` and `fpp_control_admit`.
+//
+// # Safety
+// `config` valid with NUL-terminated strings; `out` valid for writing an
+// [`FppAdmittedTicket`].
+enum FppStatus fpp_client_admit(const struct FppClientAdmitConfig *config,
+                                struct FppAdmittedTicket *out);
+#endif
+
+#if defined(FPP_GS_LINK)
+// Audit a game server's Checkpoint `(match_id, epoch, digest)` against the
+// Transparency Log at `log_addr`, verifying the C2SP log signature, witness
+// cosignature, and RFC 9162 Merkle inclusion proof (EVD-02 / EVD-03).
+//
+// # Safety
+// `log_addr` and `bundle` are NUL-terminated; `match_id` valid for 16 bytes;
+// `digest` valid for 32 bytes; `out_status` non-NULL; `out_logged_digest`
+// NULL or valid for 32 bytes.
+enum FppStatus fpp_tlog_check_checkpoint(const char *log_addr,
+                                         const char *bundle,
+                                         const uint8_t *match_id,
+                                         uint32_t epoch,
+                                         const uint8_t *digest,
+                                         uint32_t timeout_ms,
+                                         enum FppTlogStatus *out_status,
+                                         uint8_t *out_logged_digest);
+#endif
+
+#if defined(FPP_GS_LINK)
+// Report a conflicting signed Checkpoint to Server Liveness (`liveness_addr`)
+// so the equivocating game server is revoked immediately. Sets `*out_revoked`
+// to `1` if Server Liveness confirmed revocation, `0` otherwise.
+//
+// # Safety
+// `liveness_addr` and `bundle` are NUL-terminated; `signed_checkpoint` valid
+// for `signed_checkpoint_len` bytes; `out_revoked` NULL or valid for 1 byte.
+enum FppStatus fpp_tlog_report_equivocation(const char *liveness_addr,
+                                            const char *bundle,
+                                            const uint8_t *signed_checkpoint,
+                                            size_t signed_checkpoint_len,
+                                            uint32_t timeout_ms,
+                                            uint8_t *out_revoked);
 #endif
 
 // Generate a static X25519 key pair (the host's identity for its invites).

@@ -11,14 +11,18 @@
 //! tests check this log against Go's implementation (`interop/go/tlog`).
 
 pub mod leaf;
+#[cfg(feature = "log")]
 #[allow(clippy::module_inception)]
 pub mod log;
 pub mod note;
 pub mod tiles;
+#[cfg(feature = "log")]
 pub mod witness;
 
+#[cfg(feature = "log")]
 pub use log::{Appended, Log};
 pub use note::{Checkpoint, Note};
+#[cfg(feature = "log")]
 pub use witness::Witness;
 
 #[derive(Debug)]

@@ -1,5 +1,5 @@
 # cargo-deny policy (CI job `dependency-policy`, blocking). Run locally with
-# `cargo deny check`. Zero advisory ignores after eliminating bincode and client-bevy.
+# `cargo deny check`.
 
 [graph]
 all-features = false
@@ -8,7 +8,16 @@ all-features = false
 version = 2
 yanked = "deny"
 unmaintained = "workspace"
-ignore = []
+ignore = [
+    # tokio::io::unix::AsyncFd::new accepts RawFd; mmo never calls AsyncFd
+    # (only TcpListener/TcpStream/UdpSocket). Remove once tokio patches.
+    "RUSTSEC-2026-0386",
+    # crypto-bigint 0.5.5 timing variability via p256 0.13.2 (locked by
+    # elliptic-curve 0.13); mmo uses p256 strictly for public verification of
+    # hardware-backed ES256 signatures and test fixtures — never server secrets.
+    # Remove once p256 0.14 / crypto-bigint 0.7.6 releases.
+    "RUSTSEC-2026-0387",
+]
 
 [licenses]
 version = 2
@@ -21,11 +30,9 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
-    "Zlib",
     "Unicode-3.0",
     "CC0-1.0",
     "BSL-1.0",
-    "0BSD",
 ]
 
 [bans]

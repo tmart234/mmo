@@ -83,11 +83,16 @@ struct GsSession {
     next_slot: u16,
 }
 
+type GsSender = (
+    mpsc::UnboundedSender<ToGameServer>,
+    Arc<tokio::sync::Notify>,
+);
+
 pub struct LivenessRole {
     pub key: Ed25519Signer,
     pub config: LivenessConfig,
     sessions: RwLock<HashMap<[u8; 16], GsSession>>,
-    senders: RwLock<HashMap<[u8; 16], mpsc::UnboundedSender<ToGameServer>>>,
+    senders: RwLock<HashMap<[u8; 16], GsSender>>,
     evidence: Option<Arc<EvidenceStore>>,
     log: Option<Arc<LogEngine>>,
     feed: Option<Arc<RevocationFeed>>,
@@ -160,11 +165,15 @@ impl LivenessRole {
                 );
             }
         }
-        // Drop sender channel so SAR loop / writer exits promptly.
-        self.senders
+        // Drop sender channel and wake SAR loop so TCP writer closes immediately.
+        if let Some((_, notify)) = self
+            .senders
             .write()
             .expect("senders lock")
-            .remove(session_id);
+            .remove(session_id)
+        {
+            notify.notify_waiters();
+        }
     }
 
     fn apply_revocation(&self, event: &RevocationEvent, cose: Vec<u8>) {
@@ -191,7 +200,7 @@ impl LivenessRole {
             .read()
             .expect("senders lock")
             .values()
-            .cloned()
+            .map(|(tx, _)| tx.clone())
             .collect();
         for tx in senders {
             let _ = tx.send(ToGameServer::Revocation(cose.clone()));
@@ -352,10 +361,11 @@ impl LivenessRole {
 
         let (sender, receiver, _) = stream.split();
         let (tx, rx) = mpsc::unbounded_channel::<ToGameServer>();
+        let revoked_notify = Arc::new(tokio::sync::Notify::new());
         self.senders
             .write()
             .expect("senders lock")
-            .insert(session_id, tx.clone());
+            .insert(session_id, (tx.clone(), revoked_notify.clone()));
 
         // Replay existing revocations in force immediately.
         if let Some(feed) = &self.feed {
@@ -369,11 +379,16 @@ impl LivenessRole {
         }
 
         let writer = tokio::spawn(gs_writer_task(sender, rx));
-        let sar_task = tokio::spawn(sar_loop_task(self.clone(), session_id, tx.clone()));
+        let sar_task = tokio::spawn(sar_loop_task(self.clone(), session_id, tx, revoked_notify));
         let cp_task = tokio::spawn(checkpoint_reader_task(self.clone(), session_id, receiver));
         let wd_task = tokio::spawn(watchdog_task(self.clone(), session_id));
 
-        let _ = tokio::join!(writer, sar_task, cp_task, wd_task);
+        // Once the writer exits (all senders dropped on revoke) or reader exits (GS disconnected),
+        // clean up all remaining per-session tasks promptly.
+        let _ = writer.await;
+        sar_task.abort();
+        cp_task.abort();
+        wd_task.abort();
         self.senders
             .write()
             .expect("senders lock")
@@ -482,6 +497,7 @@ async fn sar_loop_task(
     role: Arc<LivenessRole>,
     session_id: [u8; 16],
     tx: mpsc::UnboundedSender<ToGameServer>,
+    revoked: Arc<tokio::sync::Notify>,
 ) {
     let mut seq = 0u64;
     let mut prev = Digest::default();
@@ -503,7 +519,10 @@ async fn sar_loop_task(
             break;
         }
         seq += 1;
-        tokio::time::sleep(Duration::from_secs(role.config.sar_interval_s.max(1))).await;
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(role.config.sar_interval_s.max(1))) => {}
+            _ = revoked.notified() => break,
+        }
     }
 }
 
