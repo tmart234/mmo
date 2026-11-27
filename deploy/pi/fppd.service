@@ -1,0 +1,36 @@
+# systemd unit for the unified Fair-Play Protocol authority daemon (`fppd`)
+# on a Raspberry Pi (e.g. Pi Zero 2 W, 512 MB RAM). Replaces 7 separate daemon
+# units with one lean process holding strictly isolated per-role signing keys.
+[Unit]
+Description=Fair-Play Protocol v1 Authority Daemon (fppd)
+# Tokens carry expiry times: ensure NTP sync before issuing the first token.
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+
+[Service]
+Type=simple
+User=fpp
+Group=fpp
+WorkingDirectory=/var/lib/fpp
+EnvironmentFile=-/etc/fpp/fppd.env
+ExecStart=/usr/local/bin/fppd serve --dir /var/lib/fpp/cell --bundle /var/lib/fpp/keys/fpp_key_bundle.json --bind 0.0.0.0:4444 $ARGS
+Restart=on-failure
+RestartSec=2
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ReadWritePaths=/var/lib/fpp
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target

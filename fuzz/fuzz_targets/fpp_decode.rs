@@ -2,12 +2,13 @@
 #![no_main]
 
 use ed25519_dalek::SigningKey;
-use fpp_crypto::{verify, Ed25519Signer, KeyRole, KeySet};
-use fpp_wire::{cbor, cose::Sign1, AdmitPop, Checkpoint, InputCommit, Payload};
+use fpp::crypto::{verify, Ed25519Signer, KeyRole, KeySet};
+use fpp::tokens::control::Control;
+use fpp::tokens::{AttestationResult, ServerAttestationResult, SessionAdmissionToken};
+use fpp::wire::{cbor, cose::Sign1, AdmitPop, Checkpoint, InputCommit, InputFrame, Payload};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    // Exactly one accepted encoding: whatever decodes re-encodes identically.
     if let Ok(v) = cbor::decode(data) {
         assert_eq!(
             cbor::encode(&v).expect("decoded maps have unique keys"),
@@ -18,11 +19,11 @@ fuzz_target!(|data: &[u8]| {
     let _ = InputCommit::from_cbor(data);
     let _ = Checkpoint::from_cbor(data);
     let _ = AdmitPop::from_cbor(data);
-    let _ = fpp_tokens::AttestationResult::from_cbor(data);
-    let _ = fpp_tokens::SessionAdmissionToken::from_cbor(data);
-    let _ = fpp_tokens::ServerAttestationResult::from_cbor(data);
-    let _ = fpp_tokens::control::Control::decode(data);
-    let _ = fpp_wire::InputFrame::decode(data);
+    let _ = AttestationResult::from_cbor(data);
+    let _ = SessionAdmissionToken::from_cbor(data);
+    let _ = ServerAttestationResult::from_cbor(data);
+    let _ = Control::decode(data);
+    let _ = InputFrame::decode(data);
 
     let mut keys = KeySet::default();
     for (seed, role) in [

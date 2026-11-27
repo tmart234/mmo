@@ -1,0 +1,28 @@
+[package]
+name = "fppd"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Unified Fair-Play Protocol authority and trust-plane daemon + CLI (isolated role keys, owned Noise_IK TCP + deterministic CBOR, all-in-one or per-role)"
+
+[[bin]]
+name = "fppd"
+path = "src/main.rs"
+
+[dependencies]
+fpp = { path = "../fpp", features = ["log", "async-net"] }
+fpp-attest = { path = "../fpp-attest", default-features = false, features = ["tpm"] }
+anyhow = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+tokio = { version = "1.48", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "signal", "io-util"] }
+
+[features]
+default = ["mobile"]
+mobile = ["fpp-attest/mobile"]
+
+[dev-dependencies]
+fpp-attest = { path = "../fpp-attest", features = ["testing"] }
+tokio = { version = "1.48", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "signal", "io-util", "macros"] }

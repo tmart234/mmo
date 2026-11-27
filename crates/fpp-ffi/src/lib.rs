@@ -18,12 +18,11 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use fpp_crypto::{self as crypto, Ed25519Signer, KeyRole, KeySet, VerifyError};
-use fpp_tokens::evidence::{attest_challenge, Evidence, MAX_CHAIN, MAX_EVIDENCE};
-use fpp_types::{BuildId, Digest, GsInstanceId, MatchId, SessionKey};
-use fpp_wire::msg::frame_leaf_data;
-use fpp_wire::{Checkpoint, InputCommit, InputLeaf};
-use sha2::{Digest as _, Sha256};
+use fpp_core::crypto::{self as crypto, Ed25519Signer, KeyRole, KeySet, VerifyError};
+use fpp_core::tokens::evidence::{attest_challenge, Evidence, MAX_CHAIN, MAX_EVIDENCE};
+use fpp_core::types::{BuildId, Digest, GsInstanceId, MatchId, SessionKey};
+use fpp_core::wire::msg::frame_leaf_data;
+use fpp_core::wire::{Checkpoint, InputCommit, InputLeaf};
 use std::cell::Cell;
 use std::ffi::{c_char, c_int, c_void};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -309,7 +308,7 @@ pub extern "C" fn fpp_status_str(status: c_int) -> *const c_char {
 pub unsafe extern "C" fn fpp_sha256(data: *const u8, len: usize, out: *mut u8) -> FppStatus {
     guard(|| {
         let data = unsafe { input(data, len) }?;
-        unsafe { write_fixed(out, &Sha256::digest(data).into()) }
+        unsafe { write_fixed(out, &fpp_core::crypto::sha256(data)) }
     })
 }
 
@@ -371,7 +370,7 @@ pub unsafe extern "C" fn fpp_attest_challenge_hw_key(
         unsafe {
             write_fixed(
                 out,
-                &fpp_tokens::evidence::attest_challenge_hw_key(&challenge),
+                &fpp_core::tokens::evidence::attest_challenge_hw_key(&challenge),
             )
         }
     })
@@ -572,7 +571,7 @@ pub type FppSignCallback = Option<
 struct ExternalSigner {
     session: SessionKey,
     public: crypto::PublicKey,
-    kid: fpp_types::Kid,
+    kid: fpp_core::types::Kid,
     callback: unsafe extern "C" fn(*mut c_void, *const u8, usize, *mut u8) -> c_int,
     ctx: *mut c_void,
     /// Set when a signature could not be made; read by `Key::check`.
@@ -616,7 +615,7 @@ impl crypto::Signer for Key {
         self.session_key().alg()
     }
 
-    fn kid(&self) -> fpp_types::Kid {
+    fn kid(&self) -> fpp_core::types::Kid {
         match self {
             Key::Local(s) => s.kid(),
             Key::External(e) => e.kid,
@@ -880,7 +879,7 @@ impl FppInputCommitBuilder {
     fn finish(&self) -> InputCommit {
         let mut c = self.commit.clone();
         c.n = self.frames.len() as u32;
-        c.frames_root = fpp_merkle::root(&self.frames);
+        c.frames_root = fpp_core::merkle::root(&self.frames);
         c
     }
 }
@@ -1195,13 +1194,13 @@ pub unsafe extern "C" fn fpp_checkpoint_sign(
         let key = unsafe { handle(instance_key) }?;
         let mut cp = b.checkpoint.clone();
         cp.gs_instance_id = GsInstanceId(crypto::key_digest(&key.inner.ed25519()?).0);
-        cp.inputs_root = fpp_merkle::root(&b.inputs);
+        cp.inputs_root = fpp_core::merkle::root(&b.inputs);
         cp.inputs_n = b.inputs.len() as u32;
-        cp.events_root = fpp_merkle::root(&b.events);
+        cp.events_root = fpp_core::merkle::root(&b.events);
         cp.events_n = b.events.len() as u32;
-        cp.rng_root = fpp_merkle::root(&b.rng);
+        cp.rng_root = fpp_core::merkle::root(&b.rng);
         cp.rng_n = b.rng.len() as u32;
-        cp.roster_root = fpp_merkle::root(&b.roster);
+        cp.roster_root = fpp_core::merkle::root(&b.roster);
         cp.roster_n = b.roster.len() as u32;
         let signed = crypto::sign(&key.inner, &cp);
         key.inner.check()?;
@@ -1414,7 +1413,7 @@ pub struct FppArInfo {
     pub platform: [u8; 33],
 }
 
-fn feature_bits(f: &fpp_tokens::Features) -> u32 {
+fn feature_bits(f: &fpp_core::tokens::Features) -> u32 {
     [
         (f.secure_boot, FPP_FEATURE_SECURE_BOOT),
         (f.measured_boot, FPP_FEATURE_MEASURED_BOOT),
@@ -1530,7 +1529,7 @@ unsafe fn ar_verify(
     for key in raw.as_chunks::<32>().0 {
         keys.insert_ed25519(KeyRole::VerifierAr, verifying_key(*key)?);
     }
-    let result = fpp_tokens::verify_ar(ar, &keys, now_s).map_err(gs::token_status)?;
+    let result = fpp_core::tokens::verify_ar(ar, &keys, now_s).map_err(gs::token_status)?;
     if result.cnf != *session {
         return Err(FppStatus::TokenBinding);
     }
@@ -1557,12 +1556,89 @@ unsafe fn ar_verify(
     Ok(())
 }
 
-impl From<fpp_wire::WireError> for FppStatus {
-    fn from(e: fpp_wire::WireError) -> Self {
+impl From<fpp_core::wire::WireError> for FppStatus {
+    fn from(e: fpp_core::wire::WireError) -> Self {
         if e.is_encoding() {
             FppStatus::Encoding
         } else {
             FppStatus::Schema
         }
     }
+}
+
+// ------------------------------------------------------------------ crypto primitives
+//
+// Exposed so C/C++ games (e.g. Halo: CE signalling, finding H05) use the
+// SDK's vetted pure-Rust SHA-256, HMAC-SHA256, and RFC 8439 ChaCha20-Poly1305
+// instead of hand-rolling cryptography in C.
+
+/// Bytes [`fpp_aead_seal`] adds to a plaintext: 12-byte random nonce + 16-byte Poly1305 tag.
+pub const FPP_AEAD_OVERHEAD: usize = 28;
+const _: () = assert!(FPP_AEAD_OVERHEAD == fpp_core::crypto::AEAD_OVERHEAD);
+
+/// HMAC-SHA256 (RFC 2104) of `data` under `key`.
+///
+/// # Safety
+/// `key` valid for `key_len` bytes (when `key_len > 0`); `data` valid for
+/// `len` bytes (when `len > 0`); `out` valid for 32 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn fpp_hmac_sha256(
+    key: *const u8,
+    key_len: usize,
+    data: *const u8,
+    len: usize,
+    out: *mut u8,
+) -> FppStatus {
+    guard(|| {
+        let key = unsafe { input(key, key_len) }?;
+        let data = unsafe { input(data, len) }?;
+        unsafe { write_fixed(out, &fpp_core::crypto::hmac_sha256(key, data)) }
+    })
+}
+
+/// Seal `plaintext` (`len` bytes) with RFC 8439 ChaCha20-Poly1305 (empty AAD)
+/// under a 32-byte `key` and a fresh random 12-byte nonce.
+/// Output format: `nonce (12 B) || ciphertext (len B) || tag (16 B)`.
+///
+/// # Safety
+/// `key` valid for 32 bytes; `plaintext` valid for `len` bytes (when `len > 0`);
+/// `out` valid for `out_cap` bytes; `out_len` valid for a write.
+#[no_mangle]
+pub unsafe extern "C" fn fpp_aead_seal(
+    key: *const u8,
+    plaintext: *const u8,
+    len: usize,
+    out: *mut u8,
+    out_cap: usize,
+    out_len: *mut usize,
+) -> FppStatus {
+    guard(|| {
+        let key: [u8; 32] = unsafe { fixed(key) }?;
+        let plaintext = unsafe { input(plaintext, len) }?;
+        let sealed = fpp_core::crypto::aead_seal(&key, plaintext);
+        unsafe { write_object(&sealed, out, out_cap, out_len) }
+    })
+}
+
+/// Open a message sealed by [`fpp_aead_seal`], verifying the Poly1305 tag in
+/// constant time. Returns `FPP_STATUS_SIGNATURE` if truncated or unauthentic.
+///
+/// # Safety
+/// `key` valid for 32 bytes; `sealed` valid for `len` bytes; `out` valid for
+/// `out_cap` bytes; `out_len` valid for a write.
+#[no_mangle]
+pub unsafe extern "C" fn fpp_aead_open(
+    key: *const u8,
+    sealed: *const u8,
+    len: usize,
+    out: *mut u8,
+    out_cap: usize,
+    out_len: *mut usize,
+) -> FppStatus {
+    guard(|| {
+        let key: [u8; 32] = unsafe { fixed(key) }?;
+        let sealed = unsafe { input(sealed, len) }?;
+        let plain = fpp_core::crypto::aead_open(&key, sealed).ok_or(FppStatus::Signature)?;
+        unsafe { write_object(&plain, out, out_cap, out_len) }
+    })
 }

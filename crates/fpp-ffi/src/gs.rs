@@ -18,12 +18,12 @@ use super::{
     emit, fixed, free, guard, handle, handle_mut, input, session_key_in, verifying_key, FppStatus,
     Res,
 };
-use fpp_crypto::{KeyRole, KeySet};
-use fpp_tokens::admission::{admit, AdmissionPolicy, Admitted, Revocations};
-use fpp_tokens::control::Control;
-use fpp_tokens::{SarChain, TokenError};
-use fpp_types::{BuildId, DeviceTier, Did, MatchId, Reason, SessionKey};
-use fpp_wire::{RevocationEvent, SubjectKind};
+use fpp_core::crypto::{KeyRole, KeySet};
+use fpp_core::tokens::admission::{admit, AdmissionPolicy, Admitted, Revocations};
+use fpp_core::tokens::control::Control;
+use fpp_core::tokens::{SarChain, TokenError};
+use fpp_core::types::{BuildId, DeviceTier, Did, MatchId, Reason, SessionKey};
+use fpp_core::wire::{RevocationEvent, SubjectKind};
 use std::collections::BTreeMap;
 use std::ffi::c_char;
 
@@ -257,7 +257,7 @@ pub unsafe extern "C" fn fpp_sar_chain_free(chain: *mut FppSarChain) {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct FppAdmitted {
-    /// `fpp_types::Reason` code to send in `Reject` and close the session
+    /// `fpp_core::types::Reason` code to send in `Reject` and close the session
     /// with; 0 when admitted.
     pub reason: u16,
     /// The SAT's slot (the Broker placed the player there).
@@ -371,7 +371,7 @@ pub unsafe extern "C" fn fpp_admission_new(
                 FppAdmission {
                     keys,
                     policy: AdmissionPolicy {
-                        gs_instance_id: fpp_tokens::instance_id(&instance),
+                        gs_instance_id: fpp_core::tokens::instance_id(&instance),
                         matches: vec![match_id],
                         min_tier,
                         client_builds: Vec::new(),
@@ -509,7 +509,7 @@ impl FppAdmission {
         if event.expires_at.is_some_and(|e| e <= now_s) {
             return FppRevocationOutcome::Ignored;
         }
-        if event.effective_at > now_s + fpp_tokens::SKEW_S {
+        if event.effective_at > now_s + fpp_core::tokens::SKEW_S {
             self.scheduled.push(event);
             return FppRevocationOutcome::Scheduled;
         }
@@ -549,7 +549,7 @@ impl FppAdmission {
         let due: Vec<RevocationEvent>;
         (due, self.scheduled) = std::mem::take(&mut self.scheduled)
             .into_iter()
-            .partition(|e| e.effective_at <= now_s + fpp_tokens::SKEW_S);
+            .partition(|e| e.effective_at <= now_s + fpp_core::tokens::SKEW_S);
         // (every due event applies, even after one that ends the match)
         let mut instance = false;
         for e in due {
@@ -578,7 +578,7 @@ pub unsafe extern "C" fn fpp_admission_revocation(
     guard(|| {
         let a = unsafe { handle_mut(admission) }?;
         let event = unsafe { input(event, len) }?;
-        let v = fpp_crypto::verify::<RevocationEvent>(event, &a.keys)?;
+        let v = fpp_core::crypto::verify::<RevocationEvent>(event, &a.keys)?;
         let o = a.apply(v.payload, now_s);
         if let Some(out) = unsafe { outcome.as_mut() } {
             *out = o;
@@ -678,7 +678,7 @@ pub struct FppControl {
 }
 
 /// Largest control message.
-pub const FPP_CONTROL_MAX: usize = fpp_tokens::control::MAX_CONTROL;
+pub const FPP_CONTROL_MAX: usize = fpp_core::tokens::control::MAX_CONTROL;
 
 /// Decode one control message from the reliable channel. Byte fields are
 /// copied to `(data, cap)` back to back (`first_len`, then `second_len`);
@@ -871,7 +871,7 @@ pub unsafe extern "C" fn fpp_control_checkpoint_head(
     })
 }
 
-/// Name of a `fpp_types::Reason` code (never NULL).
+/// Name of a `fpp_core::types::Reason` code (never NULL).
 #[no_mangle]
 pub extern "C" fn fpp_reason_str(code: u16) -> *const c_char {
     let s: &'static [u8] = match code {

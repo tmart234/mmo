@@ -252,8 +252,8 @@ fn an_external_p256_key_signs_session_objects_with_low_s() {
     }
     let c = commit(ext).unwrap();
     // ES256 and low s, whatever the hardware returned
-    let s = fpp_wire::cose::Sign1::decode(&c).unwrap();
-    assert_eq!(s.protected.alg, fpp_wire::cose::alg::ES256);
+    let s = fpp_core::wire::cose::Sign1::decode(&c).unwrap();
+    assert_eq!(s.protected.alg, fpp_core::wire::cose::alg::ES256);
     let sig = p256::ecdsa::Signature::from_slice(&s.signature).unwrap();
     assert!(sig.normalize_s().is_none(), "high s emitted");
     unsafe {
@@ -285,7 +285,7 @@ fn an_external_p256_key_signs_session_objects_with_low_s() {
         );
         assert_eq!(
             ch,
-            fpp_tokens::evidence::attest_challenge(&[9; 32], &public)
+            fpp_core::tokens::evidence::attest_challenge(&[9; 32], &public)
         );
         // a P-256 key cannot sign as a host
         let mut b = ptr::null_mut();

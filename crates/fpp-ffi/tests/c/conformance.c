@@ -291,6 +291,45 @@ int main(void) {
         fpp_signer_free(ext);
     }
 
+    /* Shared crypto primitives exported for game titles (HMAC-SHA256 + ChaCha20-Poly1305). */
+    {
+        /* RFC 4231 Test Case 2 */
+        static const uint8_t want_hmac[32] = {
+            0x5b, 0xdc, 0xc1, 0x46, 0xbf, 0x60, 0x75, 0x4e, 0x6a, 0x04, 0x24, 0x26, 0x08, 0x95, 0x75, 0xc7,
+            0x5a, 0x00, 0x3f, 0x08, 0x9d, 0x27, 0x39, 0x83, 0x9d, 0xec, 0x58, 0xb9, 0x64, 0xec, 0x38, 0x43};
+        uint8_t mac[32];
+        CHECK_STATUS(fpp_hmac_sha256((const uint8_t *)"Jefe", 4,
+                                     (const uint8_t *)"what do ya want for nothing?", 28, mac),
+                     FPP_STATUS_OK);
+        CHECK(memcmp(mac, want_hmac, 32) == 0);
+        CHECK_STATUS(fpp_hmac_sha256(NULL, 4, (const uint8_t *)"a", 1, mac), FPP_STATUS_NULL_POINTER);
+
+        uint8_t key[32], sealed[64], opened[64];
+        const uint8_t pt[] = "fair-play-protocol";
+        size_t slen = 0, olen = 0;
+        memset(key, 0x42, sizeof key);
+        CHECK_STATUS(fpp_aead_seal(key, pt, sizeof pt - 1, sealed, sizeof sealed, &slen),
+                     FPP_STATUS_OK);
+        CHECK(slen == (sizeof pt - 1) + FPP_AEAD_OVERHEAD);
+        CHECK_STATUS(fpp_aead_open(key, sealed, slen, opened, sizeof opened, &olen),
+                     FPP_STATUS_OK);
+        CHECK(olen == sizeof pt - 1 && memcmp(opened, pt, olen) == 0);
+        /* Wrong key must fail */
+        key[0] ^= 0x01;
+        CHECK_STATUS(fpp_aead_open(key, sealed, slen, opened, sizeof opened, &olen),
+                     FPP_STATUS_SIGNATURE);
+        key[0] ^= 0x01;
+        /* Tampered ciphertext must fail */
+        sealed[slen - 1] ^= 0x01;
+        CHECK_STATUS(fpp_aead_open(key, sealed, slen, opened, sizeof opened, &olen),
+                     FPP_STATUS_SIGNATURE);
+        /* Empty plaintext works */
+        CHECK_STATUS(fpp_aead_seal(key, NULL, 0, sealed, sizeof sealed, &slen), FPP_STATUS_OK);
+        CHECK(slen == FPP_AEAD_OVERHEAD);
+        CHECK_STATUS(fpp_aead_open(key, sealed, slen, opened, sizeof opened, &olen), FPP_STATUS_OK);
+        CHECK(olen == 0);
+    }
+
     fpp_signer_free(session0);
     fpp_signer_free(gs);
     fprintf(stderr, "C conformance (%u-bit): %d failure(s)\n", (unsigned)(sizeof(void *) * 8), failures);

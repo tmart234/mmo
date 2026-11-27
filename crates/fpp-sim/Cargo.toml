@@ -1,0 +1,16 @@
+[package]
+name = "fpp-sim"
+version = "0.1.0"
+edition = "2021"
+description = "Headless reference client, reference game server, and adversarial exit tests for FPP v1"
+
+[dependencies]
+anyhow = { workspace = true }
+ed25519-dalek = { workspace = true }
+fpp = { path = "../fpp", features = ["log", "async-net"] }
+fpp-attest = { path = "../fpp-attest" }
+fppd = { path = "../fppd" }
+hex = { workspace = true }
+p256 = { workspace = true }
+rand = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }

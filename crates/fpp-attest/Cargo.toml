@@ -1,0 +1,29 @@
+[package]
+name = "fpp-attest"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Feature-gated Verifier appraisal of hardware and platform evidence: open TPM 2.0 (default) and optional mobile verifiers (Android KeyMint / Play Integrity, Apple App Attest)"
+
+[dependencies]
+fpp = { path = "../fpp" }
+aws-lc-rs = { workspace = true }
+x509-parser = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+# Only needed for Android Play Integrity / Google revocation status JSON (external vendor format).
+serde_json = { workspace = true, optional = true }
+
+[features]
+default = ["tpm"]
+tpm = []
+mobile = ["dep:serde_json"]
+# Play Integrity token minting helper for tests.
+testing = ["mobile"]
+
+[dev-dependencies]
+fpp-attest = { path = ".", features = ["testing"] }
+hex = { workspace = true }
+rcgen = { workspace = true }
+serde_json = { workspace = true }

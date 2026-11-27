@@ -1,0 +1,565 @@
+//! FPP v1 signed payloads (04-protocol.md §7.4, §8.1).
+//!
+//! Each payload type is bound to one `fpp-ctx` and content type, so a
+//! signature over one kind of object can never be accepted as another.
+
+use crate::types::{content_type, ctx, BuildId, Digest, GsInstanceId, MatchId};
+use crate::wire::cbor::{self, text_map, MapView, Value};
+use crate::wire::WireError;
+
+/// A CBOR payload bound to one domain-separation context.
+pub trait Payload: Sized {
+    const CTX: &'static str;
+    const CONTENT_TYPE: &'static str;
+
+    fn to_value(&self) -> Value;
+    fn from_value(v: &Value) -> Result<Self, WireError>;
+
+    fn to_cbor(&self) -> Vec<u8> {
+        cbor::encode(&self.to_value()).expect("payload maps have unique keys")
+    }
+
+    fn from_cbor(bytes: &[u8]) -> Result<Self, WireError> {
+        Self::from_value(&cbor::decode(bytes)?)
+    }
+}
+
+fn digest(d: &Digest) -> Value {
+    Value::bytes(d.0.to_vec())
+}
+
+/// Leaf data for one input frame in an `InputCommit`'s `frames_root`:
+/// `u32le(tick) ‖ payload`. The Merkle leaf hash adds the RFC 9162 `0x00` prefix.
+pub fn frame_leaf_data(tick: u32, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + payload.len());
+    out.extend_from_slice(&tick.to_le_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Client-signed commitment to its input frames for one epoch (§7.4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InputCommit {
+    pub match_id: MatchId,
+    pub slot: u16,
+    pub epoch: u32,
+    pub first_tick: u32,
+    pub last_tick: u32,
+    /// Frames the client sent in the epoch.
+    pub n: u32,
+    /// Merkle root over `frame_leaf_data`, ascending tick.
+    pub frames_root: Digest,
+    /// SHA-256 of the previous signed InputCommit; zeros at epoch 0.
+    pub prev: Digest,
+}
+
+impl Payload for InputCommit {
+    const CTX: &'static str = ctx::INPUT_COMMIT;
+    const CONTENT_TYPE: &'static str = content_type::INPUT_COMMIT;
+
+    fn to_value(&self) -> Value {
+        text_map([
+            ("match_id", Value::bytes(self.match_id.0.to_vec())),
+            ("slot", Value::Unsigned(self.slot.into())),
+            ("epoch", Value::Unsigned(self.epoch.into())),
+            ("first_tick", Value::Unsigned(self.first_tick.into())),
+            ("last_tick", Value::Unsigned(self.last_tick.into())),
+            ("n", Value::Unsigned(self.n.into())),
+            ("frames_root", digest(&self.frames_root)),
+            ("prev", digest(&self.prev)),
+        ])
+    }
+
+    fn from_value(v: &Value) -> Result<Self, WireError> {
+        const WHAT: &str = "InputCommit";
+        let m = MapView::new(v, WHAT)?;
+        let commit = Self {
+            match_id: MatchId(m.fixed("match_id")?),
+            slot: m.u16("slot")?,
+            epoch: m.u32("epoch")?,
+            first_tick: m.u32("first_tick")?,
+            last_tick: m.u32("last_tick")?,
+            n: m.u32("n")?,
+            frames_root: Digest(m.fixed("frames_root")?),
+            prev: Digest(m.fixed("prev")?),
+        };
+        if commit.first_tick > commit.last_tick {
+            return Err(WireError::Schema(WHAT, "first_tick > last_tick"));
+        }
+        if u64::from(commit.n) > u64::from(commit.last_tick - commit.first_tick) + 1 {
+            return Err(WireError::Schema(WHAT, "more frames than ticks"));
+        }
+        Ok(commit)
+    }
+}
+
+/// One slot's entry under a Checkpoint's `inputs_root` (§8.1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InputLeaf {
+    pub slot: u16,
+    /// SHA-256 of the client's signed InputCommit; `None` if none arrived.
+    pub commit: Option<Digest>,
+    /// Bitset over the epoch's ticks: bit i set = frame for tick
+    /// `ticks[0] + i` was applied in time (LSB-first within each byte).
+    pub applied: Vec<u8>,
+}
+
+impl InputLeaf {
+    pub fn to_value(&self) -> Value {
+        text_map([
+            ("slot", Value::Unsigned(self.slot.into())),
+            ("commit", self.commit.as_ref().map_or(Value::Null, digest)),
+            ("applied", Value::bytes(self.applied.clone())),
+        ])
+    }
+
+    pub fn from_value(v: &Value) -> Result<Self, WireError> {
+        const WHAT: &str = "InputLeaf";
+        let m = MapView::new(v, WHAT)?;
+        let commit = match m.field("commit")? {
+            Value::Null => None,
+            other => Some(Digest(
+                other
+                    .as_bytes()
+                    .and_then(|b| b.try_into().ok())
+                    .ok_or(WireError::Schema(WHAT, "commit"))?,
+            )),
+        };
+        Ok(Self {
+            slot: m.u16("slot")?,
+            commit,
+            applied: m.bytes("applied")?.to_vec(),
+        })
+    }
+
+    /// Leaf data under `inputs_root`: the deterministic CBOR of this leaf.
+    pub fn leaf_data(&self) -> Vec<u8> {
+        cbor::encode(&self.to_value()).expect("InputLeaf keys are unique")
+    }
+}
+
+/// GS-instance-signed commitment per match per epoch (§8.1).
+///
+/// Every Merkle root is signed together with its leaf count: RFC 9162
+/// inclusion proofs do not authenticate the tree size on their own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Checkpoint {
+    pub match_id: MatchId,
+    pub gs_instance_id: GsInstanceId,
+    pub build_id: BuildId,
+    pub policy_ver: u64,
+    pub epoch: u32,
+    /// Inclusive tick range.
+    pub ticks: (u32, u32),
+    /// SHA-256 of the previous signed Checkpoint; zeros at epoch 0.
+    pub prev: Digest,
+    /// Merkle root over `InputLeaf::leaf_data`, ascending slot; `inputs_n` leaves.
+    pub inputs_root: Digest,
+    pub inputs_n: u32,
+    /// Merkle root over authoritative events in simulation order; `events_n` leaves.
+    pub events_root: Digest,
+    pub events_n: u32,
+    /// Digest of the canonical audit-projection state at `ticks.1`.
+    pub state_root: Digest,
+    /// Merkle root over the epoch's VRF proofs; `rng_n` leaves.
+    pub rng_root: Digest,
+    pub rng_n: u32,
+    /// Merkle root over admitted (slot, sat_cti, did); `roster_n` leaves.
+    pub roster_root: Digest,
+    pub roster_n: u32,
+}
+
+impl Payload for Checkpoint {
+    const CTX: &'static str = ctx::CHECKPOINT;
+    const CONTENT_TYPE: &'static str = content_type::CHECKPOINT;
+
+    fn to_value(&self) -> Value {
+        text_map([
+            ("match_id", Value::bytes(self.match_id.0.to_vec())),
+            (
+                "gs_instance_id",
+                Value::bytes(self.gs_instance_id.0.to_vec()),
+            ),
+            ("build_id", Value::bytes(self.build_id.0.to_vec())),
+            ("policy_ver", Value::Unsigned(self.policy_ver)),
+            ("epoch", Value::Unsigned(self.epoch.into())),
+            (
+                "ticks",
+                Value::Array(vec![
+                    Value::Unsigned(self.ticks.0.into()),
+                    Value::Unsigned(self.ticks.1.into()),
+                ]),
+            ),
+            ("prev", digest(&self.prev)),
+            ("inputs_root", digest(&self.inputs_root)),
+            ("inputs_n", Value::Unsigned(self.inputs_n.into())),
+            ("events_root", digest(&self.events_root)),
+            ("events_n", Value::Unsigned(self.events_n.into())),
+            ("state_root", digest(&self.state_root)),
+            ("rng_root", digest(&self.rng_root)),
+            ("rng_n", Value::Unsigned(self.rng_n.into())),
+            ("roster_root", digest(&self.roster_root)),
+            ("roster_n", Value::Unsigned(self.roster_n.into())),
+        ])
+    }
+
+    fn from_value(v: &Value) -> Result<Self, WireError> {
+        const WHAT: &str = "Checkpoint";
+        let m = MapView::new(v, WHAT)?;
+        let ticks = match m.field("ticks")?.as_array() {
+            Some([a, b]) => (
+                a.as_u64().and_then(|t| u32::try_from(t).ok()),
+                b.as_u64().and_then(|t| u32::try_from(t).ok()),
+            ),
+            _ => (None, None),
+        };
+        let ticks = match ticks {
+            (Some(a), Some(b)) if a <= b => (a, b),
+            _ => return Err(WireError::Schema(WHAT, "ticks")),
+        };
+        Ok(Self {
+            match_id: MatchId(m.fixed("match_id")?),
+            gs_instance_id: GsInstanceId(m.fixed("gs_instance_id")?),
+            build_id: BuildId(m.fixed("build_id")?),
+            policy_ver: m.u64("policy_ver")?,
+            epoch: m.u32("epoch")?,
+            ticks,
+            prev: Digest(m.fixed("prev")?),
+            inputs_root: Digest(m.fixed("inputs_root")?),
+            inputs_n: m.u32("inputs_n")?,
+            events_root: Digest(m.fixed("events_root")?),
+            events_n: m.u32("events_n")?,
+            state_root: Digest(m.fixed("state_root")?),
+            rng_root: Digest(m.fixed("rng_root")?),
+            rng_n: m.u32("rng_n")?,
+            roster_root: Digest(m.fixed("roster_root")?),
+            roster_n: m.u32("roster_n")?,
+        })
+    }
+}
+
+/// Proof that the holder of a session key opened one specific secure channel
+/// (04-protocol.md §5.2 `pop_sig`, §7.7). Signed with the session key under
+/// `fpp/1/admit-pop`, so the key that later signs InputCommits is bound to
+/// the channel its frames arrived on, and a relayed proof fails elsewhere.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdmitPop {
+    /// Channel type, e.g. [`AdmitPop::NOISE_IK`].
+    pub channel: String,
+    /// Channel binding. For `NOISE_IK`: host static key ‖ joiner static key.
+    pub binding: Vec<u8>,
+}
+
+impl AdmitPop {
+    /// Player-hosted sessions (fpp-session): Noise IK over UDP.
+    pub const NOISE_IK: &'static str = "fpp-p2p/noise-ik";
+    /// QUIC session plane: TLS exporter ‖ SHA-256(handshake, nonce, SAT cti).
+    pub const QUIC_TLS: &'static str = "fpp/quic-tls";
+    /// Longest accepted channel name.
+    pub const MAX_CHANNEL: usize = 32;
+    /// Accepted binding sizes (a 32-byte exporter up to two 32-byte keys).
+    pub const BINDING_LEN: core::ops::RangeInclusive<usize> = 32..=64;
+}
+
+impl Payload for AdmitPop {
+    const CTX: &'static str = ctx::ADMIT_POP;
+    const CONTENT_TYPE: &'static str = content_type::ADMIT_POP;
+
+    fn to_value(&self) -> Value {
+        text_map([
+            ("channel", Value::text(self.channel.clone())),
+            ("binding", Value::bytes(self.binding.clone())),
+        ])
+    }
+
+    fn from_value(v: &Value) -> Result<Self, WireError> {
+        const WHAT: &str = "AdmitPop";
+        let m = MapView::new(v, WHAT)?;
+        let channel = m
+            .field("channel")?
+            .as_text()
+            .filter(|c| !c.is_empty() && c.len() <= Self::MAX_CHANNEL)
+            .ok_or(WireError::Schema(WHAT, "channel"))?;
+        let binding = m.bytes("binding")?;
+        if !Self::BINDING_LEN.contains(&binding.len()) {
+            return Err(WireError::Schema(WHAT, "binding"));
+        }
+        Ok(Self {
+            channel: channel.to_owned(),
+            binding: binding.to_vec(),
+        })
+    }
+}
+
+/// The Transparency Log's promise to include a leaf within `mmd_s` of
+/// `timestamp` (04 §8.2). A log that breaks it is provably at fault: the
+/// receipt is signed, and its tree heads are public.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogReceipt {
+    /// SHA-256 of the log's public key.
+    pub log_id: Digest,
+    /// RFC 9162 leaf hash of the entry.
+    pub leaf_hash: Digest,
+    /// Unix seconds.
+    pub timestamp: u64,
+    /// Maximum merge delay, seconds.
+    pub mmd_s: u64,
+}
+
+impl Payload for LogReceipt {
+    const CTX: &'static str = ctx::LOG_RECEIPT;
+    const CONTENT_TYPE: &'static str = content_type::LOG_RECEIPT;
+
+    fn to_value(&self) -> Value {
+        text_map([
+            ("log_id", digest(&self.log_id)),
+            ("leaf_hash", digest(&self.leaf_hash)),
+            ("timestamp", Value::Unsigned(self.timestamp)),
+            ("mmd_s", Value::Unsigned(self.mmd_s)),
+        ])
+    }
+
+    fn from_value(v: &Value) -> Result<Self, WireError> {
+        let m = MapView::new(v, "LogReceipt")?;
+        Ok(Self {
+            log_id: Digest(m.fixed("log_id")?),
+            leaf_hash: Digest(m.fixed("leaf_hash")?),
+            timestamp: m.u64("timestamp")?,
+            mmd_s: m.u64("mmd_s")?,
+        })
+    }
+}
+
+// ------------------------------------------------------------------ enforcement
+
+/// What a revocation is about (04 §9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SubjectKind {
+    /// A pseudonymous account (SAT `sub`).
+    Account = 0,
+    /// A device (DID).
+    Device = 1,
+    /// A session key (AR and SAT `cnf`).
+    Session = 2,
+    /// One SAT (`cti`).
+    Sat = 3,
+    /// A game server instance (`gs_instance_id`).
+    GsInstance = 4,
+    /// A client or server build.
+    Build = 5,
+}
+
+impl SubjectKind {
+    pub fn from_u64(v: u64) -> Option<Self> {
+        Some(match v {
+            0 => Self::Account,
+            1 => Self::Device,
+            2 => Self::Session,
+            3 => Self::Sat,
+            4 => Self::GsInstance,
+            5 => Self::Build,
+            _ => return None,
+        })
+    }
+
+    /// Length of a subject id of this kind.
+    pub fn id_len(self) -> usize {
+        match self {
+            Self::Sat => 16,
+            _ => 32,
+        }
+    }
+}
+
+/// What to do about it (04 §9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Action {
+    Kick = 0,
+    DenyAdmission = 1,
+    DowngradeTier = 2,
+    Segregate = 3,
+    Suspend = 4,
+    Ban = 5,
+    InvalidateMatch = 6,
+}
+
+impl Action {
+    pub fn from_u64(v: u64) -> Option<Self> {
+        Some(match v {
+            0 => Self::Kick,
+            1 => Self::DenyAdmission,
+            2 => Self::DowngradeTier,
+            3 => Self::Segregate,
+            4 => Self::Suspend,
+            5 => Self::Ban,
+            6 => Self::InvalidateMatch,
+            _ => return None,
+        })
+    }
+
+    /// Whether new admissions are refused.
+    pub fn denies_admission(self) -> bool {
+        matches!(self, Self::DenyAdmission | Self::Suspend | Self::Ban)
+    }
+
+    /// Whether players already in a match are removed (not only refused
+    /// admission from now on).
+    pub fn removes_players(self) -> bool {
+        matches!(
+            self,
+            Self::Kick | Self::Suspend | Self::Ban | Self::InvalidateMatch
+        )
+    }
+}
+
+/// Where an event applies; an empty list means everywhere.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Scope {
+    pub titles: Vec<String>,
+    pub queues: Vec<String>,
+    pub regions: Vec<String>,
+}
+
+impl Scope {
+    const MAX_ENTRIES: usize = 16;
+    const MAX_LEN: usize = 64;
+
+    fn to_value(&self) -> Value {
+        let list = |v: &[String]| Value::Array(v.iter().map(Value::text).collect());
+        let mut m = Vec::new();
+        for (k, v) in [
+            ("titles", &self.titles),
+            ("queues", &self.queues),
+            ("regions", &self.regions),
+        ] {
+            if !v.is_empty() {
+                m.push((Value::text(k), list(v)));
+            }
+        }
+        Value::Map(m)
+    }
+
+    fn from_value(v: &Value) -> Result<Self, WireError> {
+        const WHAT: &str = "Scope";
+        let m = MapView::new(v, WHAT)?;
+        let list = |name: &'static str| -> Result<Vec<String>, WireError> {
+            let Some(v) = m.get(&Value::text(name)) else {
+                return Ok(Vec::new());
+            };
+            let items = v.as_array().ok_or(WireError::Schema(WHAT, name))?;
+            if items.is_empty() || items.len() > Self::MAX_ENTRIES {
+                return Err(WireError::Schema(WHAT, name));
+            }
+            items
+                .iter()
+                .map(|i| {
+                    i.as_text()
+                        .filter(|t| !t.is_empty() && t.len() <= Self::MAX_LEN)
+                        .map(str::to_owned)
+                        .ok_or(WireError::Schema(WHAT, name))
+                })
+                .collect()
+        };
+        Ok(Self {
+            titles: list("titles")?,
+            queues: list("queues")?,
+            regions: list("regions")?,
+        })
+    }
+
+    /// Whether the event applies in `region`, for `queue` (a `None` is
+    /// "not known here": the scope does not narrow on it).
+    pub fn covers(&self, region: Option<&str>, queue: Option<&str>) -> bool {
+        let ok = |list: &[String], v: Option<&str>| {
+            list.is_empty() || v.is_none_or(|v| list.iter().any(|x| x == v))
+        };
+        ok(&self.regions, region) && ok(&self.queues, queue)
+    }
+}
+
+/// Enforcement → Revocation Feed → Brokers, Server Liveness, game servers
+/// (04 §9), signed with the Enforcement key. Idempotent by `id`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RevocationEvent {
+    pub id: [u8; 16],
+    pub subject_kind: SubjectKind,
+    /// [`SubjectKind::id_len`] bytes.
+    pub subject_id: Vec<u8>,
+    pub action: Action,
+    pub scope: Scope,
+    /// Unix seconds.
+    pub effective_at: u64,
+    pub expires_at: Option<u64>,
+    /// `crate::types::Reason` code.
+    pub reason: u16,
+    /// SHA-256 of the enforcement record (in the Transparency Log).
+    pub record: Digest,
+}
+
+impl RevocationEvent {
+    /// In force at `now` (unix seconds).
+    pub fn in_force(&self, now: u64) -> bool {
+        now >= self.effective_at && self.expires_at.is_none_or(|e| now < e)
+    }
+}
+
+impl Payload for RevocationEvent {
+    const CTX: &'static str = ctx::REVOCATION;
+    const CONTENT_TYPE: &'static str = content_type::REVOCATION;
+
+    fn to_value(&self) -> Value {
+        let mut m = vec![
+            (Value::text("id"), Value::bytes(self.id.to_vec())),
+            (
+                Value::text("subject"),
+                text_map([
+                    ("kind", Value::Unsigned(self.subject_kind as u64)),
+                    ("id", Value::bytes(self.subject_id.clone())),
+                ]),
+            ),
+            (Value::text("action"), Value::Unsigned(self.action as u64)),
+            (Value::text("scope"), self.scope.to_value()),
+            (
+                Value::text("effective_at"),
+                Value::Unsigned(self.effective_at),
+            ),
+            (Value::text("reason"), Value::Unsigned(self.reason.into())),
+            (Value::text("record"), digest(&self.record)),
+        ];
+        if let Some(e) = self.expires_at {
+            m.push((Value::text("expires_at"), Value::Unsigned(e)));
+        }
+        Value::Map(m)
+    }
+
+    fn from_value(v: &Value) -> Result<Self, WireError> {
+        const WHAT: &str = "RevocationEvent";
+        let m = MapView::new(v, WHAT)?;
+        let subject = MapView::new(m.field("subject")?, WHAT)?;
+        let subject_kind = SubjectKind::from_u64(subject.u64("kind")?)
+            .ok_or(WireError::Schema(WHAT, "subject kind"))?;
+        let subject_id = subject.bytes("id")?.to_vec();
+        if subject_id.len() != subject_kind.id_len() {
+            return Err(WireError::Schema(WHAT, "subject id"));
+        }
+        let effective_at = m.u64("effective_at")?;
+        let expires_at = match m.get(&Value::text("expires_at")) {
+            None => None,
+            Some(v) => Some(v.as_u64().ok_or(WireError::Schema(WHAT, "expires_at"))?),
+        };
+        if expires_at.is_some_and(|e| e <= effective_at) {
+            return Err(WireError::Schema(WHAT, "expires_at <= effective_at"));
+        }
+        Ok(Self {
+            id: m.fixed("id")?,
+            subject_kind,
+            subject_id,
+            action: Action::from_u64(m.u64("action")?).ok_or(WireError::Schema(WHAT, "action"))?,
+            scope: Scope::from_value(m.field("scope")?)?,
+            effective_at,
+            expires_at,
+            reason: m.u16("reason")?,
+            record: Digest(m.fixed("record")?),
+        })
+    }
+}

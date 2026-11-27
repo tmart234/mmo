@@ -2,10 +2,11 @@
 #![no_main]
 
 use ed25519_dalek::SigningKey;
-use fpp_crypto::{Ed25519Signer, KeyRole, KeySet};
-use fpp_tokens::admission::{admit, AdmissionPolicy, Revocations};
-use fpp_tokens::{verify_ar, verify_sat, SarChain};
-use fpp_types::{BuildId, DeviceTier, GsInstanceId, MatchId};
+use fpp::crypto::{self, Ed25519Signer, KeyRole, KeySet};
+use fpp::tokens::admission::{admit, AdmissionPolicy, Revocations};
+use fpp::tokens::{verify_ar, verify_sat, SarChain};
+use fpp::types::{BuildId, DeviceTier, GsInstanceId, MatchId, SessionKey};
+use fpp::wire::{InputCommit, Payload as _};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -33,31 +34,26 @@ fuzz_target!(|data: &[u8]| {
                 let _ = chain.live(u64::MAX);
             }
         }
-        // session keys from the wire (P-256 points included), and objects
-        // signed with them
         2 => {
             let (key, object) = body.split_at(body.len().min(65));
-            if let Some(key) = fpp_types::SessionKey::from_bytes(key) {
+            if let Some(key) = SessionKey::from_bytes(key) {
                 let mut session = KeySet::default();
                 if session.insert_session(&key).is_some() {
-                    let _ = fpp_crypto::verify::<fpp_wire::InputCommit>(object, &session);
-                    let _ = fpp_crypto::verify_session_raw(&key, b"msg", object);
+                    let _ = crypto::verify::<InputCommit>(object, &session);
+                    let _ = crypto::verify_session_raw(&key, b"msg", object);
                 }
             }
         }
-        // token payloads past the signature (a cnf of either kind)
         3 => {
-            use fpp_wire::Payload as _;
-            let _ = fpp_tokens::AttestationResult::from_cbor(body);
-            let _ = fpp_tokens::SessionAdmissionToken::from_cbor(body);
-            // a Play Integrity token (with fixed response keys)
+            let _ = fpp::tokens::AttestationResult::from_cbor(body);
+            let _ = fpp::tokens::SessionAdmissionToken::from_cbor(body);
             if let Ok(token) = std::str::from_utf8(body) {
-                let keys = attest_android::integrity::IntegrityKeys {
+                let ikeys = fpp_attest::android::integrity::IntegrityKeys {
                     decryption: [7; 32],
                     verification: vec![4; 65],
                 };
-                let _ = attest_android::integrity::b64(token);
-                let _ = attest_android::integrity::verify(token, &keys, &[0; 32], &[], 0, 1);
+                let _ = fpp::b64::decode(token);
+                let _ = fpp_attest::android::integrity::verify(token, &ikeys, &[0; 32], &[], 0, 1);
             }
         }
         _ => {
@@ -71,7 +67,7 @@ fuzz_target!(|data: &[u8]| {
             let _ = admit(
                 &body[..mid],
                 &body[mid..],
-                &fpp_types::SessionKey::Ed25519([0; 32]),
+                &SessionKey::Ed25519([0; 32]),
                 &keys,
                 &policy,
                 &Revocations::default(),
